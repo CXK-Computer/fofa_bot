@@ -120,6 +120,13 @@ def find_cached_query(query_text):
     return None
 
 # --- 辅助函数与装饰器 ---
+def sanitize_for_filename(text: str) -> str:
+    """将查询语句转换为安全的文件名字符串。"""
+    # 将所有非字母数字的字符序列替换为单个下划线
+    sanitized_text = re.sub(r'[^a-zA-Z0-9]+', '_', text)
+    # 移除可能存在的前导或尾随下划线，并限制总长度
+    return sanitized_text.strip('_')[:50] # 限制查询部分长度，防止文件名过长
+
 def escape_markdown(text: str) -> str:
     escape_chars = '_*`[]()~>#+-=|{}.!'; return "".join(['\\' + char if char in escape_chars else char for char in text])
 
@@ -216,7 +223,6 @@ async def stop_or_cancel_command(update: Update, context: ContextTypes.DEFAULT_T
         action_taken = True
 
     if context.user_data:
-        # 如果已发送停止任务消息，则只取消对话；否则发送取消操作消息
         if not action_taken:
             await update.effective_chat.send_message('✅ 当前操作已取消。')
         context.user_data.clear()
@@ -263,7 +269,6 @@ async def start_new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = context.user_data['query']; key_index = context.user_data.get('key_index')
     add_or_update_query(query_text, cache_data=None) 
     
-    # 统一消息发送/编辑逻辑
     message_able = update.callback_query.message if update.callback_query else update.message
     edit_func = message_able.edit_text if update.callback_query else (lambda text, **kwargs: message_able.reply_text(text, **kwargs))
     
@@ -393,7 +398,7 @@ async def settings_action_handler(update: Update, context: ContextTypes.DEFAULT_
     # Data Actions
     elif action == 'history': await history_command(update, context); return STATE_SETTINGS_ACTION
     elif action == 'backup_now': await backup_config_command(update, context); return STATE_SETTINGS_ACTION
-    elif action == 'restore': await restore_config_command(update, context); await query.message.delete(); return STATE_SETTINGS_MAIN # 结束会话，等待文件
+    elif action == 'restore': await restore_config_command(update, context); await query.message.delete(); return STATE_SETTINGS_MAIN
 
     # Admin Actions
     elif action == 'getlog': await get_log_command(update, context); return STATE_SETTINGS_ACTION
@@ -421,17 +426,15 @@ async def remove_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.sleep(1); await show_api_menu(update, context); return STATE_SETTINGS_ACTION
 
 # --- 文件处理与下载任务 ---
-async def start_download_job(context: ContextTypes.DEFAULT_TYPE, callback_func, job_data):
-    chat_id = job_data.get('chat_id')
-    if not chat_id: logger.error("start_download_job 失败: job_data 中缺少 'chat_id'。"); return
-    job_name = f"download_job_{chat_id}"; [job.schedule_removal() for job in context.job_queue.get_jobs_by_name(job_name)]
-    context.bot_data.pop(f'stop_job_{chat_id}', None)
-    context.job_queue.run_once(callback_func, 1, data=job_data, name=job_name, chat_id=chat_id)
-
 async def _save_and_send_results(bot, chat_id, query_text, results, msg):
-    local_filename = f"fofa_cache_{hash(query_text) & 0xffffff}_{int(time.time())}.txt"
+    # 使用新的命名规则
+    sanitized_query = sanitize_for_filename(query_text)
+    timestamp = int(time.time())
+    local_filename = f"fofa_{sanitized_query}_{timestamp}.txt"
+    
     local_file_path = os.path.join(LOCAL_CACHE_DIR, local_filename)
-    with open(local_file_path, 'w', encoding='utf-8') as f: f.write("\n".join(results))
+    with open(local_file_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(results))
     
     cache_data = {'cache_type': 'local', 'local_path': local_file_path, 'file_name': local_filename, 'result_count': len(results)}
     add_or_update_query(query_text, cache_data)
@@ -454,7 +457,7 @@ async def _save_and_send_results(bot, chat_id, query_text, results, msg):
             for i in range(num_parts):
                 await msg.edit_text(f"📦 正在发送第 {i+1}/{num_parts} 部分...")
                 part_lines = lines[i*lines_per_part:(i+1)*lines_per_part]
-                part_filename = f"part_{i+1}_{os.path.basename(local_file_path)}"
+                part_filename = f"part_{i+1}_{local_filename}"
                 part_filepath = os.path.join(LOCAL_CACHE_DIR, part_filename)
                 with open(part_filepath, 'w', encoding='utf-8') as pf: pf.writelines(part_lines)
                 await bot.send_document(chat_id, document=open(part_filepath, 'rb'), read_timeout=60, write_timeout=60)
@@ -463,8 +466,6 @@ async def _save_and_send_results(bot, chat_id, query_text, results, msg):
         except Exception as e:
             logger.error(f"分割文件时出错: {e}")
             await msg.edit_text(f"❌ 处理文件分卷时发生错误: {e}")
-
-# ... (run_full_download_query, run_traceback_download_query, run_incremental_update_query 保持不变) ...
 
 async def run_full_download_query(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data; bot = context.bot; chat_id, query_text, total_size = job_data['chat_id'], job_data['query'], job_data['total_size']
@@ -612,17 +613,21 @@ async def main() -> None:
     
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(unified_stop_handler)
+    application.add_handler(unified_stop_handler) # 注册统一的停止命令
+    
+    # 隐藏的管理员/高级命令
     application.add_handler(CommandHandler("backup", backup_config_command))
     application.add_handler(CommandHandler("restore", restore_config_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("getlog", get_log_command))
     application.add_handler(CommandHandler("shutdown", shutdown_command))
+    
     application.add_handler(settings_conv)
     application.add_handler(kkfofa_conv)
     application.add_handler(MessageHandler(filters.Document.FileExtension("json"), receive_config_file))
     
     async with application:
+        # 简化命令菜单
         await application.bot.set_my_commands([ 
             BotCommand("kkfofa", "🔍 资产搜索"),
             BotCommand("settings", "⚙️ 设置与管理"),
