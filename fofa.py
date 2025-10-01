@@ -9,8 +9,8 @@ import random
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 # 适配旧版：从旧的结构中导入必要的类
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.constants import ParseMode
+# 修改后
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode
 from telegram.error import BadRequest, NetworkError, Conflict
 from telegram.ext import (
     Updater, # 适配旧版：使用 Updater
