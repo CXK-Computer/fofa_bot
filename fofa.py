@@ -11,6 +11,11 @@ import sys
 import math
 import concurrent.futures # 引入并发执行器
 
+import warnings
+# 忽略特定的 DeprecationWarning
+warnings.filterwarnings("ignore", category=DeprecationWarning) 
+
+# ... 其他代码 ...
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
