@@ -60,7 +60,7 @@ if not logger.handlers:
     logger.addHandler(stream_handler)
 
 
-# --- 配置和历史操作 (关键修改区域) ---
+# --- 配置和历史操作 ---
 def load_config():
     """加载配置，兼容所有旧格式，并统一返回 Key 字符串列表。"""
     default_config = {
@@ -113,7 +113,6 @@ def load_config():
 
 def save_config(config_data):
     """保存配置。"""
-    # 确保保存时只保留新的 key 字符串列表
     if 'apis' in config_data:
         del config_data['apis']
         
@@ -149,7 +148,7 @@ def is_owner(func):
         return func(update, context)
     return wrapper
 
-# --- FOFA 接口客户端类 (关键修改区域：移除 email 参数) ---
+# --- FOFA 接口客户端类 ---
 class FofaAPIClient:
     def __init__(self, config):
         self.config = config
@@ -188,7 +187,7 @@ class FofaAPIClient:
         
         url = (
             f"{base_url}?qbase64={query_hash}"
-            f"&key={key}" # *** 关键修改：只使用 key ***
+            f"&key={key}" 
             f"&size={size}&fields={fields}&page={page}"
         )
         return url
@@ -204,7 +203,7 @@ class FofaAPIClient:
         random.shuffle(available_keys) 
         chat_id = context.effective_chat.id
         
-        for i, key_str in enumerate(available_keys): # 迭代 Key 字符串
+        for i, key_str in enumerate(available_keys): 
             if stop_flag:
                 context.bot.send_message(
                     chat_id=chat_id, 
@@ -214,12 +213,12 @@ class FofaAPIClient:
                 stop_flag = False
                 return None, 0, None, "STOPPED"
 
-            key_display = f"`{key_str[:6]}...`" # 只显示 Key 前六位
+            key_display = f"`{key_str[:6]}...`" 
             query_str = query_details.get('query', '')
             size = query_details.get('size', 100)
             fields = query_details.get('fields', 'host,ip,port')
             
-            url = self._build_fofa_url(query_str, key_str, size, fields, page=1) # 传入 key_str
+            url = self._build_fofa_url(query_str, key_str, size, fields, page=1) 
             
             context.bot.send_message(
                 chat_id=chat_id, 
@@ -246,7 +245,7 @@ class FofaAPIClient:
                         context.bot.send_message(chat_id=chat_id, text=f"❌ Key API 错误: {errmsg[:20]}... 尝试下一个 Key...")
                         continue
                         
-                    return result, result.get('size', 0), key_str, "SUCCESS" # 返回成功的 key_str
+                    return result, result.get('size', 0), key_str, "SUCCESS" 
                 except json.JSONDecodeError:
                     return None, 0, None, "INVALID_JSON"
             
@@ -268,7 +267,6 @@ class FofaAPIClient:
         
         status_code, content = self._make_request_sync(url=url, proxy=self.default_proxy)
         
-        # ... (错误处理与解析逻辑与之前版本类似，确保使用 key_str)
         if status_code == 200:
             try:
                 result = json.loads(content)
@@ -306,7 +304,6 @@ class FofaAPIClient:
             }
 
             for future in concurrent.futures.as_completed(future_to_page):
-                # ... (线程池处理逻辑，与之前版本类似)
                 if stop_flag:
                     executor.shutdown(wait=False, cancel_futures=True)
                     return all_results
@@ -330,7 +327,7 @@ class FofaAPIClient:
 STATE_KKFOFA_QUERY = 1
 STATE_KKFOFA_MODE = 2
 STATE_SETTINGS_MAIN = 3
-STATE_ADD_KEY = 4 # 状态简化：只输入 Key
+STATE_ADD_KEY = 4 
 STATE_SET_THREADS = 6
 STATE_DOWNLOAD_SCRIPT = 7 
 
@@ -411,21 +408,11 @@ def download_script_handler(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 
-# --- FOFA 查询对话处理 ---
-def kkfofa_query_command(update: Update, context: CallbackContext) -> int:
-    """进入 FOFA 查询流程，提示用户输入查询语句。"""
-    config = load_config()
-    if not config.get("api_keys"):
-        update.message.reply_text("❌ 您尚未配置 FOFA API Key。请使用 /settings 配置。")
-        return ConversationHandler.END
-        
-    update.message.reply_text("请输入 **FOFA 查询语句** (例如：`title=\"xxx\" && country=\"CN\"`)：", parse_mode=ParseMode.MARKDOWN)
-    return STATE_KKFOFA_QUERY
-
-def process_fofa_query(update: Update, context: CallbackContext) -> int:
-    """接收查询语句并启动 FOFA 查询任务。"""
-    fofa_query = update.message.text
-    context.user_data['fofa_query_str'] = fofa_query
+# --- FOFA 辅助函数：显示模式按钮 ---
+def show_query_mode(update: Update, context: CallbackContext, query_str: str) -> int:
+    """显示查询模式按钮，并将查询字符串存储在 user_data 中。"""
+    
+    context.user_data['fofa_query_str'] = query_str
     
     keyboard = [
         [
@@ -436,12 +423,41 @@ def process_fofa_query(update: Update, context: CallbackContext) -> int:
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    update.message.reply_text(
-        f"✅ 已接收查询语句：`{fofa_query}`\n\n请选择查询模式：", 
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
+    text = f"✅ 已接收查询语句：`{query_str}`\n\n请选择查询模式： (Bot Owner ID: {load_config().get('owner_id')})"
+
+    # 根据触发方式选择回复方式
+    if update.callback_query:
+         # 如果是从 Mode 选择菜单返回，则编辑原消息
+        update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    elif update.message:
+        # 如果是新的消息或命令，则发送新消息
+        update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
     return STATE_KKFOFA_MODE
+
+
+# --- FOFA 查询对话处理 ---
+def kkfofa_query_command(update: Update, context: CallbackContext) -> int:
+    """进入 FOFA 查询流程。检查参数以支持即时查询。"""
+    config = load_config()
+    if not config.get("api_keys"):
+        update.message.reply_text("❌ 您尚未配置 FOFA API Key。请使用 /settings 配置。", parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+        
+    if context.args:
+        # 修复点：如果命令后带有参数，则将参数拼接起来作为查询语句，并直接进入模式选择
+        query_str = " ".join(context.args)
+        return show_query_mode(update, context, query_str)
+    else:
+        # 如果没有参数，则提示用户输入，进入等待状态
+        update.message.reply_text("请输入 **FOFA 查询语句** (例如：`title=\"xxx\" && country=\"CN\"`)：", parse_mode=ParseMode.MARKDOWN)
+        return STATE_KKFOFA_QUERY
+
+def process_fofa_query(update: Update, context: CallbackContext) -> int:
+    """接收查询语句并启动 FOFA 查询任务。（此函数仅处理用户在收到提示后发送的第二条消息）"""
+    fofa_query = update.message.text
+    return show_query_mode(update, context, fofa_query)
+
 
 def query_mode_callback(update: Update, context: CallbackContext) -> int:
     """根据用户选择的模式设置查询参数并执行查询。"""
@@ -491,8 +507,8 @@ def query_mode_callback(update: Update, context: CallbackContext) -> int:
     
     # 4. 最终结果处理
     if final_count > 0:
-        # (历史记录保存省略)
         key_display = f"`{key_str[:6]}...`"
+        # 格式化输出前 5 条结果
         first_results_str = "\n".join([f"| {r[0]:<40} | {r[1]:<15} |" for r in all_results[:5]])
         output = (
             f"🎉 **任务完成！** 抓取结果 **{final_count}** 条 (目标 {total_size} 条)。\n\n"
@@ -520,7 +536,7 @@ def query_mode_callback(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 
-# --- 设置对话处理 (关键修改区域：Key 管理简化) ---
+# --- 设置对话处理 ---
 def settings_command(update: Update, context: CallbackContext) -> int:
     """进入设置主菜单。"""
     config = load_config()
@@ -575,7 +591,7 @@ def settings_callback(update: Update, context: CallbackContext) -> int:
     elif action == 'proxy':
         query.edit_message_text("🌐 **代理设置**\n请输入代理地址 (如：`http://user:pass@host:port`)，输入 `None` 清除：")
         context.user_data['settings_mode'] = 'proxy'
-        return STATE_ADD_KEY # 复用状态
+        return STATE_ADD_KEY 
         
     elif action == 'exit':
         query.edit_message_text("✅ 已退出设置菜单。")
@@ -599,11 +615,12 @@ def key_management_callback(update: Update, context: CallbackContext) -> int:
         config["api_keys"] = []
         save_config(config)
         query.edit_message_text("🗑️ **已清空所有 API Key。**")
+        # 必须返回 ConversationHandler.END 来结束当前 key_management 状态，并让 settings_command 重新发送菜单
         return settings_command(update, context) 
 
     elif action == 'back':
         # 模拟回到 settings_command
-        query.message.text = "返回" # 临时设置 text 属性以复用 settings_command
+        # 注意: 必须使用 query.message 来获取 message 对象，因为 settings_command 期望一个 message 对象
         return settings_command(query.message, context)
         
     return STATE_ADD_KEY
@@ -670,12 +687,11 @@ def help_command(update: Update, context: CallbackContext):
                               "/upgrade - 仅限 Owner，从外部链接升级脚本。\n"
                               "/stop - 停止当前正在执行的查询任务。")
 
-# --- 主函数和 Bot 启动 ---
+# --- 主函数和 Bot 启动 (应用 allow_reentry 修复对话中断问题) ---
 def main():
     """主函数，负责启动 Bot。"""
     if BOT_TOKEN == '8325002891:AAHzYRlWn2Tq_lMyzbfBbkhPC-vX8LqS6kw':
         logger.error("BOT_TOKEN 仍为默认值，请替换为您的 Bot Token。")
-        # 尽管有警告，我们仍然允许运行以便测试其他功能
         
     config = load_config()
     save_config(config) 
@@ -695,7 +711,9 @@ def main():
                 STATE_KKFOFA_QUERY: [MessageHandler(Filters.text & ~Filters.command, process_fofa_query)],
                 STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
             },
-            fallbacks=[unified_stop_handler] 
+            fallbacks=[unified_stop_handler],
+            # 修复点：允许其他 ConversationHandler 中断此对话
+            allow_reentry=True 
         )
         
         # 2. 设置对话
@@ -703,13 +721,15 @@ def main():
             entry_points=[CommandHandler("settings", settings_command)],
             states={
                 STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_callback, pattern=r"^set_")],
-                STATE_ADD_KEY: [ # Key/代理输入的统一状态
+                STATE_ADD_KEY: [ 
                     CallbackQueryHandler(key_management_callback, pattern=r"^key_"),
                     MessageHandler(Filters.text & ~Filters.command, add_key_or_proxy_handler),
                 ],
                 STATE_SET_THREADS: [MessageHandler(Filters.text & ~Filters.command, set_threads_handler)],
             },
-            fallbacks=[unified_stop_handler]
+            fallbacks=[unified_stop_handler],
+            # 修复点：允许其他 ConversationHandler 中断此对话
+            allow_reentry=True 
         )
         
         # 3. 脚本升级对话
@@ -718,7 +738,9 @@ def main():
             states={
                 STATE_DOWNLOAD_SCRIPT: [MessageHandler(Filters.text & ~Filters.command, download_script_handler)],
             },
-            fallbacks=[unified_stop_handler]
+            fallbacks=[unified_stop_handler],
+            # 修复点：允许其他 ConversationHandler 中断此对话
+            allow_reentry=True 
         )
 
         # 4. 注册所有 Handler
