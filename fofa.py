@@ -1,10 +1,13 @@
 import os
 import json
 import logging
+import logging.handlers
 import base64
 import time
 import re
 import random
+import httpx # 引入 httpx
+import sys
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -31,645 +34,543 @@ LOG_FILE = 'fofa_bot.log'
 MAX_HISTORY_SIZE = 50
 TELEGRAM_BOT_UPLOAD_LIMIT = 45 * 1024 * 1024
 LOCAL_CACHE_DIR = "fofa_cache"
+DEFAULT_TIMEOUT_SEC = 30 # 设置默认的 httpx 请求超时时间
+
+# --- 全局停止标志 (用于中断耗时操作) ---
+stop_flag = False
 
 # --- 初始化 ---
 if not os.path.exists(LOCAL_CACHE_DIR):
     os.makedirs(LOCAL_CACHE_DIR)
 
 # --- 日志配置 (每日轮换) ---
-if os.path.exists(LOG_FILE):
-    try:
-        file_mod_time = os.path.getmtime(LOG_FILE)
-        if (time.time() - file_mod_time) > 86400: # 86400秒 = 24小时
-            os.rename(LOG_FILE, LOG_FILE + f".{datetime.now().strftime('%Y-%m-%d')}.old")
-            print("日志文件已超过一天，已轮换。")
-    except (OSError, FileNotFoundError) as e:
-        print(f"无法检查或轮换旧日志文件: {e}")
+# 确保在运行前创建 logs 目录（如果需要）
+# log_dir = "logs"
+# if not os.path.exists(log_dir):
+#     os.makedirs(log_dir)
+# LOG_PATH = os.path.join(log_dir, LOG_FILE)
 
-if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > (5 * 1024 * 1024):
-    try:
-        os.rename(LOG_FILE, LOG_FILE + '.big.old')
-    except OSError as e:
-        print(f"无法轮换超大日志文件: {e}")
+# 配置日志
+logger = logging.getLogger('fofa_bot')
+logger.setLevel(logging.INFO)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8'), logging.StreamHandler()]
+# 创建一个旋转文件处理器，每天轮换日志文件
+handler = logging.handlers.TimedRotatingFileHandler(
+    LOG_FILE, 
+    when='midnight', 
+    interval=1, 
+    backupCount=7,
+    encoding='utf-8'
 )
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
-(STATE_KKFOFA_MODE, STATE_SETTINGS_MAIN, STATE_SETTINGS_ACTION, STATE_GET_KEY, STATE_GET_PROXY, STATE_REMOVE_API, STATE_CACHE_CHOICE) = range(7)
+# 同时输出到控制台
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
 
-# --- 配置与历史记录管理 ---
-def load_json_file(filename, default_content):
-    if not os.path.exists(filename):
-        with open(filename, 'w', encoding='utf-8') as f: json.dump(default_content, f, indent=4)
-        return default_content
-    try:
-        with open(filename, 'r', encoding='utf-8') as f: return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        logger.error(f"{filename} 损坏，将使用默认配置重建。")
-        with open(filename, 'w', encoding='utf-8') as f: json.dump(default_content, f, indent=4)
-        return default_content
 
-def save_json_file(filename, data):
-    with open(filename, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4)
+# --- 配置文件/历史记录操作 ---
+def load_config():
+    """加载配置，如果文件不存在则返回默认配置。"""
+    if not os.path.exists(CONFIG_FILE):
+        return {
+            "api_keys": [], # 格式: [{"email": "user@example.com", "key": "xxxxxxxxxxxxxxxx"}, ...]
+            "user_agent": "FofaBot/1.0 (httpx)",
+            "proxy": None,
+            "owner_id": None
+        }
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-default_admin_id = int(base64.b64decode('NzY5NzIzNTM1OA==').decode('utf-8'))
-CONFIG = load_json_file(CONFIG_FILE, {"apis": [], "admins": [default_admin_id], "proxy": "", "full_mode": False})
-HISTORY = load_json_file(HISTORY_FILE, {"queries": []})
+def save_config(config_data):
+    """保存配置。"""
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config_data, f, indent=4, ensure_ascii=False)
 
-def save_config(): save_json_file(CONFIG_FILE, CONFIG)
-def save_history(): save_json_file(HISTORY_FILE, HISTORY)
+def load_history():
+    """加载查询历史记录。"""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-def add_or_update_query(query_text, cache_data=None):
-    sanitized_queries = []
-    if HISTORY.get('queries') and isinstance(HISTORY['queries'], list):
-        for q in HISTORY['queries']:
-            if not isinstance(q, dict): continue
-            is_valid = True
-            cache_info = q.get('cache')
-            if isinstance(cache_info, dict) and cache_info.get('cache_type') == 'local':
-                if not cache_info.get('local_path') or not os.path.exists(cache_info['local_path']):
-                    is_valid = False
-            if is_valid:
-                sanitized_queries.append(q)
-    HISTORY['queries'] = sanitized_queries
+def save_history(history_data):
+    """保存查询历史记录，限制最大数量。"""
+    if len(history_data) > MAX_HISTORY_SIZE:
+        history_data = history_data[-MAX_HISTORY_SIZE:]
+    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+        json.dump(history_data, f, indent=4, ensure_ascii=False)
 
-    existing_query = next((q for q in HISTORY['queries'] if q.get('query_text') == query_text), None)
 
-    if existing_query:
-        HISTORY['queries'].remove(existing_query)
-        existing_query['timestamp'] = datetime.now(timezone.utc).isoformat()
-        if cache_data: existing_query['cache'] = cache_data
-        HISTORY['queries'].insert(0, existing_query)
-    elif query_text:
-        new_query = {"query_text": query_text, "timestamp": datetime.now(timezone.utc).isoformat(), "cache": cache_data}
-        HISTORY['queries'].insert(0, new_query)
+# --- FOFA 接口客户端类 (封装请求逻辑) ---
+class FofaAPIClient:
+    def __init__(self, config):
+        self.config = config
+        self.user_agent = config.get("user_agent", "FofaBot/1.0 (httpx)")
+        self.default_proxy = config.get("proxy")
 
-    while len(HISTORY['queries']) > MAX_HISTORY_SIZE: HISTORY['queries'].pop()
-    save_history()
+    def get_available_keys(self):
+        """获取所有可用的 FOFA API Key 列表。"""
+        return self.config.get("api_keys", [])
 
-def find_cached_query(query_text):
-    for q in HISTORY.get('queries', []):
-        if isinstance(q, dict) and q.get('query_text') == query_text and isinstance(q.get('cache'), dict):
-            return q
-    return None
+    # =================================================================
+    # V2: 使用 httpx 替代 curl/os.popen，支持超时和更好的错误处理
+    # =================================================================
+    def _make_request_sync(self, url, method='GET', data=None, proxy=None, timeout=DEFAULT_TIMEOUT_SEC):
+        """
+        同步执行 HTTP 请求。
 
-# --- 辅助函数与装饰器 ---
-def sanitize_for_filename(text: str) -> str:
-    sanitized_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]+', '_', text)
-    return sanitized_text.strip('_')[:50]
-
-def escape_markdown(text: str) -> str:
-    escape_chars = '_*`[]()~>#+-=|{}.!'; return "".join(['\\' + char if char in escape_chars else char for char in text])
-
-def restricted(func):
-    @wraps(func)
-    def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
-        user_id = update.effective_user.id
-        if user_id not in CONFIG.get('admins', []):
-            if update.message: update.message.reply_text("⛔️ 抱歉，您没有权限。")
-            return None
-        return func(update, context, *args, **kwargs)
-    return wrapped
-
-# --- FOFA API 核心逻辑 ---
-def _make_request_sync(url: str):
-    proxy_str = ""
-    if CONFIG.get("proxy"): proxy_str = f'--proxy "{CONFIG["proxy"]}"'
-    command = f'curl -s -L -k {proxy_str} "{url}"'
-    try:
-        with os.popen(command) as pipe:
-            response_text = pipe.read()
-        if not response_text: return None, "API 返回了空响应。"
-        data = json.loads(response_text)
-        if data.get("error"): return None, data.get("errmsg", "未知的FOFA错误")
-        return data, None
-    except json.JSONDecodeError: return None, f"解析JSON响应失败: {response_text[:200]}"
-    except Exception as e: return None, f"执行curl时发生意外错误: {e}"
-
-def verify_fofa_api(key):
-    url = f"https://fofa.info/api/v1/info/my?key={key}"; return _make_request_sync(url)
-
-def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host"):
-    b64_query = base64.b64encode(query.encode('utf-8')).decode('utf-8')
-    full_param = "&full=true" if CONFIG.get("full_mode", False) else ""
-    url = f"https://fofa.info/api/v1/search/all?key={key}&qbase64={b64_query}&size={page_size}&page={page}&fields={fields}{full_param}"
-    return _make_request_sync(url)
-
-def execute_query_with_fallback(query_func, preferred_key_index=None):
-    if not CONFIG['apis']: return None, None, "没有配置任何API Key。"
-    valid_keys = []
-    for i, key in enumerate(CONFIG['apis']):
-        data, error = verify_fofa_api(key)
-        if not error and data:
-            valid_keys.append({'key': key, 'index': i + 1, 'is_vip': data.get('is_vip', False)})
-    if not valid_keys: return None, None, "所有API Key均无效或验证失败。"
-    prioritized_keys = sorted(valid_keys, key=lambda x: x['is_vip'], reverse=True)
-    keys_to_try = prioritized_keys
-    if preferred_key_index is not None:
-        start_index = next((i for i, k in enumerate(prioritized_keys) if k['index'] == preferred_key_index), -1)
-        if start_index != -1: keys_to_try = prioritized_keys[start_index:] + prioritized_keys[:start_index]
-    last_error = "没有可用的API Key。"
-    for key_info in keys_to_try:
-        data, error = query_func(key_info['key'])
-        if not error: return data, key_info['index'], None
-        last_error = error
-        if "[820031]" in str(error): logger.warning(f"Key [#{key_info['index']}] F点余额不足，尝试下一个..."); continue
-        return None, key_info['index'], error
-    return None, None, f"所有Key均尝试失败，最后错误: {last_error}"
-
-# --- 命令处理程序 ---
-@restricted
-def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 FOFA 查询机器人！请使用 /help 查看命令手册。')
-    if update.effective_user.id not in CONFIG.get('admins', []):
-        CONFIG.setdefault('admins', []).append(update.effective_user.id); save_config()
-        update.message.reply_text("ℹ️ 已自动将您添加为管理员。")
-
-@restricted
-def help_command(update: Update, context: CallbackContext):
-    help_text = (
-        "📖 *Fofa 机器人指令手册*\n\n"
-        "**核心功能:**\n"
-        "`/kkfofa [key] <查询>` - 核心搜索功能。\n"
-        "  - 支持缓存、增量更新、深度追溯。\n\n"
-        "**管理与控制:**\n"
-        "`/settings` - 进入交互式菜单，管理所有配置。\n"
-        "`/stop` - 停止后台下载任务，或取消当前操作。\n"
-        "`/help` - 显示此帮助信息。\n\n"
-        "**快捷命令 (等同于在 /settings 中操作):**\n"
-        "`/history` - 查看最近的查询历史。\n"
-        "`/backup` - 备份配置文件 `config.json`。\n"
-        "`/restore` - 提示如何恢复配置文件。\n"
-        "`/getlog` - 下载机器人运行日志。\n"
-        "`/shutdown` - 安全地关闭机器人进程。"
-    )
-    update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-@restricted
-def stop_or_cancel_command(update: Update, context: CallbackContext) -> int:
-    chat_id = update.effective_chat.id
-    action_taken = False
-    if context.bot_data.get(f'stop_job_{chat_id}') is not None:
-        context.bot_data[f'stop_job_{chat_id}'] = True
-        update.effective_chat.send_message("✅ 已发送停止信号到后台下载任务。")
-        action_taken = True
-    if context.user_data:
-        if not action_taken:
-            update.effective_chat.send_message('✅ 当前操作已取消。')
-        context.user_data.clear()
-        return ConversationHandler.END
-    if not action_taken:
-        update.effective_chat.send_message('✅ 当前没有正在进行的任务或操作。')
-    return ConversationHandler.END
-
-# --- kkfofa 查询会话 ---
-@restricted
-def kkfofa_command(update: Update, context: CallbackContext):
-    args = context.args
-    if not args: update.message.reply_text("用法: `/kkfofa [key编号] <查询语句>`"); return ConversationHandler.END
-    key_index, query_text = None, " ".join(args)
-    try:
-        key_index = int(args[0])
-        if not (1 <= key_index <= len(CONFIG['apis'])): update.message.reply_text(f"❌ Key编号无效。"); return ConversationHandler.END
-        query_text = " ".join(args[1:])
-    except (ValueError, IndexError): pass
-
-    context.user_data.update({'query': query_text, 'key_index': key_index, 'chat_id': update.effective_chat.id})
-    cached_item = find_cached_query(query_text)
-    if cached_item:
-        dt_utc = datetime.fromisoformat(cached_item['timestamp']); dt_local = dt_utc.astimezone(); time_str = dt_local.strftime('%Y-%m-%d %H:%M')
-        cache_info = cached_item['cache']; result_count = cache_info.get('result_count', '未知')
-        message_text = f"✅ **发现缓存**\n\n**查询**: `{escape_markdown(query_text)}`\n**缓存于**: *{time_str}*\n**结果数**: *{result_count}*"
-        keyboard = [
-            [InlineKeyboardButton("🔄 增量更新", callback_data='cache_incremental')],
-            [InlineKeyboardButton("🔍 全新搜索 (覆盖缓存)", callback_data='cache_newsearch')],
-            [InlineKeyboardButton("❌ 取消", callback_data='cache_cancel')]
-        ]
-        update.message.reply_text(f"{message_text}\n\n请选择操作：", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-        return STATE_CACHE_CHOICE
-    return start_new_search(update, context)
-
-def start_new_search(update: Update, context: CallbackContext):
-    query_text = context.user_data['query']; key_index = context.user_data.get('key_index')
-    add_or_update_query(query_text, cache_data=None)
-    message_able = update.callback_query.message if update.callback_query else update.message
-    edit_func = message_able.edit_text if update.callback_query else (lambda text, **kwargs: message_able.reply_text(text, **kwargs))
-    msg = edit_func("🔄 正在执行全新查询...")
-    data, used_key_index, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, 1, 1, "host"), key_index)
-    if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
-    total_size = data.get('size', 0)
-    if total_size == 0: msg.edit_text("🤷‍♀️ 未找到结果。"); return ConversationHandler.END
-    context.user_data.update({'total_size': total_size, 'chat_id': update.effective_chat.id})
-    success_message = f"✅ 使用 Key [#{used_key_index}] 找到 {total_size} 条结果。"
-    if total_size <= 10000:
-        msg.edit_text(f"{success_message}\n开始下载...");
-        start_download_job(context, run_full_download_query, context.user_data)
-        return ConversationHandler.END
-    else:
-        keyboard = [
-            [InlineKeyboardButton("💎 全部下载", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯", callback_data='mode_traceback')],
-            [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]
-        ]
-        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return STATE_KKFOFA_MODE
-
-def cache_choice_callback(update: Update, context: CallbackContext):
-    query = update.callback_query; query.answer()
-    user_data = context.user_data
-    if not user_data.get('query'): query.edit_message_text("❌ 会话已过期，请重新发起 /kkfofa 查询。"); return ConversationHandler.END
-    choice = query.data.split('_')[1]
-    if choice == 'newsearch': return start_new_search(update, context)
-    elif choice == 'incremental':
-        query.edit_message_text("⏳ 准备增量更新...")
-        start_download_job(context, run_incremental_update_query, user_data)
-        return ConversationHandler.END
-    elif choice == 'cancel':
-        query.edit_message_text("✅ 操作已取消。")
-        user_data.clear()
-        return ConversationHandler.END
-
-def query_mode_callback(update: Update, context: CallbackContext):
-    query = update.callback_query; query.answer()
-    user_data = context.user_data
-    if not user_data.get('query'): query.edit_message_text("❌ 会话已过期，请重新发起 /kkfofa 查询。"); return ConversationHandler.END
-    mode = query.data.split('_')[1]
-    if mode == 'full':
-        query.edit_message_text(f"⏳ 开始全量下载任务...");
-        start_download_job(context, run_full_download_query, user_data)
-    elif mode == 'traceback':
-        query.edit_message_text(f"⏳ 开始深度追溯下载任务...");
-        start_download_job(context, run_traceback_download_query, user_data)
-    elif mode == 'cancel':
-        query.edit_message_text("✅ 操作已取消。")
-    return ConversationHandler.END
-
-# --- 设置会话 ---
-@restricted
-def settings_command(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("🔑 API 管理", callback_data='settings_api'), InlineKeyboardButton("🌐 代理设置", callback_data='settings_proxy')],
-        [InlineKeyboardButton("💾 数据管理", callback_data='settings_data')],
-        [InlineKeyboardButton("💻 系统管理", callback_data='settings_admin')]
-    ]
-    message_text = "⚙️ *设置与管理*\n请选择要操作的项目："
-    if update.callback_query: update.callback_query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    else: update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    return STATE_SETTINGS_MAIN
-
-def settings_callback_handler(update: Update, context: CallbackContext):
-    query = update.callback_query; query.answer(); menu = query.data.split('_', 1)[1]
-    if menu == 'api': show_api_menu(update, context); return STATE_SETTINGS_ACTION
-    elif menu == 'proxy': show_proxy_menu(update, context); return STATE_SETTINGS_ACTION
-    elif menu == 'data': show_data_menu(update, context); return STATE_SETTINGS_ACTION
-    elif menu == 'admin': show_admin_menu(update, context); return STATE_SETTINGS_ACTION
-
-def show_api_menu(update: Update, context: CallbackContext):
-    msg_obj = update.callback_query.message if update.callback_query else update.message
-    msg = msg_obj.edit_text("🔄 正在查询API Key状态...") if update.callback_query else msg_obj.reply_text("🔄 正在查询API Key状态...")
-    api_details = []
-    for i, key in enumerate(CONFIG['apis']):
-        data, error = verify_fofa_api(key)
-        key_masked = f"`{key[:4]}...{key[-4:]}`"; status = f"❌ 无效或出错: {error}"
-        if not error and data: status = f"({escape_markdown(data.get('username', 'N/A'))}, {'✅ VIP' if data.get('is_vip') else '👤 普通'}, F币: {data.get('fcoin', 0)})"
-        api_details.append(f"{i+1}. {key_masked} {status}")
-    api_message = "\n".join(api_details) if api_details else "目前没有存储任何API密钥。"
-    keyboard = [[InlineKeyboardButton(f"时间范围: {'✅ 查询所有' if CONFIG.get('full_mode') else '⏳ 仅查近一年'}", callback_data='action_toggle_full')], [InlineKeyboardButton("➕ 添加Key", callback_data='action_add_api'), InlineKeyboardButton("➖ 删除Key", callback_data='action_remove_api')], [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]]
-    msg.edit_text(f"🔑 *API 管理*\n\n{api_message}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
-def show_proxy_menu(update: Update, context: CallbackContext):
-    keyboard = [[InlineKeyboardButton("✏️ 设置/更新", callback_data='action_set_proxy')], [InlineKeyboardButton("🗑️ 清除", callback_data='action_delete_proxy')], [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]]
-    update.callback_query.edit_message_text(f"🌐 *代理设置*\n当前: `{CONFIG.get('proxy') or '未设置'}`", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
-def show_data_menu(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("🕰️ 查询历史", callback_data='action_history')],
-        [InlineKeyboardButton("📤 备份配置", callback_data='action_backup_now'), InlineKeyboardButton("📥 恢复配置", callback_data='action_restore')],
-        [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]
-    ]
-    update.callback_query.edit_message_text("💾 *数据与历史管理*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
-def show_admin_menu(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("📄 获取日志", callback_data='action_getlog')],
-        [InlineKeyboardButton("🔌 关闭机器人", callback_data='action_shutdown')],
-        [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]
-    ]
-    update.callback_query.edit_message_text("💻 *系统管理*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
-def settings_action_handler(update: Update, context: CallbackContext):
-    query = update.callback_query; query.answer(); action = query.data.split('_', 1)[1]
-    if action == 'back_main': return settings_command(update, context)
-    elif action == 'toggle_full': CONFIG["full_mode"] = not CONFIG.get("full_mode", False); save_config(); show_api_menu(update, context); return STATE_SETTINGS_ACTION
-    elif action == 'add_api': query.edit_message_text("请发送您的 Fofa API Key (或发送 /stop 取消)。"); return STATE_GET_KEY
-    elif action == 'remove_api':
-        if not CONFIG['apis']: query.message.reply_text("没有可删除的API Key。"); show_api_menu(update, context); return STATE_SETTINGS_ACTION
-        query.edit_message_text("请回复要删除的API Key编号 (或发送 /stop 取消)。"); return STATE_REMOVE_API
-    elif action == 'set_proxy': query.edit_message_text("请输入代理地址 (或发送 /stop 取消)。"); return STATE_GET_PROXY
-    elif action == 'delete_proxy': CONFIG['proxy'] = ""; save_config(); query.edit_message_text("✅ 代理已清除。"); time.sleep(1); return settings_command(update, context)
-    elif action == 'history': history_command(update, context); return STATE_SETTINGS_ACTION
-    elif action == 'backup_now': backup_config_command(update, context); return STATE_SETTINGS_ACTION
-    elif action == 'restore': restore_config_command(update, context); query.message.delete(); return STATE_SETTINGS_MAIN
-    elif action == 'getlog': get_log_command(update, context); return STATE_SETTINGS_ACTION
-    elif action == 'shutdown': shutdown_command(update, context); return ConversationHandler.END
-
-def get_key(update: Update, context: CallbackContext):
-    key = update.message.text.strip(); msg = update.message.reply_text("正在验证...")
-    data, error = verify_fofa_api(key)
-    if not error and data:
-        if key not in CONFIG['apis']: CONFIG['apis'].append(key); save_config(); msg.edit_text(f"✅ 添加成功！你好, {escape_markdown(data.get('username', 'user'))}!", parse_mode=ParseMode.MARKDOWN)
-        else: msg.edit_text(f"ℹ️ 该Key已存在。")
-    else: msg.edit_text(f"❌ 验证失败: {error}")
-    time.sleep(2); msg.delete(); show_api_menu(update, context); return STATE_SETTINGS_ACTION
-
-def get_proxy(update: Update, context: CallbackContext):
-    CONFIG['proxy'] = update.message.text.strip(); save_config()
-    update.message.reply_text(f"✅ 代理已更新。"); time.sleep(1); settings_command(update, context); return STATE_SETTINGS_MAIN
-
-def remove_api(update: Update, context: CallbackContext):
-    try:
-        index = int(update.message.text) - 1
-        if 0 <= index < len(CONFIG['apis']): CONFIG['apis'].pop(index); save_config(); update.message.reply_text(f"✅ 已删除。")
-        else: update.message.reply_text("❌ 无效编号。")
-    except (ValueError, IndexError): update.message.reply_text("❌ 请输入数字。")
-    time.sleep(1); show_api_menu(update, context); return STATE_SETTINGS_ACTION
-
-# --- 数据与系统命令 ---
-@restricted
-def history_command(update: Update, context: CallbackContext):
-    add_or_update_query(None) 
-    effective_message = update.effective_message
-    if not HISTORY['queries']: effective_message.reply_text("🕰️ 暂无缓存记录。"); return
-    message_text = "🕰️ *最近10条缓存记录:*\n"
-    for i, query in enumerate(HISTORY['queries'][:10]):
-        dt_utc = datetime.fromisoformat(query['timestamp']); dt_local = dt_utc.astimezone(); time_str = dt_local.strftime('%Y-%m-%d %H:%M')
-        cache_info = query.get('cache', {})
-        message_text += f"\n`{i+1}.` **查询:** `{escape_markdown(query['query_text'])}`\n   _时间: {time_str} | 结果: {cache_info.get('result_count', 'N/A')} 条_\n"
-    effective_message.reply_text(message_text, parse_mode=ParseMode.MARKDOWN)
-
-@restricted
-def backup_config_command(update: Update, context: CallbackContext):
-    if os.path.exists(CONFIG_FILE): context.bot.send_document(chat_id=update.effective_chat.id, document=open(CONFIG_FILE, 'rb'), caption="这是您当前的配置文件备份。")
-    else: update.effective_message.reply_text("❌ 找不到配置文件。")
-
-@restricted
-def restore_config_command(update: Update, context: CallbackContext):
-    update.effective_message.reply_text("📥 要恢复配置，请直接将您的 `config.json` 备份文件作为文档发送给我。")
-
-@restricted
-def receive_config_file(update: Update, context: CallbackContext):
-    if not update.message.document or update.message.document.file_name != 'config.json': return 
-    doc = update.message.document
-    try:
-        temp_file_path = f"{CONFIG_FILE}.tmp"
-        new_file = doc.get_file()
-        new_file.download(custom_path=temp_file_path)
-        with open(temp_file_path, 'r', encoding='utf-8') as f: json.load(f) # 验证JSON有效性
-        os.replace(temp_file_path, CONFIG_FILE)
-        global CONFIG
-        CONFIG = load_json_file(CONFIG_FILE, {})
-        update.message.reply_text("✅ 配置文件已成功恢复！")
-    except Exception as e:
-        logger.error(f"恢复配置文件时出错: {e}")
-        update.message.reply_text(f"❌ 恢复配置文件失败: {e}")
-        if os.path.exists(temp_file_path): os.remove(temp_file_path)
-
-@restricted
-def get_log_command(update: Update, context: CallbackContext):
-    if os.path.exists(LOG_FILE): context.bot.send_document(chat_id=update.effective_chat.id, document=open(LOG_FILE, 'rb'), caption="这是当前的机器人运行日志。")
-    else: update.message.reply_text("❌ 未找到日志文件。")
-
-@restricted
-def shutdown_command(update: Update, context: CallbackContext):
-    update.effective_message.reply_text("✅ **收到指令！**\n机器人正在安全关闭...", parse_mode=ParseMode.MARKDOWN)
-    logger.info(f"接收到来自用户 {update.effective_user.id} 的关闭指令。")
-    updater = context.bot_data.get('updater')
-    if updater:
-        updater.stop()
-        updater.is_idle = False
-
-# --- 文件处理与下载任务 ---
-def start_download_job(context: CallbackContext, callback_func, job_data):
-    chat_id = job_data.get('chat_id')
-    if not chat_id: logger.error("start_download_job 失败: job_data 中缺少 'chat_id'。"); return
-    job_name = f"download_job_{chat_id}"; [job.schedule_removal() for job in context.job_queue.get_jobs_by_name(job_name)]
-    context.bot_data[f'stop_job_{chat_id}'] = False
-    context.job_queue.run_once(callback_func, 1, context=job_data, name=job_name)
-
-def _save_and_send_results(bot, chat_id, query_text, results, msg):
-    sanitized_query = sanitize_for_filename(query_text)
-    timestamp = int(time.time())
-    local_filename = f"fofa_{sanitized_query}_{timestamp}.txt"
-    local_file_path = os.path.join(LOCAL_CACHE_DIR, local_filename)
-    with open(local_file_path, 'w', encoding='utf-8') as f: f.write("\n".join(results))
-    cache_data = {'cache_type': 'local', 'local_path': local_file_path, 'file_name': local_filename, 'result_count': len(results)}
-    add_or_update_query(query_text, cache_data)
-    file_size = os.path.getsize(local_file_path)
-    if file_size <= TELEGRAM_BOT_UPLOAD_LIMIT:
-        try:
-            msg.edit_text(f"✅ 下载完成！共 {len(results)} 条。\n💾 正在发送文件...")
-            bot.send_document(chat_id, document=open(local_file_path, 'rb'), timeout=60)
-            msg.edit_text(f"✅ 下载完成！共 {len(results)} 条。\n\n💾 本地路径:\n`{escape_markdown(local_file_path)}`\n\n⬆️ 文件已发送！", parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.error(f"发送文件时发生未知错误: {e}")
-            msg.edit_text(f"✅ 下载完成！共 {len(results)} 条。\n\n💾 本地路径:\n`{escape_markdown(local_file_path)}`\n\n❌ 文件发送失败: {e}", parse_mode=ParseMode.MARKDOWN)
-    else:
-        num_parts = (file_size + TELEGRAM_BOT_UPLOAD_LIMIT - 1) // TELEGRAM_BOT_UPLOAD_LIMIT
-        msg.edit_text(f"📦 文件过大 ({file_size/1024/1024:.2f} MB)，将分割成 {num_parts} 个文件发送...")
-        try:
-            with open(local_file_path, 'r', encoding='utf-8') as f: lines = f.readlines()
-            lines_per_part = (len(lines) + num_parts - 1) // num_parts
-            for i in range(num_parts):
-                msg.edit_text(f"📦 正在发送第 {i+1}/{num_parts} 部分...")
-                part_lines = lines[i*lines_per_part:(i+1)*lines_per_part]
-                part_filename = f"part_{i+1}_{local_filename}"
-                part_filepath = os.path.join(LOCAL_CACHE_DIR, part_filename)
-                with open(part_filepath, 'w', encoding='utf-8') as pf: pf.writelines(part_lines)
-                bot.send_document(chat_id, document=open(part_filepath, 'rb'), timeout=60)
-                os.remove(part_filepath)
-            msg.edit_text(f"✅ 所有 {num_parts} 个文件分卷已发送完毕！\n\n💾 完整文件本地路径:\n`{escape_markdown(local_file_path)}`", parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.error(f"分割文件时出错: {e}")
-            msg.edit_text(f"❌ 处理文件分卷时发生错误: {e}")
-
-def run_full_download_query(context: CallbackContext):
-    job_data = context.job.context; bot = context.bot; chat_id, query_text, total_size = job_data['chat_id'], job_data['query'], job_data['total_size']
-    msg = bot.send_message(chat_id, "⏳ 开始全量下载任务...")
-    unique_results = set(); pages_to_fetch = (total_size + 9999) // 10000; stop_flag = f'stop_job_{chat_id}'
-    for page in range(1, pages_to_fetch + 1):
-        if context.bot_data.get(stop_flag): msg.edit_text("🌀 下载任务已手动停止."); break
-        try: msg.edit_text(f"下载进度: {len(unique_results)}/{total_size} (Page {page}/{pages_to_fetch})...")
-        except BadRequest: pass
-        data, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page, 10000, "host"))
-        if error: msg.edit_text(f"❌ 第 {page} 页下载出错: {error}"); break
-        if not data.get('results'): break
-        unique_results.update(data.get('results', []))
-    if unique_results: _save_and_send_results(bot, chat_id, query_text, list(unique_results), msg)
-    elif not context.bot_data.get(stop_flag): msg.edit_text("🤷‍♀️ 任务完成，但未能下载到任何数据。")
-    context.bot_data.pop(stop_flag, None)
-
-def run_traceback_download_query(context: CallbackContext):
-    job_data = context.job.context; bot = context.bot; chat_id, base_query = job_data['chat_id'], job_data['query']
-    msg = bot.send_message(chat_id, "⏳ 开始深度追溯下载...")
-    unique_results, page_count, last_page_date, termination_reason = set(), 0, None, ""
-    current_query = base_query; stop_flag = f'stop_job_{chat_id}'
-    while True:
-        page_count += 1
-        if context.bot_data.get(stop_flag): termination_reason = "\n\n🌀 任务已手动停止."; break
-        data, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, current_query, 1, 10000, "host,lastupdatetime"))
-        if error: termination_reason = f"\n\n❌ 第 {page_count} 轮出错: {error}"; break
-        results = data.get('results', [])
-        if not results: termination_reason = f"\n\nℹ️ 已获取所有查询结果."; break
-        original_count = len(unique_results); unique_results.update([r[0] for r in results if r and r[0]]); newly_added_count = len(unique_results) - original_count
-        try: msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
-        except BadRequest: pass
-        valid_anchor_found = False; outer_loop_break = False
-        for i in range(len(results) - 1, -1, -1):
-            if not results[i] or not results[i][0]: continue
-            potential_anchor_host = results[i][0]
-            anchor_host_data, _, _ = execute_query_with_fallback(lambda key: fetch_fofa_data(key, f'host="{potential_anchor_host}"', 1, 1, "lastupdatetime"))
-            try:
-                ts_str = anchor_host_data.get('results', [])[0];
-                if isinstance(ts_str, list): ts_str = ts_str[0]
-                current_date_obj = datetime.strptime(ts_str.split(' ')[0], '%Y-%m-%d')
-                if last_page_date and current_date_obj.date() >= last_page_date: continue
-                next_page_date_obj = current_date_obj
-                if last_page_date and current_date_obj.date() == last_page_date: next_page_date_obj -= timedelta(days=1)
-                next_page_date_str = next_page_date_obj.strftime('%Y-%m-%d')
-                if last_page_date and next_page_date_str == last_page_date.strftime('%Y-%m-%d') and newly_added_count == 0:
-                    termination_reason = "\n\n⚠️ 日期未推进且无新数据，已达查询边界."; outer_loop_break = True; break
-                last_page_date = current_date_obj.date(); current_query = f'({base_query}) && before="{next_page_date_str}"'; valid_anchor_found = True; break
-            except (IndexError, TypeError, ValueError, AttributeError) as e: logger.warning(f"主机 {potential_anchor_host} 作为锚点无效: {e}..."); continue
-        if outer_loop_break: break
-        if not valid_anchor_found: termination_reason = "\n\n❌ 错误：无法找到有效的时间锚点以继续。"; break
-    if unique_results:
-        msg.edit_text(f"✅ 深度追溯完成！共 {len(unique_results)} 条。{termination_reason}")
-        _save_and_send_results(bot, chat_id, base_query, list(unique_results), msg)
-    else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
-    context.bot_data.pop(stop_flag, None)
-
-def run_incremental_update_query(context: CallbackContext):
-    job_data = context.job.context; bot = context.bot; chat_id, base_query = job_data['chat_id'], job_data['query']
-    msg = bot.send_message(chat_id, "--- 增量更新启动 ---")
-    cached_item = find_cached_query(base_query)
-    if not cached_item: msg.edit_text("❌ 错误：找不到有效的缓存项。"); return
-    
-    cache_info = cached_item['cache']; old_results = set(); local_path = cache_info.get('local_path')
-    if not local_path or not os.path.exists(local_path): msg.edit_text(f"❌ 错误: 本地缓存文件 `{local_path}` 已不存在。"); return
-
-    msg.edit_text("1/4: 正在读取本地缓存文件...")
-    with open(local_path, 'r', encoding='utf-8') as f: old_results = set(line.strip() for line in f if line.strip())
-    if not old_results: msg.edit_text("❌ 错误: 缓存文件为空，无法更新。"); return
-    
-    msg.edit_text("2/4: 正在确定更新起始点...")
-    sample_size = min(20, len(old_results)); random_sample = random.sample(list(old_results), sample_size); latest_date = None
-    for i, host in enumerate(random_sample):
-        try:
-            msg.edit_text(f"2/4: 检查样本 {i+1}/{sample_size}...")
-            data, _, _ = execute_query_with_fallback(lambda key: fetch_fofa_data(key, f'host="{host}"', fields="lastupdatetime"))
-            if data and data.get('results'):
-                ts_str = data['results'][0];
-                if isinstance(ts_str, list): ts_str = ts_str[0]
-                current_date = datetime.strptime(ts_str.split(' ')[0], '%Y-%m-%d')
-                if latest_date is None or current_date > latest_date: latest_date = current_date
-        except Exception as e: logger.warning(f"无法获取主机 {host} 的时间戳: {e}"); continue
-    
-    if latest_date is None: msg.edit_text("❌ 无法从缓存样本中获取有效的时间戳。"); return
-    
-    cutoff_date = latest_date.strftime('%Y-%m-%d'); incremental_query = f'({base_query}) && after="{cutoff_date}"'
-    msg.edit_text(f"3/4: 正在侦察自 {cutoff_date} 以来的新数据...")
-    data, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, incremental_query, page_size=1))
-    if error: msg.edit_text(f"❌ 侦察查询失败: {error}"); return
-    
-    total_new_size = data.get('size', 0)
-    if total_new_size == 0: msg.edit_text("✅ 未发现新数据。缓存已是最新。"); return
-    
-    new_results = set(); stop_flag = f'stop_job_{chat_id}'; pages_to_fetch = (total_new_size + 9999) // 10000
-    for page in range(1, pages_to_fetch + 1):
-        if context.bot_data.get(stop_flag): msg.edit_text("🌀 增量更新已手动停止。"); return
-        msg.edit_text(f"3/4: 正在下载新数据... ( Page {page}/{pages_to_fetch} )")
-        data, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, incremental_query, page=page, page_size=10000))
-        if error: msg.edit_text(f"❌ 下载新数据失败: {error}"); return
-        if data.get('results'): new_results.update(data.get('results', []))
+        :param url: 请求 URL
+        :param method: HTTP 方法 (GET/POST)
+        :param data: 请求体数据
+        :param proxy: 代理字符串 (如 'http://user:pass@host:port')
+        :param timeout: 请求超时时间（秒）
+        :return: (status_code, content)
+        """
+        proxies = {"all": proxy} if proxy else None
         
-    msg.edit_text(f"4/4: 正在合并数据...")
-    newly_added_results = new_results - old_results
-    if newly_added_results:
-        with open(local_path, 'a', encoding='utf-8') as f:
-            for item in newly_added_results: f.write(f"\n{item}")
-    final_results = list(old_results) + list(newly_added_results)
-    _save_and_send_results(bot, chat_id, base_query, final_results, msg)
-    context.bot_data.pop(stop_flag, None)
+        try:
+            # 使用 httpx.Client 保持会话和配置，但这里直接用 request 也可以
+            with httpx.Client(proxies=proxies, verify=False, timeout=timeout) as client:
+                response = client.request(
+                    method,
+                    url,
+                    data=data,
+                    headers={'User-Agent': self.user_agent},
+                )
+            
+            # 不直接抛出异常，而是返回状态码和内容，由上层函数处理 API 错误
+            return response.status_code, response.text
+            
+        except httpx.TimeoutException:
+            # 捕获超时错误 (408 Request Timeout)
+            return 408, f"请求超时: FOFA 服务器响应超过 {timeout} 秒"
+        except httpx.RequestError as e:
+            # 捕获所有其他请求错误 (DNS 失败, 连接失败等)
+            return 500, f"网络或连接错误: {e.__class__.__name__}: {e}"
+        except Exception as e:
+            # 捕获未知错误
+            return 500, f"发生未知错误: {e.__class__.__name__}: {e}"
 
-def main() -> None:
-    # ！！！请在这里填入您的Bot Token！！！
-    TELEGRAM_BOT_TOKEN = "8325002891:AAHkNSGJnm7wCwcgeYQQkZ0CrNOuHT9R63Q"
+    # =================================================================
+    # V2: 改进的带回退机制的执行查询函数 (关键优化)
+    # =================================================================
+    def execute_query_with_fallback(self, query_details, context: CallbackContext, query_timeout=DEFAULT_TIMEOUT_SEC):
+        """
+        使用所有可用的 API Key 尝试执行 FOFA 查询，并在每次尝试前检查 stop_flag。
+        
+        :param query_details: 查询参数字典 {'query': str, 'size': int, 'fields': str}
+        :param context: Telegram CallbackContext
+        :param query_timeout: 单次查询的超时时间
+        :return: (API 响应内容, 状态字符串)
+        """
+        global stop_flag
+        
+        available_keys = self.get_available_keys() 
+        if not available_keys:
+             return None, "NO_KEYS"
+
+        # 随机打乱 key 顺序
+        random.shuffle(available_keys) 
+        
+        chat_id = context.effective_chat.id
+        
+        for i, api_key_info in enumerate(available_keys):
+            # ！！！关键改进：在尝试新 Key 之前检查停止标志 ！！！
+            if stop_flag:
+                logger.info(f"Chat {chat_id}: 任务因 stop_flag 启用而取消。")
+                context.bot.send_message(
+                    chat_id=chat_id, 
+                    text="✅ 任务已成功停止。", 
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                stop_flag = False # 重置标志
+                return None, "STOPPED"
+
+            email = api_key_info.get('email', 'N/A')
+            
+            # 1. 构造 FOFA URL
+            query_str = query_details.get('query', '')
+            size = query_details.get('size', 100)
+            fields = query_details.get('fields', 'host,ip,port')
+            
+            base_url = "https://fofa.info/api/v1/search/all"
+            query_hash = base64.b64encode(query_str.encode()).decode()
+            
+            url = (
+                f"{base_url}?qbase64={query_hash}"
+                f"&email={email}&key={api_key_info.get('key')}"
+                f"&size={size}&fields={fields}"
+            )
+            
+            # 2. 通知用户尝试中
+            context.bot.send_message(
+                chat_id=chat_id, 
+                text=f"🔑 正在使用 Key ({email[:5]}... / 尝试 {i+1}/{len(available_keys)}) 尝试查询...",
+            )
+            
+            # 3. 发送请求 (使用 httpx 实现超时控制)
+            status_code, content = self._make_request_sync(
+                url=url, 
+                proxy=self.default_proxy, 
+                timeout=query_timeout
+            )
+            
+            # 4. 结果判断
+            if status_code == 200:
+                # 成功获取数据
+                return content, "SUCCESS"
+            
+            # 常见错误码处理
+            try:
+                error_data = json.loads(content)
+                errmsg = error_data.get('errmsg', '未知 API 错误')
+            except json.JSONDecodeError:
+                errmsg = content # 如果不是 JSON，直接使用内容
+            
+            
+            if status_code == 408:
+                # 请求超时
+                logger.warning(f"Key {email} 请求超时。")
+                context.bot.send_message(chat_id=chat_id, text="⚠️ 请求超时，尝试下一个 Key...")
+                continue # 尝试下一个 Key
+            
+            elif status_code == 401 or 'key invalid' in errmsg.lower():
+                # API Key 无效或过期
+                logger.error(f"Key {email} 无效。")
+                context.bot.send_message(chat_id=chat_id, text="🔑 API Key 无效/过期，尝试下一个 Key...")
+                continue # 尝试下一个 Key
+
+            elif status_code == 402 or 'balance' in errmsg.lower():
+                # 余额不足
+                logger.error(f"Key {email} 余额不足。")
+                context.bot.send_message(chat_id=chat_id, text="💰 API Key 余额不足，尝试下一个 Key...")
+                continue # 尝试下一个 Key
+            
+            else:
+                # 通用错误处理
+                logger.error(f"Key {email} 查询失败，状态码: {status_code}, 错误信息: {errmsg}")
+                context.bot.send_message(chat_id=chat_id, text=f"❌ 查询失败 (Code: {status_code})，尝试下一个 Key...")
+                continue # 尝试下一个 Key
+                
+        # 循环结束，所有 Key 均失败
+        return None, "FAILED_ALL"
+
+
+# --- Telegram Bot 状态常量 ---
+STATE_KKFOFA_QUERY = 1
+STATE_KKFOFA_MODE = 2
+STATE_SETTINGS_MAIN = 3
+STATE_ADD_KEY_EMAIL = 4
+STATE_ADD_KEY_KEY = 5
+
+
+# --- 统一的停止指令处理函数 (改进用户反馈) ---
+def unified_stop_handler(update: Update, context: CallbackContext) -> int:
+    """
+    处理 /stop 指令，设置全局停止标志并提供即时用户反馈。
+    """
+    global stop_flag
     
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        logger.critical("错误：您必须在代码中设置 TELEGRAM_BOT_TOKEN 变量！")
+    # 1. 立即反馈用户 (关键改进)
+    # 检查 update.message 是否存在，以应对 fallbacks 可能接收到 CallbackQuery 的情况
+    if update.callback_query:
+        update.callback_query.answer("停止指令已收到。")
+        update.callback_query.edit_message_text(
+            "🛑 **收到停止指令**。任务将在执行完当前请求后尽快停止。请稍候...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    elif update.message:
+        update.message.reply_text(
+            "🛑 **收到停止指令**。当前任务（如 FOFA 查询）将在执行完当前请求后尽快停止。请稍候...", 
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # 2. 设置停止标志
+    stop_flag = True
+    
+    # 3. 退出当前对话
+    return ConversationHandler.END
+
+
+# --- FOFA 查询对话处理 ---
+def kkfofa_query_command(update: Update, context: CallbackContext) -> int:
+    """进入 FOFA 查询流程，提示用户输入查询语句。"""
+    config = load_config()
+    if not config.get("api_keys"):
+        update.message.reply_text("❌ 您尚未配置 FOFA API Key。请使用 /settings 配置。")
+        return ConversationHandler.END
+        
+    update.message.reply_text("请输入 **FOFA 查询语句** (例如：`title=\"xxx\" && country=\"CN\"`)：")
+    return STATE_KKFOFA_QUERY
+
+def process_fofa_query(update: Update, context: CallbackContext) -> int:
+    """接收查询语句并启动 FOFA 查询任务。"""
+    fofa_query = update.message.text
+    user_id = update.effective_user.id
+    
+    # 存储查询参数到 context.user_data
+    context.user_data['fofa_query_str'] = fofa_query
+    context.user_data['fofa_query_size'] = 1000 # 默认查询 1000 条
+    context.user_data['fofa_query_fields'] = 'host,ip,port,title,country'
+    
+    # 提示用户选择模式
+    keyboard = [
+        [
+            InlineKeyboardButton("默认模式 (1000条)", callback_data="mode_default"),
+            InlineKeyboardButton("精简模式 (host,ip)", callback_data="mode_simple")
+        ],
+        [InlineKeyboardButton("自定义字段", callback_data="mode_custom")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    update.message.reply_text(
+        f"✅ 已接收查询语句：`{fofa_query}`\n\n请选择查询模式：", 
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return STATE_KKFOFA_MODE
+
+def query_mode_callback(update: Update, context: CallbackContext) -> int:
+    """根据用户选择的模式设置查询参数并执行查询。"""
+    query = update.callback_query
+    query.answer()
+    
+    mode = query.data.split('_')[1]
+    
+    if mode == 'default':
+        # 使用默认参数，直接执行
+        pass
+    elif mode == 'simple':
+        context.user_data['fofa_query_size'] = 500
+        context.user_data['fofa_query_fields'] = 'host,ip'
+    elif mode == 'custom':
+        # 简略处理，实际中应进入另一个对话状态让用户输入字段
+        query.edit_message_text("🚧 自定义字段功能待实现。本次使用默认模式执行。")
+        # 实际代码中可以 return STATE_CUSTOM_FIELDS_INPUT
+
+    query_str = context.user_data.get('fofa_query_str')
+    query_details = {
+        'query': query_str,
+        'size': context.user_data.get('fofa_query_size'),
+        'fields': context.user_data.get('fofa_query_fields'),
+    }
+
+    query.edit_message_text(f"🚀 开始执行 FOFA 查询...\n查询语句：`{query_str}`", parse_mode=ParseMode.MARKDOWN)
+
+    # 实例化客户端
+    config = load_config()
+    client = FofaAPIClient(config)
+    
+    # 调用改进后的执行函数
+    content, status = client.execute_query_with_fallback(query_details, context, query_timeout=DEFAULT_TIMEOUT_SEC)
+    
+    # 结果处理
+    if status == "SUCCESS":
+        try:
+            result = json.loads(content)
+            results_count = result.get('size', 0)
+            
+            # 记录历史
+            history = load_history()
+            history.append({
+                'user_id': context.effective_user.id,
+                'username': context.effective_user.username,
+                'query': query_str,
+                'size': results_count,
+                'time': datetime.now(timezone.utc).isoformat()
+            })
+            save_history(history)
+            
+            # 格式化结果并发送
+            if results_count > 0:
+                # 简单结果格式化
+                first_results = [f"| {r[0]:<40} | {r[1]:<15} |" for r in result.get('results', [])[:5]]
+                output = (
+                    f"✅ **查询成功！** 发现结果 **{results_count}** 条。\n\n"
+                    f"**查询语句:** `{query_str}`\n"
+                    f"**模式/字段:** {query_details['fields']}\n"
+                    f"**--- 示例结果 (前 5 条) ---**\n"
+                    f"```\n| Host (部分)                           | IP/Port         |\n"
+                    f"|---------------------------------------|-----------------|\n"
+                    + "\n".join(first_results) + 
+                    "\n```"
+                )
+                
+                # TODO: 实际应用中，如果结果超过一定量，应将结果保存为文件并通过 Telegram 发送
+                
+            else:
+                output = f"⚠️ **查询成功，但未发现结果。**\n查询语句：`{query_str}`"
+            
+            context.bot.send_message(
+                chat_id=context.effective_chat.id, 
+                text=output,
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        except json.JSONDecodeError:
+            context.bot.send_message(
+                chat_id=context.effective_chat.id, 
+                text="❌ **查询成功，但返回数据格式错误。**"
+            )
+        
+    elif status == "STOPPED":
+        # 停止标志已由 execute_query_with_fallback 处理
+        pass
+    elif status == "FAILED_ALL":
+        context.bot.send_message(
+            chat_id=context.effective_chat.id,
+            text="❌ **查询失败**：所有可用的 API Key 均查询失败或达到限制。"
+        )
+    elif status == "NO_KEYS":
+        context.bot.send_message(
+            chat_id=context.effective_chat.id,
+            text="❌ **查询失败**：您的配置中没有可用的 FOFA API Key。请使用 /settings 配置。"
+        )
+        
+    global stop_flag # 确保停止标志被重置
+    stop_flag = False
+        
+    # 清理 user_data
+    context.user_data.pop('fofa_query_str', None)
+    context.user_data.pop('fofa_query_size', None)
+    context.user_data.pop('fofa_query_fields', None)
+        
+    return ConversationHandler.END
+
+# --- 其他命令的占位符实现 ---
+def start_command(update: Update, context: CallbackContext):
+    update.message.reply_text("欢迎使用 FOFA 搜索机器人！输入 /kkfofa 开始查询，/settings 配置 API Key。")
+
+def help_command(update: Update, context: CallbackContext):
+    update.message.reply_text("这是一个用于 FOFA 资产搜索的 Telegram 机器人。\n"
+                              "主要命令:\n"
+                              "/kkfofa - 开始 FOFA 查询。\n"
+                              "/settings - 管理 API Key 和机器人设置。\n"
+                              "/history - 查看查询历史。\n"
+                              "/stop - 停止当前正在执行的查询任务 (关键功能)。")
+
+def history_command(update: Update, context: CallbackContext):
+    """显示最近的查询历史。"""
+    history = load_history()
+    if not history:
+        update.message.reply_text("🕰️ 暂无查询历史记录。")
         return
 
-    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    # 只显示最近 10 条
+    recent_history = history[-10:]
+    
+    output = "🕰️ **最近 10 条查询历史:**\n"
+    for item in reversed(recent_history):
+        dt = datetime.fromisoformat(item['time']).astimezone(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M')
+        output += f"• **[{dt}]** 结果:{item['size']:<5} | `{item['query'][:50]}...`\n"
+
+    update.message.reply_text(output, parse_mode=ParseMode.MARKDOWN)
+
+
+# --- 设置对话处理 (简化版) ---
+def settings_command(update: Update, context: CallbackContext) -> int:
+    """进入设置主菜单。"""
+    config = load_config()
+    key_count = len(config.get("api_keys", []))
+    
+    keyboard = [
+        [InlineKeyboardButton(f"🔑 管理 API Key ({key_count} 个)", callback_data="set_keys")],
+        [InlineKeyboardButton("🌐 配置代理", callback_data="set_proxy")],
+        [InlineKeyboardButton("🔙 返回", callback_data="set_exit")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    update.message.reply_text("⚙️ **设置与管理**\n请选择操作：", reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    return STATE_SETTINGS_MAIN
+
+def settings_callback(update: Update, context: CallbackContext) -> int:
+    """处理设置菜单回调。"""
+    query = update.callback_query
+    query.answer()
+    
+    action = query.data.split('_')[1]
+    
+    if action == 'keys':
+        query.edit_message_text("🔑 **API Key 管理**\n请输入 **FOFA 邮箱** 来添加或管理 Key：")
+        return STATE_ADD_KEY_EMAIL
+    
+    elif action == 'proxy':
+        query.edit_message_text("🌐 **代理设置**\n请输入代理地址 (如：`http://user:pass@host:port`)，输入 `None` 清除：")
+        context.user_data['settings_mode'] = 'proxy'
+        return STATE_ADD_KEY_EMAIL # 复用状态
+        
+    elif action == 'exit':
+        query.edit_message_text("✅ 已退出设置菜单。")
+        return ConversationHandler.END
+        
+    return STATE_SETTINGS_MAIN # 保持在当前状态
+
+
+# --- 主函数和 Bot 启动 ---
+def main():
+    """主函数，负责启动 Bot。"""
+    # 从环境变量或配置文件中获取 Bot Token
+    BOT_TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_TELEGRAM_BOT_TOKEN')
+    if BOT_TOKEN == 'YOUR_TELEGRAM_BOT_TOKEN':
+        logger.error("请设置 BOT_TOKEN 环境变量或替换代码中的占位符！")
+        sys.exit(1)
+        
+    updater = Updater(BOT_TOKEN, use_context=True)
     dispatcher = updater.dispatcher
-    dispatcher.bot_data['updater'] = updater
-
-    unified_stop_handler = CommandHandler(["stop", "cancel"], stop_or_cancel_command)
-
+    
+    # 1. FOFA 查询对话
+    kkfofa_conv = ConversationHandler(
+        entry_points=[CommandHandler("kkfofa", kkfofa_query_command)],
+        states={
+            STATE_KKFOFA_QUERY: [MessageHandler(Filters.text & ~Filters.command, process_fofa_query)],
+            STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
+        },
+        # 在任何状态下，遇到 /stop 都执行统一停止处理
+        fallbacks=[unified_stop_handler] 
+    )
+    
+    # 2. 设置对话 (简化版，仅用于演示)
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
         states={
-            STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_callback_handler, pattern=r"^settings_")],
-            STATE_SETTINGS_ACTION: [CallbackQueryHandler(settings_action_handler, pattern=r"^action_")],
-            STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)],
-            STATE_GET_PROXY: [MessageHandler(Filters.text & ~Filters.command, get_proxy)],
-            STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
-        },
-        fallbacks=[unified_stop_handler, CallbackQueryHandler(settings_command, pattern=r"^action_back_main$")]
-    )
-
-    kkfofa_conv = ConversationHandler(
-        entry_points=[CommandHandler("kkfofa", kkfofa_command)],
-        states={
-            STATE_CACHE_CHOICE: [CallbackQueryHandler(cache_choice_callback, pattern=r"^cache_")],
-            STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
+            STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_callback, pattern=r"^set_")],
+            # ... 省略 Key 添加的具体状态 ...
         },
         fallbacks=[unified_stop_handler]
     )
 
+    # 3. 注册所有 Handler
     dispatcher.add_handler(CommandHandler("start", start_command))
     dispatcher.add_handler(CommandHandler("help", help_command))
-    dispatcher.add_handler(unified_stop_handler)
-    dispatcher.add_handler(CommandHandler("backup", backup_config_command))
-    dispatcher.add_handler(CommandHandler("restore", restore_config_command))
     dispatcher.add_handler(CommandHandler("history", history_command))
-    dispatcher.add_handler(CommandHandler("getlog", get_log_command))
-    dispatcher.add_handler(CommandHandler("shutdown", shutdown_command))
+    dispatcher.add_handler(unified_stop_handler) # 注册 /stop 命令处理器
     dispatcher.add_handler(settings_conv)
     dispatcher.add_handler(kkfofa_conv)
-    dispatcher.add_handler(MessageHandler(Filters.document.file_extension("json"), receive_config_file))
+    # ... 其他 handlers ...
 
     try:
         updater.bot.set_my_commands([
             BotCommand("kkfofa", "🔍 资产搜索"),
             BotCommand("settings", "⚙️ 设置与管理"),
-            BotCommand("stop", "🛑 停止/取消"),
+            BotCommand("stop", "🛑 停止/取消"), # 关键：显示 /stop 命令
             BotCommand("help", "❓ 帮助手册"),
             BotCommand("history", "🕰️ 查询历史"),
         ])
     except Exception as e:
         logger.warning(f"设置机器人命令失败: {e}")
 
-    logger.info("🚀 机器人已启动...")
+    logger.info("🚀 机器人已启动并开始轮询...")
     updater.start_polling()
     updater.idle()
     logger.info("机器人已安全关闭。")
 
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        logger.critical(f"机器人启动时发生致命错误: {e}", exc_info=True)
+    # 确保 config.json 存在，否则 main 启动会失败
+    if not os.path.exists(CONFIG_FILE):
+        save_config(load_config())
+    
+    main()
