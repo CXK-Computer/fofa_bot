@@ -22,6 +22,8 @@ from telegram.ext import (
     JobQueue,
 )
 import pytz # 保留 pytz 用于创建时区对象
+from typing import Optional
+
 
 # --- 全局变量和常量 (无变化) ---
 CONFIG_FILE = 'config.json'
@@ -158,7 +160,7 @@ def user_access_check(func):
 # ...
 # 粘贴到这里的所有函数都和上一个版本完全一样
 # ...
-async def get_available_api_key(context: ContextTypes.DEFAULT_TYPE) -> str | None:
+async def get_available_api_key(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
     """轮询获取一个可用的API Key"""
     if not CONFIG['apis']:
         return None
