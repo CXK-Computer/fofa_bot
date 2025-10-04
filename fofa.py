@@ -1,8 +1,10 @@
 #
-# fofa_final_complete_v2.py (最终完整版 for python-telegram-bot v13.x)
+# fofa_final_complete_v3.py (最终完整版 for python-telegram-bot v13.x)
 #
-# 修复: main() 函数中的致命 IndentationError，确保脚本可以正常启动。
-# 修复: API Key 状态显示、/stats API、shutdown 命令、预设按钮等所有已知问题。
+# 修复: 1. `offer_post_download_actions` 中因缺少 context 参数导致的 NameError。
+# 修复: 2. 因 `show_api_menu` 函数被意外删除导致的 NameError。
+# 修复: 3. main() 函数中的 IndentationError。
+# 修复: 4. API Key 状态显示、/stats API、shutdown 命令、预设按钮等所有已知问题。
 # 功能: /kkfofa, /host, /stats, /settings, 下载后一键扫描工作流等全部功能。
 #
 import os
@@ -209,11 +211,13 @@ def stats_command(update: Update, context: CallbackContext) -> int:
     update.message.reply_text("请输入你想要进行聚合统计的 FOFA 语法。\n例如: `app=\"nginx\"`\n\n随时可以发送 /cancel 来取消。", parse_mode=ParseMode.MARKDOWN); return STATE_GET_STATS_QUERY
 
 # --- 后台任务与扫描逻辑 ---
-def offer_post_download_actions(bot, chat_id, query_text):
-    query_hash = hashlib.md5(query_text.encode()).hexdigest(); context.bot_data[query_hash] = query_text
+# NameError Fix: `context` is now passed to this function
+def offer_post_download_actions(context: CallbackContext, chat_id, query_text):
+    query_hash = hashlib.md5(query_text.encode()).hexdigest()
+    context.bot_data[query_hash] = query_text # Store original query using context
     keyboard = [[ InlineKeyboardButton("⚡️ 存活检测", callback_data=f'liveness_{query_hash}'), InlineKeyboardButton("🌐 子网扫描(/24)", callback_data=f'subnet_{query_hash}') ]]
-    bot.send_message(chat_id, "下载完成，需要对结果进行二次扫描吗？", reply_markup=InlineKeyboardMarkup(keyboard))
-def download_and_process_file(context, query_hash, prefix, processor_func, final_message_func):
+    context.bot.send_message(chat_id, "下载完成，需要对结果进行二次扫描吗？", reply_markup=InlineKeyboardMarkup(keyboard))
+def download_and_process_file(context: CallbackContext, query_hash, prefix, processor_func, final_message_func):
     bot = context.bot; job_context = context.job.context; chat_id, msg = job_context['chat_id'], job_context['msg']
     original_query = context.bot_data.get(query_hash)
     if not original_query: msg.edit_text("❌ 扫描任务已过期或无法找到原始查询。"); return
@@ -305,7 +309,7 @@ def run_full_download_query(context: CallbackContext):
         with open(output_filename, 'rb') as doc: sent_message = bot.send_document(chat_id, document=doc, filename=output_filename)
         os.remove(output_filename)
         cache_data = {'file_id': sent_message.document.file_id, 'file_name': output_filename, 'result_count': len(unique_results)}
-        add_or_update_query(query_text, cache_data); offer_post_download_actions(bot, chat_id, query_text)
+        add_or_update_query(query_text, cache_data); offer_post_download_actions(context, chat_id, query_text) # NameError Fix
     elif not context.bot_data.get(stop_flag): msg.edit_text("🤷‍♀️ 任务完成，但未能下载到任何数据。")
     context.bot_data.pop(stop_flag, None)
 def run_traceback_download_query(context: CallbackContext):
@@ -340,7 +344,7 @@ def run_traceback_download_query(context: CallbackContext):
         with open(output_filename, 'rb') as doc: sent_message = bot.send_document(chat_id, document=doc, filename=output_filename)
         os.remove(output_filename)
         cache_data = {'file_id': sent_message.document.file_id, 'file_name': output_filename, 'result_count': len(unique_results)}
-        add_or_update_query(base_query, cache_data); offer_post_download_actions(bot, chat_id, base_query)
+        add_or_update_query(base_query, cache_data); offer_post_download_actions(context, chat_id, base_query) # NameError Fix
     else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
     context.bot_data.pop(stop_flag, None)
 def run_incremental_update_query(context: CallbackContext):
@@ -374,7 +378,7 @@ def run_incremental_update_query(context: CallbackContext):
     with open(output_filename, 'rb') as doc: sent_message = bot.send_document(chat_id, document=doc, filename=output_filename)
     cache_data = {'file_id': sent_message.document.file_id, 'file_name': output_filename, 'result_count': len(combined_results)}
     add_or_update_query(base_query, cache_data); os.remove(old_file_path); os.remove(output_filename)
-    msg.delete(); bot.send_message(chat_id, f"✅ 增量更新完成！"); offer_post_download_actions(bot, chat_id, base_query)
+    msg.delete(); bot.send_message(chat_id, f"✅ 增量更新完成！"); offer_post_download_actions(context, chat_id, base_query) # NameError Fix
 
 def start_command(update: Update, context: CallbackContext):
     update.message.reply_text('👋 欢迎使用 Fofa 查询机器人！请使用 /help 查看命令手册。')
@@ -411,22 +415,16 @@ def start_new_search(update: Update, context: CallbackContext, message_to_edit=N
         keyboard = [[InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
         msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_KKFOFA_MODE
 def kkfofa_entry(update: Update, context: CallbackContext):
-    # This function is now the main entry point for the conversation
     if update.callback_query:
-        # Came from a preset button, needs to transition into the state machine
-        query = update.callback_query
         try:
-            preset_index = int(query.data.replace("run_preset_", ""))
-            preset = CONFIG["presets"][preset_index]
+            query = update.callback_query; query.answer(); preset_index = int(query.data.replace("run_preset_", "")); preset = CONFIG["presets"][preset_index]
             context.user_data.update({'query': preset['query'], 'key_index': None, 'chat_id': update.effective_chat.id})
             return start_new_search(update, context, message_to_edit=query.message)
-        except (ValueError, IndexError):
-            query.edit_message_text("❌ 预设查询失败。")
-            return ConversationHandler.END
+        except (ValueError, IndexError): query.edit_message_text("❌ 预设查询失败。"); return ConversationHandler.END
     if not context.args:
         presets = CONFIG.get("presets", []);
         if not presets: update.message.reply_text("欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。"); return ConversationHandler.END
-        keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"run_preset_{i}")] for i, p in enumerate(presets)]; update.message.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard)); return ConversationHandler.END # End since it's just displaying a menu
+        keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"run_preset_{i}")] for i, p in enumerate(presets)]; update.message.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard)); return ConversationHandler.END
     key_index, query_text = None, " ".join(context.args)
     if context.args[0].isdigit():
         try:
@@ -525,6 +523,29 @@ def settings_callback_handler(update: Update, context: CallbackContext):
     if menu == 'backup': return show_backup_restore_menu(update, context)
     if menu == 'preset': return show_preset_menu(update, context)
     if menu == 'close': query.edit_message_text("菜单已关闭."); return ConversationHandler.END
+    return STATE_SETTINGS_ACTION
+# NameError Fix: Restored this entire function
+def show_api_menu(update: Update, context: CallbackContext):
+    msg = update.callback_query.message
+    msg.edit_text("🔄 正在查询API Key状态...")
+    api_details = []
+    for i, key in enumerate(CONFIG['apis']):
+        data, error = verify_fofa_api(key)
+        key_masked = f"`...{key[-4:]}`"
+        status = ""
+        if error:
+            status = f"❌ *无效*: {error}"
+        else:
+            username = escape_markdown(data.get('username', 'N/A'))
+            vip_level = data.get('vip_level', 0)
+            vip_status = f"👑 VIP L{vip_level}" if data.get('is_vip') else "👤 普通"
+            f_points = data.get('fofa_point', 0)
+            free_points = data.get('remain_free_point', 0)
+            status = f"{vip_status} ({username}) | F点: *{f_points}*, 免费点: *{free_points}*"
+        api_details.append(f"`#{i+1}` {key_masked}\n  {status}")
+    api_message = "\n\n".join(api_details) if api_details else "_无_"
+    keyboard = [[InlineKeyboardButton(f"查询范围: {'✅ 完整历史' if CONFIG.get('full_mode') else '⏳ 近一年'}", callback_data='action_toggle_full')], [InlineKeyboardButton("➕ 添加Key", callback_data='action_add_api'), InlineKeyboardButton("➖ 删除Key", callback_data='action_remove_api')], [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]]
+    msg.edit_text(f"🔑 *API 管理*\n\n{api_message}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
     return STATE_SETTINGS_ACTION
 def show_proxy_menu(update: Update, context: CallbackContext):
     keyboard = [[InlineKeyboardButton("✏️ 设置/更新", callback_data='action_set_proxy')], [InlineKeyboardButton("🗑️ 清除", callback_data='action_delete_proxy')], [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]]
@@ -636,7 +657,7 @@ def main() -> None:
     dispatcher.add_handler(CallbackQueryHandler(liveness_check_callback, pattern=r"^liveness_"))
     dispatcher.add_handler(CallbackQueryHandler(subnet_scan_callback, pattern=r"^subnet_"))
     
-    logger.info("🚀 终极版机器人已启动 (API状态已修复)...")
+    logger.info("🚀 终极版机器人已启动 (v3 - 已修复 NameErrors)...")
     updater.start_polling()
     updater.idle()
     logger.info("机器人已关闭。")
