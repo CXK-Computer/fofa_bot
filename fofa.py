@@ -1,5 +1,6 @@
 #
-# fofa.py (兼容 python-telegram-bot v13.x)
+# fofa.py (最终融合版 for python-telegram-bot v13.x)
+# 新增功能: /stats 全球统计, /kkfofa 预设菜单, /settings 预设管理
 #
 import os
 import json
@@ -7,12 +8,9 @@ import logging
 import base64
 import time
 import re
-import asyncio
-from datetime import datetime, timedelta, timezone
-from functools import wraps
+import requests # <-- 新增依赖
 
-# **重大修改**: 这是 v13 的正确导入方式
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode 
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -23,45 +21,36 @@ from telegram.ext import (
     Filters,
 )
 
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # --- 全局变量和常量 ---
 CONFIG_FILE = 'config.json'
 LOG_FILE = 'fofa_bot.log'
+FOFA_SEARCH_URL = "https://fofa.info/api/v1/search/all"
+FOFA_STATS_URL = "https://fofa.info/api/v1/stats/statistical"
 
 # --- 日志配置 ---
 if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > (5 * 1024 * 1024): # 5MB
-    try:
-        os.rename(LOG_FILE, LOG_FILE + '.old')
-    except OSError as e:
-        print(f"无法轮换日志文件: {e}")
+    try: os.rename(LOG_FILE, LOG_FILE + '.old')
+    except OSError as e: print(f"无法轮换日志文件: {e}")
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8'), logging.StreamHandler()]
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.INFO)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- 会话状态定义 ---
+# --- 会话状态定义 (已扩展) ---
 (
     STATE_SETTINGS_MAIN,
-    STATE_SETTINGS_ACTION,
-    STATE_GET_KEY,
-    STATE_GET_PROXY,
-    STATE_REMOVE_API,
-    STATE_ACCESS_CONTROL,
-    STATE_ADD_ADMIN,
-    STATE_REMOVE_ADMIN,
-) = range(8)
+    STATE_API_MENU, STATE_GET_KEY, STATE_REMOVE_API,
+    STATE_ACCESS_CONTROL, STATE_ADD_ADMIN, STATE_REMOVE_ADMIN,
+    STATE_PRESET_MENU, STATE_GET_PRESET_NAME, STATE_GET_PRESET_QUERY, STATE_REMOVE_PRESET,
+    STATE_GET_STATS_QUERY
+) = range(12)
 
-# --- 配置管理 ---
+# --- 配置管理 (已增强) ---
 def load_config():
     default_config = {
         "bot_token": "YOUR_BOT_TOKEN_HERE",
@@ -69,7 +58,8 @@ def load_config():
         "admins": [],
         "proxy": "",
         "full_mode": False,
-        "public_mode": False
+        "public_mode": False,
+        "presets": [] # 新增: 预设列表
     }
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -79,9 +69,9 @@ def load_config():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
+            # 确保所有默认键都存在
             for key, value in default_config.items():
-                if key not in config:
-                    config[key] = value
+                config.setdefault(key, value)
             return config
     except (json.JSONDecodeError, IOError) as e:
         logger.error(f"读取 {CONFIG_FILE} 失败: {e}。将使用默认配置。")
@@ -90,313 +80,294 @@ def load_config():
 def save_config():
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(CONFIG, f, indent=4)
+            json.dump(CONFIG, f, indent=4, ensure_ascii=False)
     except IOError as e:
         logger.error(f"保存配置文件失败: {e}")
 
 CONFIG = load_config()
 
-# --- 装饰器：管理员权限检查 ---
+# --- 辅助函数与装饰器 ---
+def get_proxies():
+    if CONFIG.get("proxy"):
+        return {"http": CONFIG["proxy"], "https": CONFIG["proxy"]}
+    return None
+
+def is_admin(user_id: int) -> bool:
+    return user_id in CONFIG.get('admins', [])
+
 def admin_only(func):
     @wraps(func)
     def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
         user_id = update.effective_user.id
-        if user_id not in CONFIG.get('admins', []):
-            if update.message:
-                update.message.reply_text("⛔️ 抱歉，您没有权限执行此管理操作。")
-            elif update.callback_query:
-                update.callback_query.answer("⛔️ 权限不足", show_alert=True)
+        if not is_admin(user_id):
+            message_text = "⛔️ 抱歉，您没有权限执行此管理操作。"
+            if update.callback_query:
+                update.callback_query.answer(message_text, show_alert=True)
+            elif update.message:
+                update.message.reply_text(message_text)
             return None
         return func(update, context, *args, **kwargs)
     return wrapped
 
-# --- FOFA API 核心逻辑 ---
-async def _make_request_async(url: str):
-    proxy_str = ""
-    if CONFIG.get("proxy"):
-        proxy_str = f'--proxy "{CONFIG["proxy"]}"'
-    command = f'curl -s -L -k {proxy_str} "{url}"'
+def user_access_check(func):
+    @wraps(func)
+    def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
+        user_id = update.effective_user.id
+        if not CONFIG.get('public_mode', False) and not is_admin(user_id):
+            update.message.reply_text("⛔️ 抱歉，此机器人当前为私有模式，您没有权限进行查询。")
+            return None
+        return func(update, context, *args, **kwargs)
+    return wrapped
+
+# --- FOFA API 核心逻辑 (使用 requests) ---
+def get_available_api_key(context: CallbackContext) -> str:
+    """轮询获取一个可用的API Key"""
+    if not CONFIG['apis']: return None
+    api_index = context.bot_data.get('api_index', 0)
+    key = CONFIG['apis'][api_index]
+    context.bot_data['api_index'] = (api_index + 1) % len(CONFIG['apis'])
+    return key
+
+def call_fofa_api(query: str, api_key: str) -> dict:
+    """用于 /kkfofa 的核心查询函数"""
+    logger.info(f"正在使用Key '...{api_key[-4:]}' 查询: {query}")
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            return None, f"网络请求失败 (curl): {stderr.decode().strip()}"
-        response_text = stdout.decode()
-        if not response_text:
-            return None, "API 返回了空响应。"
-        data = json.loads(response_text)
-        if data.get("error"):
-            return None, data.get("errmsg", "未知的FOFA错误")
-        return data, None
-    except json.JSONDecodeError:
-        return None, f"解析JSON响应失败: {response_text[:200]}"
-    except Exception as e:
-        return None, f"执行curl时发生意外错误: {e}"
+        qbase64 = base64.b64encode(query.encode('utf-8')).decode('utf-8')
+        params = {
+            'key': api_key, 'qbase64': qbase64, 'size': 10000,
+            'fields': 'host,title,ip,domain,port,protocol,server',
+            'full': CONFIG.get('full_mode', False)
+        }
+        response = requests.get(FOFA_SEARCH_URL, params=params, timeout=60, proxies=get_proxies(), verify=False)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"FOFA API请求失败: {e}")
+        return {"error": True, "errmsg": f"网络错误: {e}"}
 
-async def verify_fofa_api(key):
-    url = f"https://fofa.info/api/v1/info/my?key={key}"
-    return await _make_request_async(url)
+def fetch_fofa_stats(query: str, api_key: str) -> dict:
+    """用于 /stats 的全球统计函数"""
+    logger.info(f"正在使用Key '...{api_key[-4:]}' 进行统计: {query}")
+    try:
+        qbase64 = base64.b64encode(query.encode('utf-8')).decode('utf-8')
+        params = {'key': api_key, 'qbase64': qbase64}
+        response = requests.get(FOFA_STATS_URL, params=params, timeout=30, proxies=get_proxies(), verify=False)
+        response.raise_for_status()
+        data = response.json()
+        return {"success": not data.get("error"), "data": data}
+    except requests.exceptions.RequestException as e:
+        logger.error(f"FOFA统计API请求失败: {e}")
+        return {"success": False, "data": {"errmsg": f"网络错误: {e}"}}
 
-async def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host"):
-    b64_query = base64.b64encode(query.encode('utf-8')).decode('utf-8')
-    full_param = "&full=true" if CONFIG.get("full_mode", False) else ""
-    url = f"https://fofa.info/api/v1/search/all?key={key}&qbase64={b64_query}&size={page_size}&page={page}&fields={fields}{full_param}"
-    return await _make_request_async(url)
-
-# --- 命令处理函数 ---
+# --- 主要命令处理 ---
 def start_command(update: Update, context: CallbackContext) -> None:
-    user = update.effective_user
-    update.message.reply_html(
-        rf"你好, {user.mention_html()}!",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚀 开始查询", callback_data="start_query")]
-        ])
+    update.message.reply_text(
+        "欢迎使用 FOFA 查询机器人！\n\n"
+        "➡️ 使用 /kkfofa 执行查询或查看预设\n"
+        "📊 使用 /stats 获取全球统计\n"
+        "⚙️ 管理员可使用 /settings 进行配置"
     )
 
-def kkfofa_command_entry(update: Update, context: CallbackContext) -> None:
-    user_id = update.effective_user.id
-    if not CONFIG.get('public_mode', False) and user_id not in CONFIG.get('admins', []):
-        update.message.reply_text("⛔️ 抱歉，此机器人当前为私有模式，您没有权限进行查询。")
+def execute_fofa_search(update: Update, context: CallbackContext, query_text: str):
+    """执行FOFA查询并发送结果的中心函数"""
+    message = update.effective_message
+    status_msg = message.reply_text(f"🔍 正在查询: `{query_text}`", parse_mode=ParseMode.MARKDOWN)
+    
+    api_key = get_available_api_key(context)
+    if not api_key:
+        status_msg.edit_text("❌ 查询失败：没有可用的FOFA API密钥。请管理员添加。")
         return
 
-    query_text = " ".join(context.args) if context.args else update.message.text
-    if not query_text or query_text.startswith('/'):
-        update.message.reply_text("请输入您的FOFA查询语句。例如：\n`/kkfofa domain=example.com`\n或者直接发送查询语句。")
-        return
-
-    context.bot_data[user_id] = {'query': query_text}
-    asyncio.run(execute_fofa_query(update, context))
-
-async def execute_fofa_query(update: Update, context: CallbackContext) -> None:
-    user_id = update.effective_user.id
-    query_text = context.bot_data.get(user_id, {}).get('query')
-    if not query_text: return
-    
-    msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="🔍 正在查询中，请稍候...")
-
-    async def query_func(key):
-        return await fetch_fofa_data(key, query_text)
-    
-    data, used_key_index, error = await execute_query_with_fallback(query_func)
-
-    if error:
-        await msg.edit_text(f"❌ 查询失败！\n错误信息: `{error}`", parse_mode=ParseMode.MARKDOWN)
+    data = call_fofa_api(query_text, api_key)
+    if data.get('error'):
+        status_msg.edit_text(f"❌ API错误: {data.get('errmsg', '未知错误')}")
         return
 
     results = data.get('results', [])
+    if not results:
+        status_msg.edit_text(f"✅ 查询完成，但未找到结果。\n`{query_text}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    result_count = len(results)
+    caption = f"✅ 查询完成!\n语法: `{query_text}`\n共找到 *{result_count}* 条结果。"
     filename = f"fofa_results_{int(time.time())}.txt"
     with open(filename, 'w', encoding='utf-8') as f:
         for item in results:
-            f.write(f"{item}\n")
-
-    caption = (f"✅ 查询完成！\n"
-               f"语法: `{query_text}`\n"
-               f"共找到 `{len(results)}` 条结果\n"
-               f"使用 Key: `#{used_key_index}`")
-
-    await msg.delete()
+            f.write(str(item) + "\n")
+    
+    status_msg.delete()
     with open(filename, 'rb') as f:
-        await context.bot.send_document(chat_id=update.effective_chat.id, document=f, caption=caption, parse_mode=ParseMode.MARKDOWN)
+        message.reply_document(f, caption=caption, parse_mode=ParseMode.MARKDOWN)
     os.remove(filename)
 
-async def execute_query_with_fallback(query_func):
-    if not CONFIG['apis']:
-        return None, None, "没有配置任何API Key。"
-    
-    tasks = [verify_fofa_api(key) for key in CONFIG['apis']]
-    results = await asyncio.gather(*tasks)
-    
-    valid_keys = [{'key': CONFIG['apis'][i], 'index': i + 1, 'is_vip': data.get('is_vip', False)} 
-                  for i, (data, error) in enumerate(results) if not error and data]
-
-    if not valid_keys:
-        return None, None, "所有API Key均无效或验证失败。"
-    
-    prioritized_keys = sorted(valid_keys, key=lambda x: x['is_vip'], reverse=True)
-    
-    last_error = "没有可用的API Key。"
-    for key_info in prioritized_keys:
-        data, error = await query_func(key_info['key'])
-        if not error:
-            return data, key_info['index'], None
-        last_error = error
-        if "[820031]" in str(error):
-            logger.warning(f"Key [#{key_info['index']}] F点余额不足，尝试下一个...")
-            continue
-        return None, key_info['index'], error
+@user_access_check
+def kkfofa_command(update: Update, context: CallbackContext):
+    if not context.args:
+        presets = CONFIG.get("presets", [])
+        if not presets:
+            update.message.reply_text(
+                "欢迎使用FOFA查询机器人。\n\n"
+                "➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\n"
+                "ℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。"
+            )
+            return
         
-    return None, None, f"所有Key均尝试失败，最后错误: {last_error}"
-
-def status_command(update: Update, context: CallbackContext) -> None:
-    asyncio.run(check_api_status(update, context))
-
-async def check_api_status(update: Update, context: CallbackContext) -> None:
-    if not CONFIG.get('apis'):
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="ℹ️ 当前没有配置任何API Key。")
+        keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"run_preset_{i}")] for i, p in enumerate(presets)]
+        update.message.reply_text("👇 请选择一个预设查询，或直接输入查询语法:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
-    
-    msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="📊 正在检查所有API Key状态，请稍候...")
-    
-    tasks = [verify_fofa_api(key) for key in CONFIG['apis']]
-    results = await asyncio.gather(*tasks)
-    
-    status_lines = []
-    for i, (data, error) in enumerate(results):
-        key_masked = CONFIG['apis'][i][:4] + '...' + CONFIG['apis'][i][-4:]
-        if error:
-            status_lines.append(f"🔴 Key #{i+1} (`{key_masked}`): **验证失败**\n   错误: `{error}`")
-        else:
-            email = data.get('email', 'N/A')
-            is_vip = "是" if data.get('is_vip') else "否"
-            fcoin = data.get('fcoin', 'N/A')
-            status_lines.append(f"🟢 Key #{i+1} (`{key_masked}`): **有效**\n   邮箱: `{email}`, VIP: `{is_vip}`, F点: `{fcoin}`")
-            
-    response_text = "📊 **API Key 状态报告**\n\n" + "\n\n".join(status_lines)
-    await msg.edit_text(response_text, parse_mode=ParseMode.MARKDOWN)
 
-def cancel(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text('操作已取消。')
+    query_text = " ".join(context.args)
+    execute_fofa_search(update, context, query_text)
+
+def run_preset_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    try:
+        preset_index = int(query.data.replace("run_preset_", ""))
+        preset = CONFIG["presets"][preset_index]
+        query_text = preset['query']
+        query.edit_message_text(f"🚀 正在执行预设查询: *{preset['name']}*", parse_mode=ParseMode.MARKDOWN)
+        execute_fofa_search(update, context, query_text)
+    except (ValueError, IndexError):
+        query.edit_message_text("❌ 预设查询失败，可能该预设已被移除。")
+
+# --- 新增: FOFA 全球统计 /stats ---
+@user_access_check
+def stats_command(update: Update, context: CallbackContext) -> int:
+    if not CONFIG['apis']:
+        update.message.reply_text("错误：FOFA API Key 未设置！")
+        return ConversationHandler.END
+    update.message.reply_text("请输入你想要统计的 FOFA 语法。\n例如: `app=\"nginx\"`\n\n随时可以发送 /cancel 来取消。", parse_mode=ParseMode.MARKDOWN)
+    return STATE_GET_STATS_QUERY
+
+def get_fofa_stats_query(update: Update, context: CallbackContext) -> int:
+    query_text = update.message.text
+    api_key = get_available_api_key(context)
+    
+    processing_message = update.message.reply_text("正在查询 FOFA, 请稍候...")
+    result = fetch_fofa_stats(query_text, api_key)
+    
+    if not result["success"]:
+        error_message = result["data"].get("errmsg", "未知错误")
+        processing_message.edit_text(f"查询失败 😞\n*原因:* `{error_message}`", parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+
+    stats_data = result["data"]
+    message_lines = [
+        f"*📊 FOFA 全球统计信息*",
+        f"*查询:* `{query_text}`",
+        f"*最后更新:* `{stats_data.get('last_update_time', 'N/A')}`", "",
+        "*🌍 Top 5 国家/地区:*",
+    ]
+    for item in stats_data.get("countries", [])[:5]: message_lines.append(f"  - `{item['name']}`: *{item['count']}*")
+    message_lines.append("\n*💻 Top 5 服务/组件:*")
+    for item in stats_data.get("as_servers", [])[:5]: message_lines.append(f"  - `{item['name']}`: *{item['count']}*")
+    message_lines.append("\n*🔌 Top 5 协议:*")
+    for item in stats_data.get("protocols", [])[:5]: message_lines.append(f"  - `{item['name']}`: *{item['count']}*")
+
+    processing_message.edit_text("\n".join(message_lines), parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
+# --- 设置菜单 (已扩展) ---
 @admin_only
-def settings_command(update: Update, context: CallbackContext) -> int:
+def settings_command(update: Update, context: CallbackContext):
     keyboard = [
-        [InlineKeyboardButton("🔑 API 管理", callback_data='settings_api')],
-        [InlineKeyboardButton("🌐 代理设置", callback_data='settings_proxy')],
-        [InlineKeyboardButton("👑 访问控制", callback_data='settings_access')],
-        [InlineKeyboardButton("⚙️ 查询模式", callback_data='settings_mode')],
-        [InlineKeyboardButton("❌ 关闭菜单", callback_data='settings_close')]
+        [InlineKeyboardButton("🔑 API 管理", callback_data='menu_api')],
+        [InlineKeyboardButton("✨ 预设管理", callback_data='menu_preset')],
+        [InlineKeyboardButton("👑 访问控制", callback_data='menu_access')],
+        [InlineKeyboardButton("⚙️ 查询模式切换", callback_data='menu_mode')],
+        [InlineKeyboardButton("❌ 关闭菜单", callback_data='menu_close')]
     ]
     message_text = "⚙️ *设置菜单*"
+    reply_markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
-        update.callback_query.answer()
-        update.callback_query.edit_message_text(
-            message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
-        )
+        query = update.callback_query; query.answer()
+        query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
     else:
-        update.message.reply_text(
-            message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
-        )
+        update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
     return STATE_SETTINGS_MAIN
 
-def settings_main_handler(update: Update, context: CallbackContext) -> int:
+def settings_main_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer()
     menu = query.data.split('_', 1)[1]
     if menu == 'api': return show_api_menu(update, context)
-    elif menu == 'proxy': return show_proxy_menu(update, context)
-    elif menu == 'access': return show_access_control_menu(update, context)
-    elif menu == 'mode': return toggle_full_mode(update, context)
-    elif menu == 'close':
-        query.edit_message_text("菜单已关闭."); return ConversationHandler.END
+    if menu == 'preset': return show_preset_menu(update, context)
+    if menu == 'access': query.message.reply_text("访问控制功能待开发..."); return STATE_SETTINGS_MAIN # 占位
+    if menu == 'mode': return toggle_full_mode(update, context)
+    if menu == 'close': query.edit_message_text("菜单已关闭."); return ConversationHandler.END
 
-def show_api_menu(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    api_list_str = "\n".join([f"`#{i+1}`: `{key[:4]}...{key[-4:]}`" for i, key in enumerate(CONFIG['apis'])]) or "无"
-    text = f"🔑 *API Key 管理*\n\n当前 Keys:\n{api_list_str}"
-    keyboard = [[InlineKeyboardButton("➕ 添加", callback_data='action_add_key'), InlineKeyboardButton("➖ 移除", callback_data='action_remove_key')], [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]]
-    query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    return STATE_SETTINGS_ACTION
+# API 管理
+def show_api_menu(update: Update, context: CallbackContext):
+    api_list = "\n".join([f"`#{i+1}`: `...{k[-4:]}`" for i, k in enumerate(CONFIG['apis'])]) or "_无_"
+    text = f"🔑 *API 管理*\n\n{api_list}"
+    kbd = [[InlineKeyboardButton("➕ 添加", callback_data='api_add'), InlineKeyboardButton("➖ 移除", callback_data='api_remove')], [InlineKeyboardButton("🔙 返回", callback_data='api_back')]]
+    update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kbd), parse_mode=ParseMode.MARKDOWN)
+    return STATE_API_MENU
 
-def show_proxy_menu(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    proxy_status = f"`{CONFIG.get('proxy')}`" if CONFIG.get('proxy') else "未设置"
-    text = f"🌐 *代理设置*\n\n当前代理: {proxy_status}"
-    keyboard = [[InlineKeyboardButton("✏️ 修改", callback_data='action_set_proxy')], [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]]
-    query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    return STATE_SETTINGS_ACTION
+def api_menu_callback(update: Update, context: CallbackContext):
+    query = update.callback_query; query.answer(); action = query.data.split('_', 1)[1]
+    if action == 'back': return settings_command(update, context)
+    if action == 'add': query.edit_message_text("请输入要添加的API Key:"); return STATE_GET_KEY
+    if action == 'remove': query.edit_message_text("请输入要移除的Key的编号(#):"); return STATE_REMOVE_API
 
-def settings_action_handler(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query; query.answer()
-    action = query.data.split('_', 1)[1]
-    if action == 'back_main': return settings_command(update, context)
-    elif action == 'add_key':
-        query.edit_message_text("请输入要添加的FOFA API Key:"); return STATE_GET_KEY
-    elif action == 'remove_key':
-        query.edit_message_text("请输入要移除的API Key的编号 (#):"); return STATE_REMOVE_API
-    elif action == 'set_proxy':
-        query.edit_message_text("请输入代理(http://127.0.0.1:7890)，输入'清除'移除"); return STATE_GET_PROXY
+def get_api_key(update: Update, context: CallbackContext):
+    CONFIG['apis'].append(update.message.text.strip()); save_config()
+    update.message.reply_text("✅ API Key 添加成功！")
+    return settings_command(update, context)
 
-def show_access_control_menu(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    public_mode = "✅ 公共模式" if CONFIG.get('public_mode', False) else "❌ 私有模式"
-    admin_list = "\n".join([f"`{admin_id}`" for admin_id in CONFIG.get('admins', [])]) or "_无_"
-    text = f"👑 *访问控制*\n\n**模式**: {public_mode}\n\n**管理员**:\n{admin_list}"
-    keyboard = [[InlineKeyboardButton("🔄 切换模式", callback_data='access_toggle_public')], [InlineKeyboardButton("➕ 添加", callback_data='access_add_admin'), InlineKeyboardButton("➖ 删除", callback_data='access_remove_admin')], [InlineKeyboardButton("🔙 返回", callback_data='access_back_main')]]
-    query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    return STATE_ACCESS_CONTROL
+def remove_api_key(update: Update, context: CallbackContext):
+    try:
+        idx = int(update.message.text.strip()) - 1
+        if 0 <= idx < len(CONFIG['apis']): CONFIG['apis'].pop(idx); save_config(); update.message.reply_text("✅ Key已移除。")
+        else: update.message.reply_text("❌ 无效的编号。")
+    except ValueError: update.message.reply_text("❌ 请输入数字编号。")
+    return settings_command(update, context)
 
-def access_control_callback_handler(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query; query.answer()
-    action = query.data.split('_', 1)[1]
-    if action == 'back_main': return settings_command(update, context)
-    elif action == 'toggle_public':
-        CONFIG['public_mode'] = not CONFIG.get('public_mode', False); save_config()
-        return show_access_control_menu(update, context)
-    elif action == 'add_admin':
-        query.edit_message_text("请输入要添加的管理员Telegram用户ID。"); return STATE_ADD_ADMIN
-    elif action == 'remove_admin':
-        if len(CONFIG.get('admins', [])) <= 1:
-            query.message.reply_text("❌ 不能删除最后一个管理员。"); return show_access_control_menu(update, context)
-        query.edit_message_text("请输入要删除的管理员Telegram用户ID。"); return STATE_REMOVE_ADMIN
+# 预设管理
+def show_preset_menu(update: Update, context: CallbackContext):
+    preset_list = "\n".join([f"`#{i+1}`: `{p['name']}`" for i, p in enumerate(CONFIG['presets'])]) or "_无_"
+    text = f"✨ *预设管理*\n\n{preset_list}"
+    kbd = [[InlineKeyboardButton("➕ 添加", callback_data='preset_add'), InlineKeyboardButton("➖ 移除", callback_data='preset_remove')], [InlineKeyboardButton("🔙 返回", callback_data='preset_back')]]
+    update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kbd), parse_mode=ParseMode.MARKDOWN)
+    return STATE_PRESET_MENU
 
-def toggle_full_mode(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query; query.answer()
+def preset_menu_callback(update: Update, context: CallbackContext):
+    query = update.callback_query; query.answer(); action = query.data.split('_', 1)[1]
+    if action == 'back': return settings_command(update, context)
+    if action == 'add': query.edit_message_text("请输入预设的名称 (例如: 海康威视摄像头):"); return STATE_GET_PRESET_NAME
+    if action == 'remove': query.edit_message_text("请输入要移除的预设的编号(#):"); return STATE_REMOVE_PRESET
+
+def get_preset_name(update: Update, context: CallbackContext):
+    context.user_data['preset_name'] = update.message.text.strip()
+    update.message.reply_text(f"名称: `{context.user_data['preset_name']}`\n\n现在请输入完整的FOFA查询语法:")
+    return STATE_GET_PRESET_QUERY
+
+def get_preset_query(update: Update, context: CallbackContext):
+    new_preset = {"name": context.user_data['preset_name'], "query": update.message.text.strip()}
+    CONFIG['presets'].append(new_preset); save_config()
+    update.message.reply_text("✅ 预设添加成功！")
+    context.user_data.clear()
+    return settings_command(update, context)
+
+def remove_preset(update: Update, context: CallbackContext):
+    try:
+        idx = int(update.message.text.strip()) - 1
+        if 0 <= idx < len(CONFIG['presets']): CONFIG['presets'].pop(idx); save_config(); update.message.reply_text("✅ 预设已移除。")
+        else: update.message.reply_text("❌ 无效的编号。")
+    except ValueError: update.message.reply_text("❌ 请输入数字编号。")
+    return settings_command(update, context)
+
+# 模式切换
+def toggle_full_mode(update: Update, context: CallbackContext):
     CONFIG['full_mode'] = not CONFIG.get('full_mode', False); save_config()
     mode_text = "完整模式 (full=true)" if CONFIG['full_mode'] else "精简模式 (默认)"
-    query.message.reply_text(f"✅ 查询模式已切换为: **{mode_text}**", parse_mode=ParseMode.MARKDOWN)
+    update.callback_query.message.reply_text(f"✅ 查询模式已切换为: *{mode_text}*", parse_mode=ParseMode.MARKDOWN)
     return settings_command(update, context)
 
-def get_key(update: Update, context: CallbackContext) -> int:
-    new_key = update.message.text.strip()
-    if new_key not in CONFIG['apis']:
-        CONFIG['apis'].append(new_key); save_config()
-        update.message.reply_text(f"✅ API Key `{new_key[:4]}...` 添加成功！")
-    else: update.message.reply_text("ℹ️ 这个Key已经存在了。")
-    return settings_command(update, context)
-
-def remove_api(update: Update, context: CallbackContext) -> int:
-    try:
-        key_index = int(update.message.text.strip()) - 1
-        if 0 <= key_index < len(CONFIG['apis']):
-            removed_key = CONFIG['apis'].pop(key_index); save_config()
-            update.message.reply_text(f"✅ 已移除 Key #{key_index+1} (`{removed_key[:4]}...`)。")
-        else: update.message.reply_text("❌ 无效的编号。")
-    except ValueError: update.message.reply_text("❌ 请输入一个纯数字编号。")
-    return settings_command(update, context)
-
-def get_proxy(update: Update, context: CallbackContext) -> int:
-    proxy_text = update.message.text.strip()
-    if proxy_text.lower() == '清除': CONFIG['proxy'] = ""
-    else: CONFIG['proxy'] = proxy_text
-    save_config()
-    update.message.reply_text(f"✅ 代理已设置为: `{CONFIG['proxy'] or '无'}`")
-    return settings_command(update, context)
-
-def add_admin_handler(update: Update, context: CallbackContext) -> int:
-    try:
-        new_admin_id = int(update.message.text.strip())
-        if new_admin_id not in CONFIG['admins']:
-            CONFIG['admins'].append(new_admin_id); save_config()
-            update.message.reply_text(f"✅ 管理员 `{new_admin_id}` 添加成功！")
-        else: update.message.reply_text(f"ℹ️ 用户 `{new_admin_id}` 已经是管理员了。")
-    except ValueError: update.message.reply_text("❌ 无效的ID，请输入纯数字的用户ID。")
-    return settings_command(update, context)
-
-def remove_admin_handler(update: Update, context: CallbackContext) -> int:
-    try:
-        admin_id_to_remove = int(update.message.text.strip())
-        if len(CONFIG['admins']) <= 1 and admin_id_to_remove in CONFIG['admins']:
-             update.message.reply_text("❌ 不能删除最后一个管理员。")
-        elif admin_id_to_remove in CONFIG['admins']:
-            CONFIG['admins'].remove(admin_id_to_remove); save_config()
-            update.message.reply_text(f"✅ 管理员 `{admin_id_to_remove}` 已被移除。")
-        else: update.message.reply_text(f"❌ 用户 `{admin_id_to_remove}` 不是管理员。")
-    except ValueError: update.message.reply_text("❌ 无效的ID，请输入纯数字的用户ID。")
-    return settings_command(update, context)
+def cancel(update: Update, context: CallbackContext) -> int:
+    update.message.reply_text('操作已取消。')
+    context.user_data.clear()
+    return ConversationHandler.END
 
 # --- 主程序入口 ---
 def main() -> None:
@@ -405,42 +376,45 @@ def main() -> None:
         logger.critical("严重错误：config.json 中的 'bot_token' 未设置！")
         return
 
-    # **v13 正确的初始化方式**
     updater = Updater(token=bot_token, use_context=True)
     dispatcher = updater.dispatcher
 
-    try:
-        commands = [
-            BotCommand("start", "🚀 启动机器人"), BotCommand("kkfofa", "🔎 执行FOFA查询"),
-            BotCommand("status", "📊 检查API Key状态"), BotCommand("settings", "⚙️ 打开设置菜单"),
-            BotCommand("cancel", "❌ 取消当前操作"),
-        ]
-        updater.bot.set_my_commands(commands)
-    except Exception as e:
-        logger.warning(f"设置机器人命令失败: {e}")
+    commands = [
+        BotCommand("start", "欢迎与帮助"), BotCommand("kkfofa", "执行FOFA查询或查看预设"),
+        BotCommand("stats", "获取FOFA全球资产统计"), BotCommand("settings", "(管理员) 打开设置菜单"),
+        BotCommand("cancel", "取消当前操作"),
+    ]
+    try: updater.bot.set_my_commands(commands)
+    except Exception as e: logger.warning(f"设置机器人命令失败: {e}")
 
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
         states={
-            STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_main_handler, pattern=r"^settings_")],
-            STATE_SETTINGS_ACTION: [CallbackQueryHandler(settings_action_handler, pattern=r"^action_")],
-            STATE_ACCESS_CONTROL: [CallbackQueryHandler(access_control_callback_handler, pattern=r"^access_")],
-            STATE_ADD_ADMIN: [MessageHandler(Filters.text & ~Filters.command, add_admin_handler)],
-            STATE_REMOVE_ADMIN: [MessageHandler(Filters.text & ~Filters.command, remove_admin_handler)],
-            STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)],
-            STATE_GET_PROXY: [MessageHandler(Filters.text & ~Filters.command, get_proxy)],
-            STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
+            STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_main_callback, pattern=r"^menu_")],
+            STATE_API_MENU: [CallbackQueryHandler(api_menu_callback, pattern=r"^api_")],
+            STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_api_key)],
+            STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api_key)],
+            STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")],
+            STATE_GET_PRESET_NAME: [MessageHandler(Filters.text & ~Filters.command, get_preset_name)],
+            STATE_GET_PRESET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_preset_query)],
+            STATE_REMOVE_PRESET: [MessageHandler(Filters.text & ~Filters.command, remove_preset)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     
-    dispatcher.add_handler(CommandHandler("start", start_command))
-    dispatcher.add_handler(CommandHandler("status", status_command))
-    dispatcher.add_handler(settings_conv)
-    dispatcher.add_handler(CommandHandler("kkfofa", kkfofa_command_entry))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, kkfofa_command_entry)) 
+    stats_conv = ConversationHandler(
+        entry_points=[CommandHandler("stats", stats_command)],
+        states={STATE_GET_STATS_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
     
-    logger.info("机器人已启动，正在等待消息...")
+    dispatcher.add_handler(CommandHandler("start", start_command))
+    dispatcher.add_handler(CommandHandler("kkfofa", kkfofa_command))
+    dispatcher.add_handler(settings_conv)
+    dispatcher.add_handler(stats_conv)
+    dispatcher.add_handler(CallbackQueryHandler(run_preset_callback, pattern=r"^run_preset_"))
+    
+    logger.info("功能增强版机器人已启动...")
     updater.start_polling()
     updater.idle()
     logger.info("机器人已关闭。")
