@@ -64,7 +64,7 @@ def load_json_file(filename, default_content):
         with open(filename, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
-        logger.error(f"{filename} 损坏或为空, 将使用默认内容重建。")
+        logger.error(f"{filename} 损坏或为空, 将使用默认内容重建.")
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(default_content, f, indent=4)
         return default_content
@@ -116,7 +116,7 @@ def super_admin_only(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if not is_super_admin(user_id):
-            message_text = "⛔️ 抱歉，此操作仅限**超级管理员**执行。"
+            message_text = "⛔️ 抱歉，此操作仅限**超级管理员**执行."
             if update.callback_query:
                 await update.callback_query.answer(message_text.replace('**', ''), show_alert=True)
             elif update.message:
@@ -130,7 +130,7 @@ def admin_only(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if not is_admin(user_id):
-            message_text = "⛔️ 抱歉，您没有权限执行此管理操作。"
+            message_text = "⛔️ 抱歉，您没有权限执行此管理操作."
             if update.callback_query:
                 await update.callback_query.answer(message_text, show_alert=True)
             elif update.message:
@@ -144,7 +144,7 @@ def user_access_check(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if not CONFIG.get('public_mode', False) and not is_admin(user_id):
-            await update.message.reply_text("⛔️ 抱歉，此机器人当前为私有模式，您没有权限进行查询。")
+            await update.message.reply_text("⛔️ 抱歉，此机器人当前为私有模式，您没有权限进行查询.")
             return None
         return await func(update, context, *args, **kwargs)
     return wrapped
@@ -155,9 +155,9 @@ async def get_available_api(context: ContextTypes.DEFAULT_TYPE):
     # 此处省略了完整的API调用和检查逻辑，假设它能正常工作并返回一个可用的API key
     # In a real scenario, you'd check API limits here.
     if not CONFIG['apis']:
-        return None
+        return 无
     # Simple round-robin for demonstration
-    if 'api_index' not in context.bot_data:
+    if 'api_index' not 在 context.bot_data:
         context.bot_data['api_index'] = 0
     
     idx = context.bot_data['api_index']
@@ -178,14 +178,14 @@ async def execute_fofa_search(update: Update, context: ContextTypes.DEFAULT_TYPE
     status_msg = await message.reply_text(f"🔍 正在查询: `{escape_markdown(query_text)}`", parse_mode=ParseMode.MARKDOWN)
 
     # 1. 检查缓存
-    now = time.time()
+    现在 = time.time()
     cache_key = base64.b64encode(query_text.encode()).decode()
-    if cache_key in CACHE and (now - CACHE[cache_key]['timestamp']) < CACHE_EXPIRATION_SECONDS:
+    if cache_key 在 CACHE 和 (now - CACHE[cache_key]['timestamp']) < CACHE_EXPIRATION_SECONDS:
         logger.info(f"命中缓存: {query_text}")
         cached_data = CACHE[cache_key]['data']
         await status_msg.edit_text(f"✅ 查询完成 (来自缓存):\n`{escape_markdown(query_text)}`", parse_mode=ParseMode.MARKDOWN)
         if isinstance(cached_data, str) and cached_data.startswith("FILEID:"):
-            await message.reply_document(cached_data.replace("FILEID:", ""), caption=f"缓存结果 for `{query_text}`")
+            await message.reply_document(cached_data.替换("FILEID:"， ""), caption=f"缓存结果 for `{query_text}`")
         else:
             await message.reply_text(cached_data)
         return
@@ -193,22 +193,22 @@ async def execute_fofa_search(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 2. 调用API
     api_key = await get_available_api(context)
     if not api_key:
-        await status_msg.edit_text("❌ 查询失败：没有可用的FOFA API密钥。请管理员添加。")
+        await status_msg.edit_text("❌ 查询失败：没有可用的FOFA API密钥.请管理员添加.")
         return
 
     try:
         data = await call_fofa_api(query_text, api_key)
         if data.get('error'):
-            await status_msg.edit_text(f"❌ API错误: {data.get('errmsg', '未知错误')}")
+            await status_msg.edit_text(f"❌ API错误: {data.get('errmsg'， '未知错误')}")
             return
 
-        results = data.get('results', [])
+        results = data.get('results'， [])
         if not results:
-            await status_msg.edit_text(f"✅ 查询完成，但未找到结果。\n`{escape_markdown(query_text)}`", parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(f"✅ 查询完成，但未找到结果.\n`{escape_markdown(query_text)}`", parse_mode=ParseMode.MARKDOWN)
             return
 
         result_count = len(results)
-        await status_msg.edit_text(f"✅ 查询完成，共找到 {result_count} 条结果。\n`{escape_markdown(query_text)}`", parse_mode=ParseMode.MARKDOWN)
+        await status_msg.edit_text(f"✅ 查询完成，共找到 {result_count} 条结果.\n`{escape_markdown(query_text)}`", parse_mode=ParseMode.MARKDOWN)
 
         # 3. 格式化并发送结果
         output_text = "\n".join(map(str, results))
@@ -233,16 +233,16 @@ async def execute_fofa_search(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as e:
         logger.error(f"查询执行失败: {e}")
-        await status_msg.edit_text(f"❌ 执行查询时发生内部错误。")
+        await status_msg.edit_text(f"❌ 执行查询时发生内部错误.")
 
 
 # --- 命令处理 ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "欢迎使用 FOFA 查询机器人！\n\n"
-        "➡️ 使用 `/kkfofa` 开始查询。\n"
-        "➡️ 管理员可使用 `/settings` 进行配置。\n"
-        "➡️ 管理员可使用 `/submit_preset` 提交常用查询。"
+        "➡️ 使用 `/kkfofa` 开始查询.\n"
+        "➡️ 管理员可使用 `/settings` 进行配置.\n"
+        "➡️ 管理员可使用 `/submit_preset` 提交常用查询."
     )
 
 @user_access_check
@@ -251,9 +251,9 @@ async def kkfofa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         presets = CONFIG.get("presets", [])
         if not presets:
-            await update.message.reply_text("欢迎使用FOFA查询机器人。\n\n"
+            await update.message.reply_text("欢迎使用FOFA查询机器人.\n\n"
                                           "➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\n"
-                                          "ℹ️ 当前没有可用的预设查询。管理员可通过 `/submit_preset` 提交。")
+                                          "ℹ️ 当前没有可用的预设查询.管理员可通过 `/submit_preset` 提交.")
             return
         
         keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"run_preset_{i}")] for i, p in enumerate(presets)]
@@ -276,13 +276,13 @@ async def run_preset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text(f"🚀 正在执行预设查询: *{escape_markdown(preset['name'])}*", parse_mode=ParseMode.MARKDOWN)
         await execute_fofa_search(update, context, query_text)
     except (ValueError, IndexError):
-        await query.edit_message_text("❌ 预设查询失败，可能该预设已被移除。")
+        await query.edit_message_text("❌ 预设查询失败，可能该预设已被移除.")
     except Exception as e:
         logger.error(f"执行预设时出错: {e}")
-        await query.edit_message_text("❌ 执行预设时发生内部错误。")
+        await query.edit_message_text("❌ 执行预设时发生内部错误.")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_text = '操作已取消。'
+    message_text = '操作已取消.'
     if update.message:
         await update.message.reply_text(message_text)
     elif update.callback_query:
@@ -295,15 +295,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- 预设提交与审批 ---
 @admin_only
 async def submit_preset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("好的，我们来提交一个新的预设查询。\n\n"
-                                  "📝 **第一步**：请输入这个预设的名称（例如：海康威视摄像头）。\n\n"
-                                  "随时可以输入 /cancel 来取消操作。", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("好的，我们来提交一个新的预设查询.\n\n"
+                                  "📝 **第一步**：请输入这个预设的名称（例如：海康威视摄像头）.\n\n"
+                                  "随时可以输入 /cancel 来取消操作.", parse_mode=ParseMode.MARKDOWN)
     return STATE_PRESET_SUBMIT_NAME
 
 async def preset_submit_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['preset_name'] = update.message.text.strip()
     await update.message.reply_text(f"名称设为: *{escape_markdown(context.user_data['preset_name'])}*\n\n"
-                                  "📝 **第二步**：现在请输入完整的FOFA查询语法（例如：`app=\"HIKVISION-NVR\"`）。",
+                                  "📝 **第二步**：现在请输入完整的FOFA查询语法（例如：`app=\"HIKVISION-NVR\"`）.",
                                   parse_mode=ParseMode.MARKDOWN)
     return STATE_PRESET_SUBMIT_QUERY
 
@@ -320,7 +320,7 @@ async def preset_submit_get_query(update: Update, context: ContextTypes.DEFAULT_
     CONFIG['pending_presets'].append(pending_preset)
     save_config()
     
-    await update.message.reply_text("✅ 您的预设提交成功！已发送给超级管理员进行审批。")
+    await update.message.reply_text("✅ 您的预设提交成功！已发送给超级管理员进行审批.")
     
     super_admin_id = CONFIG.get('super_admin')
     if super_admin_id and super_admin_id != user.id:
@@ -358,7 +358,7 @@ async def preset_approval_callback(update: Update, context: ContextTypes.DEFAULT
 
     lock_key = f"lock_preset_{index}"
     if context.bot_data.get(lock_key):
-        await query.answer("正在处理中，请勿重复点击。", show_alert=True)
+        await query.answer("正在处理中，请勿重复点击.", show_alert=True)
         return
     context.bot_data[lock_key] = True
 
@@ -377,21 +377,21 @@ async def preset_approval_callback(update: Update, context: ContextTypes.DEFAULT
 
         if action == 'approve':
             CONFIG['presets'].append({"name": preset_name, "query": pending_preset['query']})
-            await query.edit_message_text(f"✅ 您已批准预设 *{escape_markdown(preset_name)}*。", parse_mode=ParseMode.MARKDOWN)
+            await query.edit_message_text(f"✅ 您已批准预设 *{escape_markdown(preset_name)}*.", parse_mode=ParseMode.MARKDOWN)
             if proposer_id:
-                await context.bot.send_message(chat_id=proposer_id, text=f"🎉 恭喜！您提交的预设查询 “{preset_name}” 已被批准。")
+                await context.bot.send_message(chat_id=proposer_id, text=f"🎉 恭喜！您提交的预设查询 “{preset_name}” 已被批准.")
         elif action == 'reject':
-            await query.edit_message_text(f"❌ 您已拒绝预设 *{escape_markdown(preset_name)}*。", parse_mode=ParseMode.MARKDOWN)
+            await query.edit_message_text(f"❌ 您已拒绝预设 *{escape_markdown(preset_name)}*.", parse_mode=ParseMode.MARKDOWN)
             if proposer_id:
-                await context.bot.send_message(chat_id=proposer_id, text=f"很遗憾，您提交的预设查询 “{preset_name}” 已被拒绝。")
+                await context.bot.send_message(chat_id=proposer_id, text=f"很遗憾，您提交的预设查询 “{preset_name}” 已被拒绝.")
         
         save_config()
 
     except IndexError:
-        await query.edit_message_text("🤔 操作失败，该提交可能已被处理或撤销。")
+        await query.edit_message_text("🤔 操作失败，该提交可能已被处理或撤销.")
     except Exception as e:
         logger.error(f"处理预设审批时出错: {e}")
-        await query.edit_message_text("❌ 内部错误，操作失败。")
+        await query.edit_message_text("❌ 内部错误，操作失败.")
     finally:
         context.bot_data.pop(lock_key, None)
 
@@ -442,14 +442,14 @@ async def show_preset_management_menu(update: Update, context: ContextTypes.DEFA
     return STATE_PRESET_MANAGE
 
 # --- 模拟其他设置功能 ---
-# 为了保持脚本完整性，这里提供了其他设置菜单项的框架函数。
+# 为了保持脚本完整性，这里提供了其他设置菜单项的框架函数.
 async def show_api_menu(update, context): await update.callback_query.edit_message_text("API管理功能占位符")
 async def show_proxy_menu(update, context): await update.callback_query.edit_message_text("代理设置功能占位符")
 async def show_access_control_menu(update, context): await update.callback_query.edit_message_text("访问控制功能占位符")
 async def show_mode_menu(update, context): await update.callback_query.edit_message_text("模式切换功能占位符")
 async def backup_config(update, context): 
-    await update.callback_query。answer("正在发送备份...")
-    await update.effective_message。reply_document(open(CONFIG_FILE, 'rb'), caption="这是当前的配置文件备份。")
+    await update.callback_query.answer("正在发送备份...")
+    await update.effective_message.reply_document(open(CONFIG_FILE, 'rb'), caption="这是当前的配置文件备份.")
 
 async def settings_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -472,13 +472,13 @@ async def settings_callback_handler(update: Update, context: ContextTypes.DEFAUL
 async def preset_management_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action = query.data。split('_'， 1)[1]
+    action = query.data.split('_'， 1)[1]
 
     if action == 'back_settings':
         await settings_command(update, context)
         return STATE_SETTINGS_MAIN
     # Add logic for preset_add and preset_remove here
-    await query.message.reply_text(f"功能 '{action}' 待实现。")
+    await query.message.reply_text(f"功能 '{action}' 待实现.")
     return STATE_PRESET_MANAGE
 
 
