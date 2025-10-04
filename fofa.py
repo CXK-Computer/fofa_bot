@@ -1,5 +1,5 @@
 #
-# fofa.py (兼容 python-telegram-bot v13.x 版本)
+# fofa.py (兼容 python-telegram-bot v13.x)
 #
 import os
 import json
@@ -10,10 +10,9 @@ import re
 import asyncio
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-# 正确的代码
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.constants import ParseMode
 
+# **重大修改**: 这是 v13 的正确导入方式
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode 
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -21,7 +20,7 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     CallbackQueryHandler,
-    filters,
+    Filters,
 )
 
 import urllib3
@@ -80,7 +79,6 @@ def load_config():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
-            # 兼容性检查：确保所有新字段都存在
             for key, value in default_config.items():
                 if key not in config:
                     config[key] = value
@@ -170,7 +168,6 @@ def kkfofa_command_entry(update: Update, context: CallbackContext) -> None:
         update.message.reply_text("请输入您的FOFA查询语句。例如：\n`/kkfofa domain=example.com`\n或者直接发送查询语句。")
         return
 
-    # 使用 context.bot_data 存储查询信息
     context.bot_data[user_id] = {'query': query_text}
     asyncio.run(execute_fofa_query(update, context))
 
@@ -179,7 +176,7 @@ async def execute_fofa_query(update: Update, context: CallbackContext) -> None:
     query_text = context.bot_data.get(user_id, {}).get('query')
     if not query_text: return
     
-    msg = await update.message.reply_text("🔍 正在查询中，请稍候...")
+    msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="🔍 正在查询中，请稍候...")
 
     async def query_func(key):
         return await fetch_fofa_data(key, query_text)
@@ -239,10 +236,10 @@ def status_command(update: Update, context: CallbackContext) -> None:
 
 async def check_api_status(update: Update, context: CallbackContext) -> None:
     if not CONFIG.get('apis'):
-        await update.message.reply_text("ℹ️ 当前没有配置任何API Key。")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="ℹ️ 当前没有配置任何API Key。")
         return
     
-    msg = await update.message.reply_text("📊 正在检查所有API Key状态，请稍候...")
+    msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="📊 正在检查所有API Key状态，请稍候...")
     
     tasks = [verify_fofa_api(key) for key in CONFIG['apis']]
     results = await asyncio.gather(*tasks)
@@ -261,12 +258,10 @@ async def check_api_status(update: Update, context: CallbackContext) -> None:
     response_text = "📊 **API Key 状态报告**\n\n" + "\n\n".join(status_lines)
     await msg.edit_text(response_text, parse_mode=ParseMode.MARKDOWN)
 
-
 def cancel(update: Update, context: CallbackContext) -> int:
     update.message.reply_text('操作已取消。')
     return ConversationHandler.END
 
-# --- 设置菜单 (ConversationHandler) ---
 @admin_only
 def settings_command(update: Update, context: CallbackContext) -> int:
     keyboard = [
@@ -289,154 +284,106 @@ def settings_command(update: Update, context: CallbackContext) -> int:
     return STATE_SETTINGS_MAIN
 
 def settings_main_handler(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    query.answer()
+    query = update.callback_query; query.answer()
     menu = query.data.split('_', 1)[1]
-
-    if menu == 'api':
-        return show_api_menu(update, context)
-    elif menu == 'proxy':
-        return show_proxy_menu(update, context)
-    elif menu == 'access':
-        return show_access_control_menu(update, context)
-    elif menu == 'mode':
-        return toggle_full_mode(update, context)
+    if menu == 'api': return show_api_menu(update, context)
+    elif menu == 'proxy': return show_proxy_menu(update, context)
+    elif menu == 'access': return show_access_control_menu(update, context)
+    elif menu == 'mode': return toggle_full_mode(update, context)
     elif menu == 'close':
-        query.edit_message_text("菜单已关闭。")
-        return ConversationHandler.END
+        query.edit_message_text("菜单已关闭."); return ConversationHandler.END
 
-def settings_action_handler(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    query.answer()
-    action = query.data.split('_', 1)[1]
-
-    if action == 'back_main':
-        return settings_command(update, context)
-    elif action == 'add_key':
-        query.edit_message_text("请输入要添加的FOFA API Key:")
-        return STATE_GET_KEY
-    elif action == 'remove_key':
-        query.edit_message_text("请输入要移除的API Key的编号 (#):")
-        return STATE_REMOVE_API
-    elif action == 'set_proxy':
-        query.edit_message_text("请输入新的代理地址 (例如: http://127.0.0.1:7890)。输入 '清除' 来移除代理。")
-        return STATE_GET_PROXY
-
-# API 管理
 def show_api_menu(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     api_list_str = "\n".join([f"`#{i+1}`: `{key[:4]}...{key[-4:]}`" for i, key in enumerate(CONFIG['apis'])]) or "无"
-    message_text = f"🔑 *API Key 管理*\n\n当前 Keys:\n{api_list_str}"
-    keyboard = [
-        [InlineKeyboardButton("➕ 添加 Key", callback_data='action_add_key'), InlineKeyboardButton("➖ 移除 Key", callback_data='action_remove_key')],
-        [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]
-    ]
-    query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    text = f"🔑 *API Key 管理*\n\n当前 Keys:\n{api_list_str}"
+    keyboard = [[InlineKeyboardButton("➕ 添加", callback_data='action_add_key'), InlineKeyboardButton("➖ 移除", callback_data='action_remove_key')], [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]]
+    query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
     return STATE_SETTINGS_ACTION
 
-# 代理管理
 def show_proxy_menu(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     proxy_status = f"`{CONFIG.get('proxy')}`" if CONFIG.get('proxy') else "未设置"
-    message_text = f"🌐 *代理设置*\n\n当前代理: {proxy_status}"
-    keyboard = [
-        [InlineKeyboardButton("✏️ 修改/设置代理", callback_data='action_set_proxy')],
-        [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]
-    ]
-    query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    text = f"🌐 *代理设置*\n\n当前代理: {proxy_status}"
+    keyboard = [[InlineKeyboardButton("✏️ 修改", callback_data='action_set_proxy')], [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]]
+    query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
     return STATE_SETTINGS_ACTION
 
-# 访问控制
+def settings_action_handler(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query; query.answer()
+    action = query.data.split('_', 1)[1]
+    if action == 'back_main': return settings_command(update, context)
+    elif action == 'add_key':
+        query.edit_message_text("请输入要添加的FOFA API Key:"); return STATE_GET_KEY
+    elif action == 'remove_key':
+        query.edit_message_text("请输入要移除的API Key的编号 (#):"); return STATE_REMOVE_API
+    elif action == 'set_proxy':
+        query.edit_message_text("请输入代理(http://127.0.0.1:7890)，输入'清除'移除"); return STATE_GET_PROXY
+
 def show_access_control_menu(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    public_mode_status = "✅ 公共模式 (任何人可查询)" if CONFIG.get('public_mode', False) else "❌ 私有模式 (仅管理员可查询)"
+    public_mode = "✅ 公共模式" if CONFIG.get('public_mode', False) else "❌ 私有模式"
     admin_list = "\n".join([f"`{admin_id}`" for admin_id in CONFIG.get('admins', [])]) or "_无_"
-    message_text = f"👑 *访问控制*\n\n**当前模式**: {public_mode_status}\n\n**管理员列表**:\n{admin_list}"
-    keyboard = [
-        [InlineKeyboardButton("🔄 切换模式", callback_data='access_toggle_public')],
-        [InlineKeyboardButton("➕ 添加管理员", callback_data='access_add_admin'), InlineKeyboardButton("➖ 删除管理员", callback_data='access_remove_admin')],
-        [InlineKeyboardButton("🔙 返回主菜单", callback_data='access_back_main')]
-    ]
-    query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    text = f"👑 *访问控制*\n\n**模式**: {public_mode}\n\n**管理员**:\n{admin_list}"
+    keyboard = [[InlineKeyboardButton("🔄 切换模式", callback_data='access_toggle_public')], [InlineKeyboardButton("➕ 添加", callback_data='access_add_admin'), InlineKeyboardButton("➖ 删除", callback_data='access_remove_admin')], [InlineKeyboardButton("🔙 返回", callback_data='access_back_main')]]
+    query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
     return STATE_ACCESS_CONTROL
 
 def access_control_callback_handler(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    query.answer()
+    query = update.callback_query; query.answer()
     action = query.data.split('_', 1)[1]
-
-    if action == 'back_main':
-        return settings_command(update, context)
+    if action == 'back_main': return settings_command(update, context)
     elif action == 'toggle_public':
-        CONFIG['public_mode'] = not CONFIG.get('public_mode', False)
-        save_config()
-        return show_access_control_menu(update, context) # Refresh menu
+        CONFIG['public_mode'] = not CONFIG.get('public_mode', False); save_config()
+        return show_access_control_menu(update, context)
     elif action == 'add_admin':
-        query.edit_message_text("请输入要添加的管理员Telegram用户ID。")
-        return STATE_ADD_ADMIN
+        query.edit_message_text("请输入要添加的管理员Telegram用户ID。"); return STATE_ADD_ADMIN
     elif action == 'remove_admin':
         if len(CONFIG.get('admins', [])) <= 1:
-            query.message.reply_text("❌ 不能删除最后一个管理员。")
-            return show_access_control_menu(update, context)
-        query.edit_message_text("请输入要删除的管理员Telegram用户ID。")
-        return STATE_REMOVE_ADMIN
+            query.message.reply_text("❌ 不能删除最后一个管理员。"); return show_access_control_menu(update, context)
+        query.edit_message_text("请输入要删除的管理员Telegram用户ID。"); return STATE_REMOVE_ADMIN
 
-# 查询模式
 def toggle_full_mode(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    query.answer()
-    CONFIG['full_mode'] = not CONFIG.get('full_mode', False)
-    save_config()
+    query = update.callback_query; query.answer()
+    CONFIG['full_mode'] = not CONFIG.get('full_mode', False); save_config()
     mode_text = "完整模式 (full=true)" if CONFIG['full_mode'] else "精简模式 (默认)"
     query.message.reply_text(f"✅ 查询模式已切换为: **{mode_text}**", parse_mode=ParseMode.MARKDOWN)
     return settings_command(update, context)
 
-# 状态处理函数
 def get_key(update: Update, context: CallbackContext) -> int:
     new_key = update.message.text.strip()
     if new_key not in CONFIG['apis']:
-        CONFIG['apis'].append(new_key)
-        save_config()
+        CONFIG['apis'].append(new_key); save_config()
         update.message.reply_text(f"✅ API Key `{new_key[:4]}...` 添加成功！")
-    else:
-        update.message.reply_text("ℹ️ 这个Key已经存在了。")
+    else: update.message.reply_text("ℹ️ 这个Key已经存在了。")
     return settings_command(update, context)
 
 def remove_api(update: Update, context: CallbackContext) -> int:
     try:
         key_index = int(update.message.text.strip()) - 1
         if 0 <= key_index < len(CONFIG['apis']):
-            removed_key = CONFIG['apis'].pop(key_index)
-            save_config()
+            removed_key = CONFIG['apis'].pop(key_index); save_config()
             update.message.reply_text(f"✅ 已移除 Key #{key_index+1} (`{removed_key[:4]}...`)。")
-        else:
-            update.message.reply_text("❌ 无效的编号。")
-    except ValueError:
-        update.message.reply_text("❌ 请输入一个纯数字编号。")
+        else: update.message.reply_text("❌ 无效的编号。")
+    except ValueError: update.message.reply_text("❌ 请输入一个纯数字编号。")
     return settings_command(update, context)
 
 def get_proxy(update: Update, context: CallbackContext) -> int:
     proxy_text = update.message.text.strip()
-    if proxy_text.lower() == '清除':
-        CONFIG['proxy'] = ""
-        update.message.reply_text("✅ 代理已清除。")
-    else:
-        CONFIG['proxy'] = proxy_text
-        update.message.reply_text(f"✅ 代理已设置为: `{proxy_text}`")
+    if proxy_text.lower() == '清除': CONFIG['proxy'] = ""
+    else: CONFIG['proxy'] = proxy_text
     save_config()
+    update.message.reply_text(f"✅ 代理已设置为: `{CONFIG['proxy'] or '无'}`")
     return settings_command(update, context)
 
 def add_admin_handler(update: Update, context: CallbackContext) -> int:
     try:
         new_admin_id = int(update.message.text.strip())
         if new_admin_id not in CONFIG['admins']:
-            CONFIG['admins'].append(new_admin_id)
-            save_config()
+            CONFIG['admins'].append(new_admin_id); save_config()
             update.message.reply_text(f"✅ 管理员 `{new_admin_id}` 添加成功！")
-        else:
-            update.message.reply_text(f"ℹ️ 用户 `{new_admin_id}` 已经是管理员了。")
-    except ValueError:
-        update.message.reply_text("❌ 无效的ID，请输入纯数字的用户ID。")
+        else: update.message.reply_text(f"ℹ️ 用户 `{new_admin_id}` 已经是管理员了。")
+    except ValueError: update.message.reply_text("❌ 无效的ID，请输入纯数字的用户ID。")
     return settings_command(update, context)
 
 def remove_admin_handler(update: Update, context: CallbackContext) -> int:
@@ -445,74 +392,58 @@ def remove_admin_handler(update: Update, context: CallbackContext) -> int:
         if len(CONFIG['admins']) <= 1 and admin_id_to_remove in CONFIG['admins']:
              update.message.reply_text("❌ 不能删除最后一个管理员。")
         elif admin_id_to_remove in CONFIG['admins']:
-            CONFIG['admins'].remove(admin_id_to_remove)
-            save_config()
+            CONFIG['admins'].remove(admin_id_to_remove); save_config()
             update.message.reply_text(f"✅ 管理员 `{admin_id_to_remove}` 已被移除。")
-        else:
-            update.message.reply_text(f"❌ 用户 `{admin_id_to_remove}` 不是管理员。")
-    except ValueError:
-        update.message.reply_text("❌ 无效的ID，请输入纯数字的用户ID。")
+        else: update.message.reply_text(f"❌ 用户 `{admin_id_to_remove}` 不是管理员。")
+    except ValueError: update.message.reply_text("❌ 无效的ID，请输入纯数字的用户ID。")
     return settings_command(update, context)
-
 
 # --- 主程序入口 ---
 def main() -> None:
     bot_token = CONFIG.get("bot_token")
     if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE":
-        logger.critical("严重错误：config.json 中的 'bot_token' 未设置！请修改配置文件后重启。")
+        logger.critical("严重错误：config.json 中的 'bot_token' 未设置！")
         return
 
-    # 使用旧版的 Updater 和 Dispatcher
+    # **v13 正确的初始化方式**
     updater = Updater(token=bot_token, use_context=True)
     dispatcher = updater.dispatcher
 
-    # 设置机器人命令菜单
-    commands = [
-        BotCommand("start", "🚀 启动机器人"),
-        BotCommand("kkfofa", "🔎 执行FOFA查询"),
-        BotCommand("status", "📊 检查API Key状态"),
-        BotCommand("settings", "⚙️ 打开设置菜单"),
-        BotCommand("cancel", "❌ 取消当前操作"),
-    ]
-    updater.bot.set_my_commands(commands)
+    try:
+        commands = [
+            BotCommand("start", "🚀 启动机器人"), BotCommand("kkfofa", "🔎 执行FOFA查询"),
+            BotCommand("status", "📊 检查API Key状态"), BotCommand("settings", "⚙️ 打开设置菜单"),
+            BotCommand("cancel", "❌ 取消当前操作"),
+        ]
+        updater.bot.set_my_commands(commands)
+    except Exception as e:
+        logger.warning(f"设置机器人命令失败: {e}")
 
-    # 设置会话处理器
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
         states={
             STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_main_handler, pattern=r"^settings_")],
             STATE_SETTINGS_ACTION: [CallbackQueryHandler(settings_action_handler, pattern=r"^action_")],
             STATE_ACCESS_CONTROL: [CallbackQueryHandler(access_control_callback_handler, pattern=r"^access_")],
-            STATE_ADD_ADMIN: [MessageHandler(filters.Text & ~filters.COMMAND, add_admin_handler)],
-            STATE_REMOVE_ADMIN: [MessageHandler(filters.Text & ~filters.COMMAND, remove_admin_handler)],
-            STATE_GET_KEY: [MessageHandler(filters.Text & ~filters.COMMAND, get_key)],
-            STATE_GET_PROXY: [MessageHandler(filters.Text & ~filters.COMMAND, get_proxy)],
-            STATE_REMOVE_API: [MessageHandler(filters.Text & ~filters.COMMAND, remove_api)],
+            STATE_ADD_ADMIN: [MessageHandler(Filters.text & ~Filters.command, add_admin_handler)],
+            STATE_REMOVE_ADMIN: [MessageHandler(Filters.text & ~Filters.command, remove_admin_handler)],
+            STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)],
+            STATE_GET_PROXY: [MessageHandler(Filters.text & ~Filters.command, get_proxy)],
+            STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
     )
     
-    # 直接查询处理器
-    kkfofa_handler = CommandHandler("kkfofa", kkfofa_command_entry)
-    direct_query_handler = MessageHandler(filters.Text & ~filters.COMMAND, kkfofa_command_entry)
-
-    # 注册处理器到 dispatcher
     dispatcher.add_handler(CommandHandler("start", start_command))
     dispatcher.add_handler(CommandHandler("status", status_command))
     dispatcher.add_handler(settings_conv)
-    dispatcher.add_handler(kkfofa_handler)
-    dispatcher.add_handler(direct_query_handler) 
-
-    # 同步启动机器人
+    dispatcher.add_handler(CommandHandler("kkfofa", kkfofa_command_entry))
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, kkfofa_command_entry)) 
+    
     logger.info("机器人已启动，正在等待消息...")
     updater.start_polling()
-
-    # 优雅地停止
     updater.idle()
     logger.info("机器人已关闭。")
 
-
 if __name__ == "__main__":
     main()
-
