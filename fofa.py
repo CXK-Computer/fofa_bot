@@ -1,10 +1,11 @@
 #
-# fofa_ultimate_v13.py (最终融合版 for python-telegram-bot v13.x)
+# fofa_ultimate_v13_fixed.py (最终融合版 for python-telegram-bot v13.x)
 #
 # 继承了 fofa.py 的高级缓存、增量更新、深度追溯、任务控制等专业功能。
 # 继承了 go.py 的 /kkfofa 预设菜单、/stats 全球统计和图形化预设管理。
 # 新增: 1. 根据查询语法生成智能文件名。
 # 新增: 2. 集成Go语言的TCP存活检测工具，可通过下载任务或 /getscanner 命令获取。
+# 修复: 修复了 kkfofa_command 中的 IndentationError。
 #
 import os
 import json
@@ -186,7 +187,6 @@ SUBNET_TCP_SCANNER_GO_TEMPLATE_LINES = [
     "}",
 ]
 
-
 # --- 全局变量和常量 ---
 CONFIG_FILE = 'config.json'
 HISTORY_FILE = 'history.json'
@@ -244,7 +244,6 @@ def save_history(): save_json_file(HISTORY_FILE, HISTORY)
 
 # --- 缓存和历史记录核心函数 ---
 def add_or_update_query(query_text, cache_data=None):
-    # (此函数无需修改)
     existing_query = next((q for q in HISTORY['queries'] if q['query_text'] == query_text), None)
     if existing_query:
         HISTORY['queries'].remove(existing_query); existing_query['timestamp'] = datetime.now(tz.tzutc()).isoformat()
@@ -264,14 +263,11 @@ def find_cached_query(query_text):
 # --- 辅助函数与装饰器 ---
 def generate_filename_from_query(query_text: str) -> str:
     """根据查询语句生成安全的文件名"""
-    # 将查询语句转为小写，并用下划线替换所有非字母数字和非连字符的字符
     sanitized_query = re.sub(r'[^a-z0-9\-_]+', '_', query_text.lower())
-    # 去除可能产生在开头或结尾的下划线
     sanitized_query = sanitized_query.strip('_')
-    # 防止文件名过长，截取前100个字符
     max_len = 100
     if len(sanitized_query) > max_len:
-        sanitized_query = sanitized_query[:max_len].rsplit('_', 1)[0] # 避免截断单词
+        sanitized_query = sanitized_query[:max_len].rsplit('_', 1)[0]
     timestamp = int(time.time())
     return f"fofa_{sanitized_query}_{timestamp}.txt"
 
@@ -331,7 +327,7 @@ def offer_liveness_checker(bot, chat_id, input_filename):
     keyboard = [[InlineKeyboardButton("⚡️ 获取存活检测工具", callback_data=f'get_liveness_checker_{input_filename}')]]
     bot.send_message(chat_id, "需要对结果进行TCP活性检测吗？", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- 后台下载任务 (已更新文件名逻辑) ---
+# --- 后台下载任务 ---
 def start_download_job(context: CallbackContext, callback_func, job_data):
     chat_id = job_data['chat_id']; job_name = f"download_job_{chat_id}"
     for job in context.job_queue.get_jobs_by_name(job_name): job.schedule_removal()
@@ -340,7 +336,7 @@ def start_download_job(context: CallbackContext, callback_func, job_data):
 
 def run_full_download_query(context: CallbackContext):
     job_data = context.job.context; bot, chat_id, query_text, total_size = context.bot, job_data['chat_id'], job_data['query'], job_data['total_size']
-    output_filename = generate_filename_from_query(query_text) # <-- 使用新函数
+    output_filename = generate_filename_from_query(query_text)
     unique_results, stop_flag = set(), f'stop_job_{chat_id}'
     msg = bot.send_message(chat_id, "⏳ 开始全量下载任务...")
     pages_to_fetch = (total_size + 9999) // 10000
@@ -352,7 +348,7 @@ def run_full_download_query(context: CallbackContext):
         if error: msg.edit_text(f"❌ 第 {page} 页下载出错: {error}"); break
         results = data.get('results', []);
         if not results: break
-        unique_results.update(res for res in results if ':' in res) # 只保留 ip:port 格式
+        unique_results.update(res for res in results if ':' in res)
     if unique_results:
         with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(unique_results))
         msg.edit_text(f"✅ 下载完成！共 {len(unique_results)} 条。正在发送...")
@@ -366,7 +362,7 @@ def run_full_download_query(context: CallbackContext):
 
 def run_traceback_download_query(context: CallbackContext):
     job_data = context.job.context; bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']
-    output_filename = generate_filename_from_query(base_query) # <-- 使用新函数
+    output_filename = generate_filename_from_query(base_query)
     unique_results, page_count, last_page_date, termination_reason, stop_flag = set(), 0, None, "", f'stop_job_{chat_id}'
     msg = bot.send_message(chat_id, "⏳ 开始深度追溯下载...")
     current_query = base_query
@@ -378,7 +374,7 @@ def run_traceback_download_query(context: CallbackContext):
         results = data.get('results', [])
         if not results: termination_reason = "\n\nℹ️ 已获取所有查询结果."; break
         original_count = len(unique_results)
-        unique_results.update([r[0] for r in results if r and r[0] and ':' in r[0]]) # 只保留 ip:port
+        unique_results.update([r[0] for r in results if r and r[0] and ':' in r[0]])
         newly_added_count = len(unique_results) - original_count
         try: msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
         except BadRequest: pass
@@ -434,7 +430,7 @@ def run_incremental_update_query(context: CallbackContext):
         if error: msg.edit_text(f"❌ 下载新数据失败: {error}"); os.remove(old_file_path); return
         if data.get('results'): new_results.update(res for res in data.get('results', []) if ':' in res)
     msg.edit_text(f"4/5: 正在合并数据... (发现 {len(new_results)} 条新数据)"); combined_results = sorted(list(new_results.union(old_results)))
-    output_filename = generate_filename_from_query(base_query) # <-- 使用新函数
+    output_filename = generate_filename_from_query(base_query)
     with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(combined_results))
     msg.edit_text(f"5/5: 发送更新后的文件... (共 {len(combined_results)} 条)")
     with open(output_filename, 'rb') as doc: sent_message = bot.send_document(chat_id, document=doc, filename=output_filename)
@@ -447,11 +443,9 @@ def run_incremental_update_query(context: CallbackContext):
 
 # --- 主要命令 ---
 def start_command(update: Update, context: CallbackContext):
-    # (此函数无需修改)
     update.message.reply_text('👋 欢迎使用 Fofa 查询机器人！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 def help_command(update: Update, context: CallbackContext):
-    # (更新帮助文本)
     help_text = ( "📖 *Fofa 机器人指令手册*\n\n"
                   "*🔍 资产查询*\n`/kkfofa [key编号] <查询语句>`\n_不带参数则显示预设菜单_\n\n"
                   "*📊 资产统计*\n`/stats` - 获取全球资产统计信息\n\n"
@@ -471,39 +465,51 @@ def help_command(update: Update, context: CallbackContext):
 
 @admin_only
 def kkfofa_command(update: Update, context: CallbackContext):
-    # (此函数无需修改)
     if not context.args:
         presets = CONFIG.get("presets", [])
-        if not presets: update.message.reply_text("欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加."); return ConversationHandler.END
+        if not presets:
+            update.message.reply_text("欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。")
+            return ConversationHandler.END
         keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"run_preset_{i}")] for i, p in enumerate(presets)]
-        update.message.reply_text("👇 请选择一个预设查询，或直接输入查询语法:", reply_markup=InlineKeyboardMarkup(keyboard)); return ConversationHandler.END
+        update.message.reply_text("👇 请选择一个预设查询，或直接输入查询语法:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return ConversationHandler.END
+
     key_index, query_text = None, " ".join(context.args)
-# 这是修正后的、正确的代码
-if context.args[0].isdigit():
-    try:
-        num = int(context.args[0])
-        if 1 <= num <= len(CONFIG['apis']):
-            key_index = num
-            query_text = " ".join(context.args[1:])
-    except ValueError:
-        pass # 如果转换整数失败，则忽略，当作普通查询语句
-        except ValueError: pass
+
+    # --- START: IndentationError FIX ---
+    if context.args[0].isdigit():
+        try:
+            num = int(context.args[0])
+            if 1 <= num <= len(CONFIG['apis']):
+                key_index = num
+                query_text = " ".join(context.args[1:])
+        except ValueError:
+            pass # Ignore if conversion fails, treat as part of the query
+    # --- END: IndentationError FIX ---
+
     context.user_data.update({'query': query_text, 'key_index': key_index, 'chat_id': update.effective_chat.id})
     cached_item = find_cached_query(query_text)
+
     if cached_item:
         dt_utc = datetime.fromisoformat(cached_item['timestamp']); dt_local = dt_utc.astimezone(tz.tzlocal()); time_str = dt_local.strftime('%Y-%m-%d %H:%M')
         result_count = cached_item['cache']['result_count']
         is_expired = (datetime.now(tz.tzutc()) - dt_utc).total_seconds() > CACHE_EXPIRATION_SECONDS
         message_text = (f"✅ *发现缓存*\n\n查询: `{escape_markdown(query_text)}`\n缓存于: *{time_str}* (含 *{result_count}* 条结果)\n\n")
         keyboard = []
-        if is_expired: message_text += "⚠️ *此缓存已超过24小时，无法用于增量更新。*"; keyboard.append([InlineKeyboardButton("⬇️ 下载旧缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
-        else: message_text += "请选择操作："; keyboard.append([InlineKeyboardButton("🔄 增量更新", callback_data='cache_incremental')]); keyboard.append([InlineKeyboardButton("⬇️ 下载缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
+        if is_expired:
+            message_text += "⚠️ *此缓存已超过24小时，无法用于增量更新。*"
+            keyboard.append([InlineKeyboardButton("⬇️ 下载旧缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
+        else:
+            message_text += "请选择操作："
+            keyboard.append([InlineKeyboardButton("🔄 增量更新", callback_data='cache_incremental')])
+            keyboard.append([InlineKeyboardButton("⬇️ 下载缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
         keyboard.append([InlineKeyboardButton("❌ 取消", callback_data='cache_cancel')])
-        update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN); return STATE_CACHE_CHOICE
+        update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        return STATE_CACHE_CHOICE
+    
     return start_new_search(update, context)
 
 def start_new_search(update: Update, context: CallbackContext, message_to_edit=None):
-    # (此函数无需修改)
     query_text = context.user_data['query']; key_index = context.user_data.get('key_index'); add_or_update_query(query_text)
     if message_to_edit: msg = message_to_edit; msg.edit_text("🔄 正在执行全新查询...")
     else: msg = update.effective_message.reply_text("🔄 正在执行全新查询...")
@@ -520,70 +526,6 @@ def start_new_search(update: Update, context: CallbackContext, message_to_edit=N
         keyboard = [[InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
         msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_KKFOFA_MODE
 
-# (其余大部分命令如 stats_command, history_command, import_command 等无需修改，此处省略以节省篇幅)
-# ...
-# 可以在完整脚本区域找到所有未省略的代码
-# ...
-
-# --- 新增: 扫描工具相关命令和回调 ---
-def get_scanner_command(update: Update, context: CallbackContext):
-    """/getscanner 命令，提供扫描工具选择"""
-    keyboard = [
-        [InlineKeyboardButton("⚡️ IP:PORT 存活检测器", callback_data='get_liveness_checker_standalone')],
-        [InlineKeyboardButton("🌐 子网C段扫描器", callback_data='get_subnet_scanner')],
-    ]
-    update.message.reply_text("请选择您需要的Go扫描工具：", reply_markup=InlineKeyboardMarkup(keyboard))
-
-def get_liveness_checker_callback(update: Update, context: CallbackContext):
-    """处理获取存活检测器的回调"""
-    query = update.callback_query; query.answer()
-    
-    # 从回调数据中解析输入文件名，如果是独立请求则为None
-    parts = query.data.split('_', 3)
-    input_filename = parts[3] if len(parts) > 3 else "input.txt"
-
-    go_code = "\n".join(TCP_ACTIVE_GO_TEMPLATE_LINES)
-    checker_filename = "liveness_checker.go"
-    with open(checker_filename, "w", encoding='utf-8') as f: f.write(go_code)
-    
-    caption = ( "✅ **Go语言存活检测工具**\n\n"
-                "**用法:**\n1. 将此文件与您的 `ip:port` 结果文件放在同一目录。\n"
-                "2. 确保您已安装 Go 环境。\n"
-                "3. 在终端中运行以下命令：\n\n"
-                f"`go run {checker_filename} {input_filename} live_results.txt`\n\n"
-                f"存活的IP将会被保存在 `live_results.txt` 文件中。" )
-
-    with open(checker_filename, 'rb') as doc:
-        context.bot.send_document(chat_id=query.effective_chat.id, document=doc, caption=caption, parse_mode=ParseMode.MARKDOWN)
-    
-    os.remove(checker_filename)
-    # 如果是点击消息按钮触发的，可以编辑原消息提示已发送
-    if query.message.reply_markup:
-        query.edit_message_text("✅ 工具已发送，请查收。")
-
-def get_subnet_scanner_callback(update: Update, context: CallbackContext):
-    """处理获取子网扫描器的回调"""
-    query = update.callback_query; query.answer()
-    go_code = "\n".join(SUBNET_TCP_SCANNER_GO_TEMPLATE_LINES)
-    scanner_filename = "subnet_scanner.go"
-    with open(scanner_filename, "w", encoding='utf-8') as f: f.write(go_code)
-
-    caption = ( "✅ **Go语言子网扫描工具**\n\n"
-                "**用法:**\n1. 将此文件保存在任意位置。\n"
-                "2. 确保您已安装 Go 环境。\n"
-                "3. 在终端中运行以下命令：\n\n"
-                "`go run subnet_scanner.go <CIDR> <端口> <输出文件名> <并发数>`\n\n"
-                "**示例:**\n"
-                "`go run subnet_scanner.go 192.168.1.0/24 80 results.txt 100`")
-    
-    with open(scanner_filename, 'rb') as doc:
-        context.bot.send_document(chat_id=query.effective_chat.id, document=doc, caption=caption, parse_mode=ParseMode.MARKDOWN)
-
-    os.remove(scanner_filename)
-
-
-# ========================== START: 完整脚本区域 ==========================
-# (为了方便您直接复制使用，这里包含了所有命令的完整代码，包括上面省略的部分)
 def run_preset_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer()
     try:
@@ -625,6 +567,50 @@ def get_fofa_stats_query(update: Update, context: CallbackContext) -> int:
     message_lines.append("\n*🔌 Top 5 协议:*");
     for item in stats_data.get("protocols", [])[:5]: message_lines.append(f"  - `{escape_markdown(item['name'])}`: *{item['count']}*")
     processing_message.edit_text("\n".join(message_lines), parse_mode=ParseMode.MARKDOWN); return ConversationHandler.END
+
+# --- 扫描工具相关 ---
+def get_scanner_command(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("⚡️ IP:PORT 存活检测器", callback_data='get_liveness_checker_standalone')],
+        [InlineKeyboardButton("🌐 子网C段扫描器", callback_data='get_subnet_scanner')],
+    ]
+    update.message.reply_text("请选择您需要的Go扫描工具：", reply_markup=InlineKeyboardMarkup(keyboard))
+
+def get_liveness_checker_callback(update: Update, context: CallbackContext):
+    query = update.callback_query; query.answer()
+    parts = query.data.split('_', 3)
+    input_filename = parts[3] if len(parts) > 3 else "input.txt"
+    go_code = "\n".join(TCP_ACTIVE_GO_TEMPLATE_LINES)
+    checker_filename = "liveness_checker.go"
+    with open(checker_filename, "w", encoding='utf-8') as f: f.write(go_code)
+    caption = ( "✅ **Go语言存活检测工具**\n\n"
+                "**用法:**\n1. 将此文件与您的 `ip:port` 结果文件放在同一目录。\n"
+                "2. 确保您已安装 Go 环境。\n"
+                "3. 在终端中运行以下命令：\n\n"
+                f"`go run {checker_filename} {input_filename} live_results.txt`\n\n"
+                f"存活的IP将会被保存在 `live_results.txt` 文件中。" )
+    with open(checker_filename, 'rb') as doc:
+        context.bot.send_document(chat_id=query.effective_chat.id, document=doc, caption=caption, parse_mode=ParseMode.MARKDOWN)
+    os.remove(checker_filename)
+    if query.message.reply_markup and 'standalone' not in query.data:
+        query.edit_message_text("✅ 工具已发送，请查收。")
+
+def get_subnet_scanner_callback(update: Update, context: CallbackContext):
+    query = update.callback_query; query.answer()
+    go_code = "\n".join(SUBNET_TCP_SCANNER_GO_TEMPLATE_LINES)
+    scanner_filename = "subnet_scanner.go"
+    with open(scanner_filename, "w", encoding='utf-8') as f: f.write(go_code)
+    caption = ( "✅ **Go语言子网扫描工具**\n\n"
+                "**用法:**\n1. 将此文件保存在任意位置。\n"
+                "2. 确保您已安装 Go 环境。\n"
+                "3. 在终端中运行以下命令：\n\n"
+                "`go run subnet_scanner.go <CIDR> <端口> <输出文件名> <并发数>`\n\n"
+                "**示例:**\n"
+                "`go run subnet_scanner.go 192.168.1.0/24 80 results.txt 100`")
+    with open(scanner_filename, 'rb') as doc:
+        context.bot.send_document(chat_id=query.effective_chat.id, document=doc, caption=caption, parse_mode=ParseMode.MARKDOWN)
+    os.remove(scanner_filename)
+
 @admin_only
 def stop_all_tasks(update: Update, context: CallbackContext): context.bot_data[f'stop_job_{update.effective_chat.id}'] = True; update.message.reply_text("✅ 已发送停止信号。")
 @admin_only
@@ -757,31 +743,86 @@ def cancel(update: Update, context: CallbackContext):
 # --- 主程序入口 ---
 def main() -> None:
     bot_token = CONFIG.get("bot_token")
-    if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE": logger.critical("严重错误：config.json 中的 'bot_token' 未设置！请修改配置文件。");
-        if not os.path.exists(CONFIG_FILE): save_config(); return
+    if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE":
+        logger.critical("严重错误：config.json 中的 'bot_token' 未设置！请修改配置文件。")
+        if not os.path.exists(CONFIG_FILE): save_config()
+        return
+
     updater = Updater(token=bot_token, use_context=True); dispatcher = updater.dispatcher
-    commands = [ BotCommand("start", "🚀 启动机器人与帮助"), BotCommand("help", "❓ 获取命令手册"), BotCommand("kkfofa", "🔍 资产搜索 (或显示预设)"), BotCommand("stats", "📊 全球资产统计"), BotCommand("getscanner", "🛠️ 获取扫描工具"), BotCommand("settings", "⚙️ (管理员) 设置菜单"), BotCommand("history", "🕰️ (管理员) 查询历史"), BotCommand("import", "🖇️ (管理员) 导入旧缓存"), BotCommand("backup", "📤 (管理员) 备份配置"), BotCommand("restore", "📥 (管理员) 恢复配置"), BotCommand("getlog", "📄 (管理员) 获取日志"), BotCommand("shutdown", "🔌 (管理员) 关闭机器人"), BotCommand("stop", "🛑 (管理员) 停止任务"), BotCommand("cancel", "❌ 取消当前操作") ]
+    commands = [
+        BotCommand("start", "🚀 启动机器人与帮助"),
+        BotCommand("help", "❓ 获取命令手册"),
+        BotCommand("kkfofa", "🔍 资产搜索 (或显示预设)"),
+        BotCommand("stats", "📊 全球资产统计"),
+        BotCommand("getscanner", "🛠️ 获取扫描工具"),
+        BotCommand("settings", "⚙️ (管理员) 设置菜单"),
+        BotCommand("history", "🕰️ (管理员) 查询历史"),
+        BotCommand("import", "🖇️ (管理员) 导入旧缓存"),
+        BotCommand("backup", "📤 (管理员) 备份配置"),
+        BotCommand("restore", "📥 (管理员) 恢复配置"),
+        BotCommand("getlog", "📄 (管理员) 获取日志"),
+        BotCommand("shutdown", "🔌 (管理员) 关闭机器人"),
+        BotCommand("stop", "🛑 (管理员) 停止任务"),
+        BotCommand("cancel", "❌ 取消当前操作")
+    ]
     try: updater.bot.set_my_commands(commands)
     except Exception as e: logger.warning(f"设置机器人命令失败: {e}")
+
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
         states={
-            STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_callback_handler, pattern=r"^settings_")], STATE_SETTINGS_ACTION: [CallbackQueryHandler(settings_action_handler, pattern=r"^action_")],
-            STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)], STATE_GET_PROXY: [MessageHandler(Filters.text & ~Filters.command, get_proxy)], STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
-            STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")], STATE_GET_PRESET_NAME: [MessageHandler(Filters.text & ~Filters.command, get_preset_name)], STATE_GET_PRESET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_preset_query)], STATE_REMOVE_PRESET: [MessageHandler(Filters.text & ~Filters.command, remove_preset)],
+            STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_callback_handler, pattern=r"^settings_")],
+            STATE_SETTINGS_ACTION: [CallbackQueryHandler(settings_action_handler, pattern=r"^action_")],
+            STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)],
+            STATE_GET_PROXY: [MessageHandler(Filters.text & ~Filters.command, get_proxy)],
+            STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
+            STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")],
+            STATE_GET_PRESET_NAME: [MessageHandler(Filters.text & ~Filters.command, get_preset_name)],
+            STATE_GET_PRESET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_preset_query)],
+            STATE_REMOVE_PRESET: [MessageHandler(Filters.text & ~Filters.command, remove_preset)],
         }, fallbacks=[CommandHandler("cancel", cancel)]
     )
-    kkfofa_conv = ConversationHandler(entry_points=[CommandHandler("kkfofa", kkfofa_command)], states={ STATE_CACHE_CHOICE: [CallbackQueryHandler(cache_choice_callback, pattern=r"^cache_")], STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")], }, fallbacks=[CommandHandler("cancel", cancel)])
-    import_conv = ConversationHandler(entry_points=[CommandHandler("import", import_command)], states={STATE_GET_IMPORT_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_import_query)]}, fallbacks=[CommandHandler("cancel", cancel)])
-    stats_conv = ConversationHandler(entry_points=[CommandHandler("stats", stats_command)], states={STATE_GET_STATS_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]}, fallbacks=[CommandHandler("cancel", cancel)])
-    dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("restore", restore_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command))
-    dispatcher.add_handler(CommandHandler("getscanner", get_scanner_command)) # 新增
-    dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv);
-    dispatcher.add_handler(CallbackQueryHandler(run_preset_callback, pattern=r"^run_preset_")); dispatcher.add_handler(MessageHandler(Filters.document.mime_type("application/json"), receive_config_file))
-    dispatcher.add_handler(CallbackQueryHandler(get_liveness_checker_callback, pattern=r"^get_liveness_checker")) # 新增
-    dispatcher.add_handler(CallbackQueryHandler(get_subnet_scanner_callback, pattern=r"^get_subnet_scanner")) # 新增
-    logger.info("🚀 终极增强版机器人已启动..."); updater.start_polling(); updater.idle(); logger.info("机器人已关闭。")
+    kkfofa_conv = ConversationHandler(
+        entry_points=[CommandHandler("kkfofa", kkfofa_command)],
+        states={
+            STATE_CACHE_CHOICE: [CallbackQueryHandler(cache_choice_callback, pattern=r"^cache_")],
+            STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
+        }, fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    import_conv = ConversationHandler(
+        entry_points=[CommandHandler("import", import_command)],
+        states={STATE_GET_IMPORT_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_import_query)]},
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    stats_conv = ConversationHandler(
+        entry_points=[CommandHandler("stats", stats_command)],
+        states={STATE_GET_STATS_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]},
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+
+    # 添加所有处理器
+    dispatcher.add_handler(CommandHandler("start", start_command))
+    dispatcher.add_handler(CommandHandler("help", help_command))
+    dispatcher.add_handler(CommandHandler("stop", stop_all_tasks))
+    dispatcher.add_handler(CommandHandler("backup", backup_config_command))
+    dispatcher.add_handler(CommandHandler("restore", restore_config_command))
+    dispatcher.add_handler(CommandHandler("history", history_command))
+    dispatcher.add_handler(CommandHandler("getlog", get_log_command))
+    dispatcher.add_handler(CommandHandler("shutdown", shutdown_command))
+    dispatcher.add_handler(CommandHandler("getscanner", get_scanner_command))
+    dispatcher.add_handler(settings_conv)
+    dispatcher.add_handler(kkfofa_conv)
+    dispatcher.add_handler(import_conv)
+    dispatcher.add_handler(stats_conv)
+    dispatcher.add_handler(CallbackQueryHandler(run_preset_callback, pattern=r"^run_preset_"))
+    dispatcher.add_handler(CallbackQueryHandler(get_liveness_checker_callback, pattern=r"^get_liveness_checker"))
+    dispatcher.add_handler(CallbackQueryHandler(get_subnet_scanner_callback, pattern=r"^get_subnet_scanner"))
+    dispatcher.add_handler(MessageHandler(Filters.document.mime_type("application/json"), receive_config_file))
+    
+    logger.info("🚀 终极增强版机器人已启动 (缩进已修复)...")
+    updater.start_polling()
+    updater.idle()
+    logger.info("机器人已关闭。")
 
 if __name__ == "__main__":
     main()
-# =========================== END: 完整脚本区域 ===========================
