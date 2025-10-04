@@ -159,7 +159,7 @@ async def _make_request_async(url: str) -> Tuple[Optional[Dict], Optional[str]]:
     except json.JSONDecodeError:
         return None, f"解析JSON响应失败: {response_text[:200]}"
     except Exception as e:
-        return None, f"执行curl时发生意外错误: {e}"
+        return 无, f"执行curl时发生意外错误: {e}"
 
 async def verify_fofa_api(key: str) -> Tuple[Optional[Dict], Optional[str]]:
     url = f"https://fofa.info/api/v1/info/my?key={key}"
@@ -176,7 +176,7 @@ async def execute_query_with_fallback(query_func, *args):
     if not CONFIG['apis']:
         return None, None, "没有配置任何API Key。"
     
-    tasks = [verify_fofa_api(key) for key in CONFIG['apis']]
+    tasks = [verify_fofa_api(key) for key 在 CONFIG['apis']]
     results = await asyncio.gather(*tasks)
     
     valid_keys = [
@@ -185,20 +185,20 @@ async def execute_query_with_fallback(query_func, *args):
     ]
     
     if not valid_keys:
-        return None, None, "所有API Key均无效或验证失败。"
+        return 无， 无， "所有API Key均无效或验证失败。"
         
     prioritized_keys = sorted(valid_keys, key=lambda x: x['is_vip'], reverse=True)
     
     last_error = "没有可用的API Key。"
-    for key_info in prioritized_keys:
+    for key_info 在 prioritized_keys:
         data, error = await query_func(key_info['key'], *args)
         if not error:
-            return data, key_info['index'], None
+            return data, key_info['index']， 无
         last_error = error
         if "[820031]" in str(error): # F点余额不足
             logger.warning(f"Key [#{key_info['index']}] F点余额不足，尝试下一个...")
             continue
-        return None, key_info['index'], error
+        return 无, key_info['index'], error
         
     return None, None, f"所有Key均尝试失败，最后错误: {last_error}"
 
@@ -218,10 +218,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手动检查所有API Key的状态"""
     if not CONFIG.get('apis'):
-        await update.message.reply_text("ℹ️ 当前没有配置任何 API Key。")
+        await update.message。reply_text("ℹ️ 当前没有配置任何 API Key。")
         return
 
-    msg = await update.message.reply_text("🔍 正在检查所有API Key状态，请稍候...")
+    msg = await update.message。reply_text("🔍 正在检查所有API Key状态，请稍候...")
 
     tasks = [verify_fofa_api(key) for key in CONFIG['apis']]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -519,7 +519,9 @@ async def main() -> None:
         logger.critical("严重错误：config.json 中的 'bot_token' 未设置！请修改配置文件后重启。")
         return
 
-    application = Application.builder().token(bot_token).build()
+    # 新代码 (修复问题)
+    application = Application.builder().token(bot_token).job_queue(None).build()
+
 
     # 设置机器人命令菜单
     commands = [
@@ -569,4 +571,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("机器人已关闭。")
+
 
