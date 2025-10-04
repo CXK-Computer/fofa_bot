@@ -1,13 +1,9 @@
 #
-# fofa_final_complete.py (最终完整版 for python-telegram-bot v13.x)
+# fofa_final_complete_v2.py (最终完整版 for python-telegram-bot v13.x)
 #
-# 功能集:
-# - /kkfofa: FOFA 资产搜索, 支持预设菜单、高级缓存、增量更新、深度追溯。
-# - /host: 获取单个主机的聚合信息，支持精简和详细两种模式。
-# - /stats: 获取 FOFA 查询语法的全局聚合统计信息。
-# - /settings: 图形化管理菜单 (API Key, 代理, 预设)。
-# - 工作流: 下载任务完成后，提供一键式【存活检测】和【子网扫描(/24)】。
-# - 修复: shutdown命令, 预设按钮, API状态显示等已知问题。
+# 修复: main() 函数中的致命 IndentationError，确保脚本可以正常启动。
+# 修复: API Key 状态显示、/stats API、shutdown 命令、预设按钮等所有已知问题。
+# 功能: /kkfofa, /host, /stats, /settings, 下载后一键扫描工作流等全部功能。
 #
 import os
 import json
@@ -379,6 +375,25 @@ def run_incremental_update_query(context: CallbackContext):
     cache_data = {'file_id': sent_message.document.file_id, 'file_name': output_filename, 'result_count': len(combined_results)}
     add_or_update_query(base_query, cache_data); os.remove(old_file_path); os.remove(output_filename)
     msg.delete(); bot.send_message(chat_id, f"✅ 增量更新完成！"); offer_post_download_actions(bot, chat_id, base_query)
+
+def start_command(update: Update, context: CallbackContext):
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人！请使用 /help 查看命令手册。')
+    if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
+def help_command(update: Update, context: CallbackContext):
+    help_text = ( "📖 *Fofa 机器人指令手册*\n\n"
+                  "*🔍 资产查询*\n`/kkfofa [key] <query>` - FOFA搜索\n_不带参数则显示预设菜单_\n\n"
+                  "*📦 主机聚合*\n`/host <ip|domain> [detail]`\n_获取单个主机的聚合信息_\n\n"
+                  "*📊 聚合统计*\n`/stats <query>` - 获取全局聚合统计\n\n"
+                  "*⚙️ 管理与设置*\n`/settings` - 进入交互式设置菜单\n\n"
+                  "*💾 高级功能*\n"
+                  "`/backup` / `/restore` - 备份/恢复\n"
+                  "`/history` - 查询历史\n"
+                  "`/import` - 导入旧结果\n\n"
+                  "*💻 系统管理*\n"
+                  "`/getlog` - 获取日志\n"
+                  "`/shutdown` - 安全关闭机器人\n\n"
+                  "*🛑 任务控制*\n`/stop` - 紧急停止下载任务\n`/cancel` - 取消当前操作" )
+    update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 def start_new_search(update: Update, context: CallbackContext, message_to_edit=None):
     query_text = context.user_data['query']; key_index = context.user_data.get('key_index'); add_or_update_query(query_text)
     if message_to_edit: msg = message_to_edit; msg.edit_text("🔄 正在执行全新查询...")
@@ -396,14 +411,22 @@ def start_new_search(update: Update, context: CallbackContext, message_to_edit=N
         keyboard = [[InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
         msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_KKFOFA_MODE
 def kkfofa_entry(update: Update, context: CallbackContext):
+    # This function is now the main entry point for the conversation
     if update.callback_query:
-        # Came from a preset button
-        run_preset_callback(update, context)
-        return
+        # Came from a preset button, needs to transition into the state machine
+        query = update.callback_query
+        try:
+            preset_index = int(query.data.replace("run_preset_", ""))
+            preset = CONFIG["presets"][preset_index]
+            context.user_data.update({'query': preset['query'], 'key_index': None, 'chat_id': update.effective_chat.id})
+            return start_new_search(update, context, message_to_edit=query.message)
+        except (ValueError, IndexError):
+            query.edit_message_text("❌ 预设查询失败。")
+            return ConversationHandler.END
     if not context.args:
         presets = CONFIG.get("presets", []);
-        if not presets: update.message.reply_text("欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。"); return
-        keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"run_preset_{i}")] for i, p in enumerate(presets)]; update.message.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard)); return
+        if not presets: update.message.reply_text("欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。"); return ConversationHandler.END
+        keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"run_preset_{i}")] for i, p in enumerate(presets)]; update.message.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard)); return ConversationHandler.END # End since it's just displaying a menu
     key_index, query_text = None, " ".join(context.args)
     if context.args[0].isdigit():
         try:
@@ -420,12 +443,6 @@ def kkfofa_entry(update: Update, context: CallbackContext):
         else: message_text += "请选择操作："; keyboard.append([InlineKeyboardButton("🔄 增量更新", callback_data='cache_incremental')]); keyboard.append([InlineKeyboardButton("⬇️ 下载缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
         keyboard.append([InlineKeyboardButton("❌ 取消", callback_data='cache_cancel')]); update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN); return STATE_CACHE_CHOICE
     return start_new_search(update, context)
-def run_preset_callback(update: Update, context: CallbackContext):
-    query = update.callback_query; query.answer()
-    try:
-        preset_index = int(query.data.replace("run_preset_", "")); preset = CONFIG["presets"][preset_index]; context.user_data.update({'query': preset['query'], 'key_index': None, 'chat_id': update.effective_chat.id})
-        return start_new_search(update, context, message_to_edit=query.message)
-    except (ValueError, IndexError): query.edit_message_text("❌ 预设查询失败。"); return ConversationHandler.END
 def cache_choice_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); choice = query.data.split('_')[1]
     if choice == 'download':
@@ -569,28 +586,60 @@ def cancel(update: Update, context: CallbackContext):
 
 def main() -> None:
     bot_token = CONFIG.get("bot_token")
-    if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE": logger.critical("严重错误：config.json 中的 'bot_token' 未设置！");
-        if not os.path.exists(CONFIG_FILE): save_config(); return
-    updater = Updater(token=bot_token, use_context=True); dispatcher = updater.dispatcher
-    commands = [ BotCommand("start", "🚀 启动与帮助"), BotCommand("help", "❓ 命令手册"), BotCommand("kkfofa", "🔍 资产搜索/预设"), BotCommand("host", "📦 主机聚合信息"), BotCommand("stats", "📊 全局聚合统计"), BotCommand("settings", "⚙️ 设置菜单"), BotCommand("history", "🕰️ 查询历史"), BotCommand("import", "🖇️ 导入旧缓存"), BotCommand("backup", "📤 备份配置"), BotCommand("restore", "📥 恢复配置"), BotCommand("getlog", "📄 获取日志"), BotCommand("shutdown", "🔌 关闭机器人"), BotCommand("stop", "🛑 停止任务"), BotCommand("cancel", "❌ 取消操作") ]
-    try: updater.bot.set_my_commands(commands)
-    except Exception as e: logger.warning(f"设置机器人命令失败: {e}")
+    if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE":
+        logger.critical("严重错误：config.json 中的 'bot_token' 未设置！")
+        if not os.path.exists(CONFIG_FILE):
+            save_config()
+        return
+
+    updater = Updater(token=bot_token, use_context=True)
+    dispatcher = updater.dispatcher
+    commands = [
+        BotCommand("start", "🚀 启动与帮助"), BotCommand("help", "❓ 命令手册"),
+        BotCommand("kkfofa", "🔍 资产搜索/预设"), BotCommand("host", "📦 主机聚合信息"),
+        BotCommand("stats", "📊 全局聚合统计"), BotCommand("settings", "⚙️ 设置菜单"),
+        BotCommand("history", "🕰️ 查询历史"), BotCommand("import", "🖇️ 导入旧缓存"),
+        BotCommand("backup", "📤 备份配置"), BotCommand("restore", "📥 恢复配置"),
+        BotCommand("getlog", "📄 获取日志"), BotCommand("shutdown", "🔌 关闭机器人"),
+        BotCommand("stop", "🛑 停止任务"), BotCommand("cancel", "❌ 取消操作")
+    ]
+    try:
+        updater.bot.set_my_commands(commands)
+    except Exception as e:
+        logger.warning(f"设置机器人命令失败: {e}")
+
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
         states={ STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_callback_handler, pattern=r"^settings_")], STATE_SETTINGS_ACTION: [CallbackQueryHandler(settings_action_handler, pattern=r"^action_")], STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)], STATE_GET_PROXY: [MessageHandler(Filters.text & ~Filters.command, get_proxy)], STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)], STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")], STATE_GET_PRESET_NAME: [MessageHandler(Filters.text & ~Filters.command, get_preset_name)], STATE_GET_PRESET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_preset_query)], STATE_REMOVE_PRESET: [MessageHandler(Filters.text & ~Filters.command, remove_preset)], }, fallbacks=[CommandHandler("cancel", cancel)]
     )
     kkfofa_conv = ConversationHandler(
-        entry_points=[CommandHandler("kkfofa", kkfofa_entry), CallbackQueryHandler(run_preset_callback, pattern=r"^run_preset_")],
+        entry_points=[
+            CommandHandler("kkfofa", kkfofa_entry),
+            CallbackQueryHandler(kkfofa_entry, pattern=r"^run_preset_")
+        ],
         states={ STATE_CACHE_CHOICE: [CallbackQueryHandler(cache_choice_callback, pattern=r"^cache_")], STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")], }, fallbacks=[CommandHandler("cancel", cancel)]
     )
     import_conv = ConversationHandler(entry_points=[CommandHandler("import", import_command)], states={STATE_GET_IMPORT_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_import_query)]}, fallbacks=[CommandHandler("cancel", cancel)])
     stats_conv = ConversationHandler(entry_points=[CommandHandler("stats", stats_command)], states={STATE_GET_STATS_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]}, fallbacks=[CommandHandler("cancel", cancel)])
-    dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("restore", restore_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command))
+    
+    dispatcher.add_handler(CommandHandler("start", start_command))
+    dispatcher.add_handler(CommandHandler("help", help_command))
+    dispatcher.add_handler(CommandHandler("host", host_command))
+    dispatcher.add_handler(CommandHandler("stop", stop_all_tasks))
+    dispatcher.add_handler(CommandHandler("backup", backup_config_command))
+    dispatcher.add_handler(CommandHandler("restore", restore_config_command))
+    dispatcher.add_handler(CommandHandler("history", history_command))
+    dispatcher.add_handler(CommandHandler("getlog", get_log_command))
+    dispatcher.add_handler(CommandHandler("shutdown", shutdown_command))
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv)
     dispatcher.add_handler(MessageHandler(Filters.document.mime_type("application/json"), receive_config_file))
     dispatcher.add_handler(CallbackQueryHandler(liveness_check_callback, pattern=r"^liveness_"))
     dispatcher.add_handler(CallbackQueryHandler(subnet_scan_callback, pattern=r"^subnet_"))
-    logger.info("🚀 终极版机器人已启动 (API状态已修复)..."); updater.start_polling(); updater.idle(); logger.info("机器人已关闭。")
+    
+    logger.info("🚀 终极版机器人已启动 (API状态已修复)...")
+    updater.start_polling()
+    updater.idle()
+    logger.info("机器人已关闭。")
 
 if __name__ == "__main__":
     main()
