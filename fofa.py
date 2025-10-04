@@ -22,8 +22,6 @@ from telegram.ext import (
     JobQueue,
 )
 import pytz # 保留 pytz 用于创建时区对象
-from typing import Optional
-
 
 # --- 全局变量和常量 (无变化) ---
 CONFIG_FILE = 'config.json'
@@ -160,7 +158,7 @@ def user_access_check(func):
 # ...
 # 粘贴到这里的所有函数都和上一个版本完全一样
 # ...
-async def get_available_api_key(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+async def get_available_api_key(context: ContextTypes.DEFAULT_TYPE) -> str | None:
     """轮询获取一个可用的API Key"""
     if not CONFIG['apis']:
         return None
@@ -746,26 +744,20 @@ async def placeholder_menu_callback(update: Update, context: ContextTypes.DEFAUL
 # --- 主程序 (这是正确的版本) ---
 async def main() -> None:
     if not CONFIG.get('super_admin'):
-        logger.critical("严重错误：config.json 中的 'super_admin' 未设置！...")
+        logger.critical("严重错误：config.json 中的 'super_admin' 未设置！机器人无法确定权限，即将退出。")
         return
 
-    # 1. 创建一个 pytz 时区对象
-    shanghai_tz = pytz.timezone('Asia/Shanghai')
-
-    # 2. 创建一个 JobQueue 实例
-    job_queue = JobQueue()
-
-    # 3. 在它被使用之前，就为它的调度器设置好时区
-    job_queue.scheduler.timezone = shanghai_tz
-
-    # 4. 在构建 Application 时，把我们配置好的 job_queue 传进去
+    # 1. 首先，只构建 Application 对象。它会自己创建一个默认的 JobQueue。
     application = (
         Application.builder()
-        .token("8325002891:AAHzYRlWn2Tq_lMyzbfBbkhPC-vX8LqS6kw") # 这里是你的Token
-        .job_queue(job_queue)  # <--- 关键改动在这里
+        .token("8325002891:AAHzYRlWn2Tq_lMyzbfBbkhPC-vX8LqS6kw") # 请替换为你的Token
         .build()
     )
 
+    # 2. 然后，在 application 已经创建好的 job_queue 的 scheduler 上设置时区。
+    #    这是唯一正确且不会引起冲突的方式。
+    if application.job_queue:
+        application.job_queue.scheduler.timezone = pytz.timezone('Asia/Shanghai')
     # --- 会话处理器 (无变化) ---
     # PTBUserWarning 说明:
     # per_message=False 是正确的选择。这个警告只是提醒你，如果设置为False，
