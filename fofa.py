@@ -10,7 +10,10 @@ import re
 import asyncio
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode
+# 正确的代码
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.constants import ParseMode
+
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -512,3 +515,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
