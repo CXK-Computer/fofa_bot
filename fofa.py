@@ -14,11 +14,14 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    JobQueue,
     ConversationHandler,
     MessageHandler,
     CallbackQueryHandler,
     filters,
 )
+import pytz
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- 全局变量和常量 ---
 CONFIG_FILE = 'config.json'
@@ -445,8 +448,8 @@ async def show_proxy_menu(update, context): await update.callback_query.edit_mes
 async def show_access_control_menu(update, context): await update.callback_query.edit_message_text("访问控制功能占位符")
 async def show_mode_menu(update, context): await update.callback_query.edit_message_text("模式切换功能占位符")
 async def backup_config(update, context): 
-    await update.callback_query.answer("正在发送备份...")
-    await update.effective_message.reply_document(open(CONFIG_FILE, 'rb'), caption="这是当前的配置文件备份。")
+    await update.callback_query。answer("正在发送备份...")
+    await update.effective_message。reply_document(open(CONFIG_FILE, 'rb'), caption="这是当前的配置文件备份。")
 
 async def settings_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -469,7 +472,7 @@ async def settings_callback_handler(update: Update, context: ContextTypes.DEFAUL
 async def preset_management_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action = query.data.split('_', 1)[1]
+    action = query.data。split('_'， 1)[1]
 
     if action == 'back_settings':
         await settings_command(update, context)
@@ -481,7 +484,20 @@ async def preset_management_callback_handler(update: Update, context: ContextTyp
 
 # --- 主程序 ---
 async def main() -> None:
-    application = Application.builder().token("YOUR_TELEGRAM_BOT_TOKEN").build()
+    # 1. 创建一个 pytz 时区对象
+    timezone = pytz.timezone('Asia/Shanghai')
+    
+    # 2. 创建一个 JobQueue，并为它配置一个带有正确时区的调度器
+    job_queue = JobQueue()
+    job_queue.scheduler = AsyncIOScheduler(timezone=timezone)
+
+    # 3. 在构建 Application 时，使用我们手动创建的 job_queue
+    application = (
+        Application.builder()
+        .token("YOUR_TELEGRAM_BOT_TOKEN")
+        .job_queue(job_queue)
+        .build()
+    )
 
     # --- 会话处理器 ---
     submit_preset_conv = ConversationHandler(
