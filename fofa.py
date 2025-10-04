@@ -478,9 +478,15 @@ def kkfofa_command(update: Update, context: CallbackContext):
         keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"run_preset_{i}")] for i, p in enumerate(presets)]
         update.message.reply_text("👇 请选择一个预设查询，或直接输入查询语法:", reply_markup=InlineKeyboardMarkup(keyboard)); return ConversationHandler.END
     key_index, query_text = None, " ".join(context.args)
-    if context.args[0].isdigit():
-        try: num = int(context.args[0]);
-            if 1 <= num <= len(CONFIG['apis']): key_index = num; query_text = " ".join(context.args[1:])
+# 这是修正后的、正确的代码
+if context.args[0].isdigit():
+    try:
+        num = int(context.args[0])
+        if 1 <= num <= len(CONFIG['apis']):
+            key_index = num
+            query_text = " ".join(context.args[1:])
+    except ValueError:
+        pass # 如果转换整数失败，则忽略，当作普通查询语句
         except ValueError: pass
     context.user_data.update({'query': query_text, 'key_index': key_index, 'chat_id': update.effective_chat.id})
     cached_item = find_cached_query(query_text)
@@ -754,7 +760,7 @@ def main() -> None:
     if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE": logger.critical("严重错误：config.json 中的 'bot_token' 未设置！请修改配置文件。");
         if not os.path.exists(CONFIG_FILE): save_config(); return
     updater = Updater(token=bot_token, use_context=True); dispatcher = updater.dispatcher
-    commands = [ BotCommand("start", "🚀 启动机器人与帮助"), BotCommand("help", "❓ 获取命令手册"), BotCommand("kkfofa", "🔍 资产搜索 (或显示预设)"), BotCommand("stats", "📊 全球资产统计"), BotCommand("getscanner", "🛠️ 获取扫描工具"), BotCommand("settings", "⚙️ (管理员) 设置菜单"), BotCommand("history", "🕰️ (管理员) 查询历史"), BotCommand("import", "🖇️ (管理员) 导入旧缓存"), BotCommand("backup", "📤 (管理员) 备份配置"), BotCommand("restore", "📥 (管理员) 恢复配置"), BotCommand("getlog", "📄 (管理员) 获取日志"), BotCommand("shutdown", "🔌 (管理员) 关闭机器人"), BotCommand("stop", "🛑 (管理员) 停止任务")， BotCommand("cancel", "❌ 取消当前操作") ]
+    commands = [ BotCommand("start", "🚀 启动机器人与帮助"), BotCommand("help", "❓ 获取命令手册"), BotCommand("kkfofa", "🔍 资产搜索 (或显示预设)"), BotCommand("stats", "📊 全球资产统计"), BotCommand("getscanner", "🛠️ 获取扫描工具"), BotCommand("settings", "⚙️ (管理员) 设置菜单"), BotCommand("history", "🕰️ (管理员) 查询历史"), BotCommand("import", "🖇️ (管理员) 导入旧缓存"), BotCommand("backup", "📤 (管理员) 备份配置"), BotCommand("restore", "📥 (管理员) 恢复配置"), BotCommand("getlog", "📄 (管理员) 获取日志"), BotCommand("shutdown", "🔌 (管理员) 关闭机器人"), BotCommand("stop", "🛑 (管理员) 停止任务"), BotCommand("cancel", "❌ 取消当前操作") ]
     try: updater.bot.set_my_commands(commands)
     except Exception as e: logger.warning(f"设置机器人命令失败: {e}")
     settings_conv = ConversationHandler(
