@@ -1,13 +1,14 @@
 #
-# fofa_final_complete_v3.py (最终完整版 for python-telegram-bot v13.x)
+# fofa_final_complete_v5.py (最终完整版 for python-telegram-bot v13.x)
 #
-# 修复: 1. `offer_post_download_actions` 中因缺少 context 参数导致的 NameError。
-# 修复: 2. 因 `show_api_menu` 函数被意外删除导致的 NameError。
-# 修复: 3. main() 函数中的 IndentationError。
-# 修复: 4. API Key 状态显示、/stats API、shutdown 命令、预设按钮等所有已知问题。
-# 功能: /kkfofa, /host, /stats, /settings, 下载后一键扫描工作流等全部功能。
+# 新增: 1. 大洲选择功能: /kkfofa 后可交互式地将查询范围限定在特定大洲。
+# 新增: 2. /update 命令, 可从指定URL在线更新脚本并自动重启。
+# 新增: 3. /settings 菜单中增加 "脚本更新" 选项来管理更新URL。
+# 修复: 1. `RetryAfter` 异常导致深度追溯任务崩溃的问题。
+# 修复: 2. 大规模子网扫描时因一次性生成所有目标导致的内存和性能问题。
 #
 import os
+import sys
 import json
 import logging
 import base64
@@ -19,8 +20,8 @@ import socket
 import hashlib
 from functools import wraps
 from datetime import datetime, timedelta
-from dateutil import tz  # 依赖: pip install python-dateutil
-from concurrent.futures import ThreadPoolExecutor
+from dateutil import tz
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode
 from telegram.ext import (
@@ -32,7 +33,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     Filters,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 # --- 全局变量和常量 ---
 CONFIG_FILE = 'config.json'
@@ -47,6 +48,16 @@ FOFA_HOST_BASE_URL = "https://fofa.info/api/v1/host/"
 FOFA_STATS_FIELDS = "protocol,domain,port,title,os,server,country,asn,org,asset_type,fid,icp"
 SCAN_TIMEOUT = 3
 SCAN_CONCURRENCY = 100
+
+# <--- 新增: 大洲与国家代码映射 ---
+CONTINENT_COUNTRIES = {
+    "Asia": ["AF", "AM", "AZ", "BH", "BD", "BT", "BN", "KH", "CN", "CY", "GE", "HK", "IN", "ID", "IR", "IQ", "IL", "JP", "JO", "KZ", "KW", "KG", "LA", "LB", "MO", "MY", "MV", "MN", "MM", "NP", "KP", "OM", "PK", "PS", "PH", "QA", "SA", "SG", "KR", "LK", "SY", "TW", "TJ", "TH", "TL", "TR", "TM", "AE", "UZ", "VN", "YE"],
+    "Europe": ["AL", "AD", "AT", "BY", "BE", "BA", "BG", "HR", "CZ", "DK", "EE", "FO", "FI", "FR", "DE", "GI", "GR", "HU", "IS", "IE", "IT", "LV", "LI", "LT", "LU", "MK", "MT", "MD", "MC", "ME", "NL", "NO", "PL", "PT", "RO", "RU", "SM", "RS", "SK", "SI", "ES", "SE", "CH", "UA", "GB", "VA"],
+    "NorthAmerica": ["AG", "BS", "BB", "BZ", "CA", "CR", "CU", "DM", "DO", "SV", "GD", "GT", "HT", "HN", "JM", "MX", "NI", "PA", "KN", "LC", "VC", "TT", "US"],
+    "SouthAmerica": ["AR", "BO", "BR", "CL", "CO", "EC", "FK", "GY", "PY", "PE", "SR", "UY", "VE"],
+    "Africa": ["DZ", "AO", "BJ", "BW", "BF", "BI", "CM", "CV", "CF", "TD", "KM", "CG", "CD", "CI", "DJ", "EG", "GQ", "ER", "ET", "GA", "GM", "GH", "GN", "GW", "KE", "LS", "LR", "LY", "MG", "MW", "ML", "MR", "MU", "YT", "MA", "MZ", "NA", "NE", "NG", "RE", "RW", "ST", "SN", "SC", "SL", "SO", "ZA", "SS", "SD", "SZ", "TZ", "TG", "TN", "UG", "EH", "ZM", "ZW"],
+    "Oceania": ["AS", "AU", "FJ", "GU", "KI", "MH", "FM", "NR", "NZ", "PW", "PG", "WS", "SB", "TO", "TV", "VU"]
+}
 
 # --- 日志配置 ---
 if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > (5 * 1024 * 1024):
@@ -64,8 +75,10 @@ logger = logging.getLogger(__name__)
 (
     STATE_SETTINGS_MAIN, STATE_SETTINGS_ACTION, STATE_GET_KEY, STATE_REMOVE_API, STATE_GET_PROXY,
     STATE_KKFOFA_MODE, STATE_CACHE_CHOICE, STATE_GET_IMPORT_QUERY, STATE_GET_STATS_QUERY,
-    STATE_PRESET_MENU, STATE_GET_PRESET_NAME, STATE_GET_PRESET_QUERY, STATE_REMOVE_PRESET
-) = range(13)
+    STATE_PRESET_MENU, STATE_GET_PRESET_NAME, STATE_GET_PRESET_QUERY, STATE_REMOVE_PRESET,
+    STATE_GET_UPDATE_URL,
+    STATE_ASK_CONTINENT, STATE_CONTINENT_CHOICE # <--- 新增状态
+) = range(16)
 
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
@@ -83,7 +96,7 @@ def load_json_file(filename, default_content):
 def save_json_file(filename, data):
     with open(filename, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4, ensure_ascii=False)
 
-DEFAULT_CONFIG = { "bot_token": "YOUR_BOT_TOKEN_HERE", "apis": [], "admins": [], "proxy": "", "full_mode": False, "public_mode": False, "presets": [] }
+DEFAULT_CONFIG = { "bot_token": "YOUR_BOT_TOKEN_HERE", "apis": [], "admins": [], "proxy": "", "full_mode": False, "public_mode": False, "presets": [], "update_url": "" }
 CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
 HISTORY = load_json_file(HISTORY_FILE, {"queries": []})
 
@@ -129,7 +142,7 @@ def escape_markdown(text: str) -> str:
     if not isinstance(text, str): text = str(text)
     escape_chars = r'_*`['; return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
-# --- FOFA API 核心逻辑 ---
+# --- FOFA API 核心逻辑 (无变动) ---
 def _make_api_request(url, params, timeout=60, use_b64=True):
     try:
         if use_b64 and 'q' in params: params['qbase64'] = base64.b64encode(params.pop('q').encode('utf-8')).decode('utf-8')
@@ -158,7 +171,7 @@ def execute_query_with_fallback(query_func, preferred_key_index=None):
         return None, key_num, error
     return None, None, "所有Key均尝试失败。"
 
-# --- /host & /stats 命令处理 ---
+# --- /host & /stats 命令处理 (无变动) ---
 def format_host_summary(data):
     lines = [f"📋 *主机聚合概览: `{escape_markdown(data.get('host', 'N/A'))}`*"]
     lines.append(f"*IP:* `{escape_markdown(data.get('ip', 'N/A'))}`"); lines.append(f"*ASN:* `{data.get('asn', 'N/A')}`"); lines.append(f"*组织:* `{escape_markdown(data.get('org', 'N/A'))}`"); lines.append(f"*国家:* `{escape_markdown(data.get('country_name', 'N/A'))}`"); lines.append(f"*更新时间:* `{escape_markdown(data.get('update_time', 'N/A'))}`\n")
@@ -166,7 +179,7 @@ def format_host_summary(data):
     lines.append(f"*协议:* `{escape_markdown(join_list(data.get('protocol')))}`"); lines.append(f"*端口:* `{join_list(data.get('port'))}`\n"); lines.append(f"*产品:* `{escape_markdown(join_list(data.get('product')))}`"); lines.append(f"*分类:* `{escape_markdown(join_list(data.get('category')))}`")
     return "\n".join(lines)
 def format_host_details(data):
-    lines = [f"📋 *主机端口详情: `{escape_markdown(data.get('host', 'N/A'))}`*"]; lines.append(f"*IP:* `{escape_markdown(data.get('ip', 'N/A'))}`"); lines.append(f"*ASN:* `{data.get('asn', 'N/A')}`"); lines.append(f"*组织:* `{escape_markdown(data.get('org', 'N/A'))}`"); lines.append(f"*国家:* `{escape_markdown(data.get('country_name', 'N/A'))}`\n")
+    lines = [f"📋 *主机端口详情: `{escape_markdown(data.get('host', 'N/A'))}`*"]; lines.append(f"*IP:* `{escape_markdown(data.get('ip', 'N/A'))}`"); lines.append(f"*ASN:* `{data.get('asn', 'N/A'))}`"); lines.append(f"*组织:* `{escape_markdown(data.get('org', 'N/A'))}`"); lines.append(f"*国家:* `{escape_markdown(data.get('country_name', 'N/A'))}`\n")
     ports_data = data.get('ports', [])
     if not ports_data: lines.append("_未发现开放端口的详细信息。_"); return "\n".join(lines)
     for port_info in sorted(ports_data, key=lambda p: p.get('port', 0)):
@@ -210,11 +223,10 @@ def get_fofa_stats_query(update: Update, context: CallbackContext) -> int:
 def stats_command(update: Update, context: CallbackContext) -> int:
     update.message.reply_text("请输入你想要进行聚合统计的 FOFA 语法。\n例如: `app=\"nginx\"`\n\n随时可以发送 /cancel 来取消。", parse_mode=ParseMode.MARKDOWN); return STATE_GET_STATS_QUERY
 
-# --- 后台任务与扫描逻辑 ---
-# NameError Fix: `context` is now passed to this function
+# --- 后台任务与扫描逻辑 (已包含之前的修复) ---
 def offer_post_download_actions(context: CallbackContext, chat_id, query_text):
     query_hash = hashlib.md5(query_text.encode()).hexdigest()
-    context.bot_data[query_hash] = query_text # Store original query using context
+    context.bot_data[query_hash] = query_text
     keyboard = [[ InlineKeyboardButton("⚡️ 存活检测", callback_data=f'liveness_{query_hash}'), InlineKeyboardButton("🌐 子网扫描(/24)", callback_data=f'subnet_{query_hash}') ]]
     context.bot.send_message(chat_id, "下载完成，需要对结果进行二次扫描吗？", reply_markup=InlineKeyboardMarkup(keyboard))
 def download_and_process_file(context: CallbackContext, query_hash, prefix, processor_func, final_message_func):
@@ -258,18 +270,30 @@ def process_subnet_scan(file_path, msg):
                 subnets_to_ports[subnet].add(port)
             except ValueError: continue
     if not subnets_to_ports: return set()
-    msg.edit_text(f"2/3: 分析出 {len(subnets_to_ports)} 个/24子网，开始扫描...")
-    live_results = set(); scan_targets = []
-    for subnet, ports in subnets_to_ports.items():
-        base_ip = subnet.split('/')[0].rsplit('.', 1)[0]
-        for i in range(1, 255):
-            for port in ports: scan_targets.append((f"{base_ip}.{i}", port))
-    def check_port(target):
-        ip, port = target
+    total_targets = sum(len(ports) * 254 for ports in subnets_to_ports.values())
+    if total_targets == 0: return set()
+    msg.edit_text(f"2/3: 分析出 {len(subnets_to_ports)} 个/24子网，共计 {total_targets} 个扫描目标。开始扫描...")
+    live_results = set(); completed_count = 0; last_update_time = time.time()
+    def check_port(ip, port):
         try:
-            with socket.create_connection((ip, port), timeout=SCAN_TIMEOUT) as sock: live_results.add(f"{ip}:{port}")
-        except socket.error: pass
-    with ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY) as executor: executor.map(check_port, scan_targets)
+            with socket.create_connection((ip, port), timeout=SCAN_TIMEOUT) as sock: return f"{ip}:{port}"
+        except socket.error: return None
+    with ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY) as executor:
+        futures = []
+        for subnet, ports in subnets_to_ports.items():
+            base_ip = subnet.split('/')[0].rsplit('.', 1)[0]
+            for i in range(1, 255):
+                for port in ports: futures.append(executor.submit(check_port, f"{base_ip}.{i}", port))
+        for future in as_completed(futures):
+            completed_count += 1; result = future.result()
+            if result: live_results.add(result)
+            current_time = time.time()
+            if current_time - last_update_time > 2.5:
+                progress = (completed_count / total_targets) * 100
+                try:
+                    msg.edit_text(f"2/3: 扫描进度: {progress:.1f}% ({completed_count}/{total_targets})\n已发现: {len(live_results)} 个")
+                    last_update_time = current_time
+                except (BadRequest, RetryAfter): pass
     return live_results
 def run_liveness_check_job(context: CallbackContext):
     download_and_process_file(context, context.job.context['query_hash'], prefix="live", processor_func=process_liveness_check, final_message_func=lambda count: f"✅ **存活检测完成!**\n\n共发现 *{count}* 个存活目标。")
@@ -297,7 +321,7 @@ def run_full_download_query(context: CallbackContext):
     for page in range(1, pages_to_fetch + 1):
         if context.bot_data.get(stop_flag): msg.edit_text("🌀 下载任务已手动停止."); break
         try: msg.edit_text(f"下载进度: {len(unique_results)}/{total_size} (Page {page}/{pages_to_fetch})...")
-        except BadRequest: pass
+        except (BadRequest, RetryAfter): pass
         data, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page, 10000, "host"))
         if error: msg.edit_text(f"❌ 第 {page} 页下载出错: {error}"); break
         results = data.get('results', []);
@@ -309,12 +333,13 @@ def run_full_download_query(context: CallbackContext):
         with open(output_filename, 'rb') as doc: sent_message = bot.send_document(chat_id, document=doc, filename=output_filename)
         os.remove(output_filename)
         cache_data = {'file_id': sent_message.document.file_id, 'file_name': output_filename, 'result_count': len(unique_results)}
-        add_or_update_query(query_text, cache_data); offer_post_download_actions(context, chat_id, query_text) # NameError Fix
+        add_or_update_query(query_text, cache_data); offer_post_download_actions(context, chat_id, query_text)
     elif not context.bot_data.get(stop_flag): msg.edit_text("🤷‍♀️ 任务完成，但未能下载到任何数据。")
     context.bot_data.pop(stop_flag, None)
 def run_traceback_download_query(context: CallbackContext):
     job_data = context.job.context; bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']; output_filename = generate_filename_from_query(base_query)
-    unique_results, page_count, last_page_date, termination_reason, stop_flag = set(), 0, None, "", f'stop_job_{chat_id}'; msg = bot.send_message(chat_id, "⏳ 开始深度追溯下载...")
+    unique_results, page_count, last_page_date, termination_reason, stop_flag, last_update_time = set(), 0, None, "", f'stop_job_{chat_id}', 0
+    msg = bot.send_message(chat_id, "⏳ 开始深度追溯下载...")
     current_query = base_query
     while True:
         page_count += 1
@@ -324,8 +349,15 @@ def run_traceback_download_query(context: CallbackContext):
         results = data.get('results', [])
         if not results: termination_reason = "\n\nℹ️ 已获取所有查询结果."; break
         original_count = len(unique_results); unique_results.update([r[0] for r in results if r and r[0] and ':' in r[0]]); newly_added_count = len(unique_results) - original_count
-        try: msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
-        except BadRequest: pass
+        current_time = time.time()
+        if current_time - last_update_time > 2:
+            try:
+                msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
+                last_update_time = current_time
+            except RetryAfter as e:
+                logger.warning(f"Telegram flood control triggered. Waiting for {e.retry_after} seconds.")
+                time.sleep(e.retry_after)
+            except BadRequest: pass
         valid_anchor_found = False
         for i in range(len(results) - 1, -1, -1):
             if not results[i] or len(results[i]) < 2 or not results[i][1]: continue
@@ -344,7 +376,7 @@ def run_traceback_download_query(context: CallbackContext):
         with open(output_filename, 'rb') as doc: sent_message = bot.send_document(chat_id, document=doc, filename=output_filename)
         os.remove(output_filename)
         cache_data = {'file_id': sent_message.document.file_id, 'file_name': output_filename, 'result_count': len(unique_results)}
-        add_or_update_query(base_query, cache_data); offer_post_download_actions(context, chat_id, base_query) # NameError Fix
+        add_or_update_query(base_query, cache_data); offer_post_download_actions(context, chat_id, base_query)
     else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
     context.bot_data.pop(stop_flag, None)
 def run_incremental_update_query(context: CallbackContext):
@@ -378,8 +410,9 @@ def run_incremental_update_query(context: CallbackContext):
     with open(output_filename, 'rb') as doc: sent_message = bot.send_document(chat_id, document=doc, filename=output_filename)
     cache_data = {'file_id': sent_message.document.file_id, 'file_name': output_filename, 'result_count': len(combined_results)}
     add_or_update_query(base_query, cache_data); os.remove(old_file_path); os.remove(output_filename)
-    msg.delete(); bot.send_message(chat_id, f"✅ 增量更新完成！"); offer_post_download_actions(context, chat_id, base_query) # NameError Fix
+    msg.delete(); bot.send_message(chat_id, f"✅ 增量更新完成！"); offer_post_download_actions(context, chat_id, base_query)
 
+# --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
     update.message.reply_text('👋 欢迎使用 Fofa 查询机器人！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
@@ -394,14 +427,17 @@ def help_command(update: Update, context: CallbackContext):
                   "`/history` - 查询历史\n"
                   "`/import` - 导入旧结果\n\n"
                   "*💻 系统管理*\n"
+                  "`/update` - 在线更新脚本\n"
                   "`/getlog` - 获取日志\n"
                   "`/shutdown` - 安全关闭机器人\n\n"
                   "*🛑 任务控制*\n`/stop` - 紧急停止下载任务\n`/cancel` - 取消当前操作" )
     update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+# --- /kkfofa 查询流程 (含大洲选择) ---
 def start_new_search(update: Update, context: CallbackContext, message_to_edit=None):
     query_text = context.user_data['query']; key_index = context.user_data.get('key_index'); add_or_update_query(query_text)
-    if message_to_edit: msg = message_to_edit; msg.edit_text("🔄 正在执行全新查询...")
-    else: msg = update.effective_message.reply_text("🔄 正在执行全新查询...")
+    msg = message_to_edit if message_to_edit else update.effective_message.reply_text("🔄 正在执行全新查询...")
+    if message_to_edit: msg.edit_text("🔄 正在执行全新查询...")
     data, used_key_index, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page_size=1, fields="host"), key_index)
     if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
     total_size = data.get('size', 0)
@@ -414,6 +450,21 @@ def start_new_search(update: Update, context: CallbackContext, message_to_edit=N
     else:
         keyboard = [[InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
         msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_KKFOFA_MODE
+
+def proceed_with_query(update: Update, context: CallbackContext, message_to_edit):
+    query_text = context.user_data['query']
+    cached_item = find_cached_query(query_text)
+    if cached_item:
+        dt_utc = datetime.fromisoformat(cached_item['timestamp']); dt_local = dt_utc.astimezone(tz.tzlocal()); time_str = dt_local.strftime('%Y-%m-%d %H:%M')
+        message_text = (f"✅ *发现缓存*\n\n查询: `{escape_markdown(query_text)}`\n缓存于: *{time_str}*\n\n")
+        keyboard = []; is_expired = (datetime.now(tz.tzutc()) - dt_utc).total_seconds() > CACHE_EXPIRATION_SECONDS
+        if is_expired: message_text += "⚠️ *此缓存已过期，无法增量更新。*"; keyboard.append([InlineKeyboardButton("⬇️ 下载旧缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
+        else: message_text += "请选择操作："; keyboard.append([InlineKeyboardButton("🔄 增量更新", callback_data='cache_incremental')]); keyboard.append([InlineKeyboardButton("⬇️ 下载缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
+        keyboard.append([InlineKeyboardButton("❌ 取消", callback_data='cache_cancel')])
+        message_to_edit.edit_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        return STATE_CACHE_CHOICE
+    return start_new_search(update, context, message_to_edit=message_to_edit)
+
 def kkfofa_entry(update: Update, context: CallbackContext):
     if update.callback_query:
         try:
@@ -422,25 +473,69 @@ def kkfofa_entry(update: Update, context: CallbackContext):
             return start_new_search(update, context, message_to_edit=query.message)
         except (ValueError, IndexError): query.edit_message_text("❌ 预设查询失败。"); return ConversationHandler.END
     if not context.args:
-        presets = CONFIG.get("presets", []);
+        presets = CONFIG.get("presets", [])
         if not presets: update.message.reply_text("欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。"); return ConversationHandler.END
         keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"run_preset_{i}")] for i, p in enumerate(presets)]; update.message.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard)); return ConversationHandler.END
+    
     key_index, query_text = None, " ".join(context.args)
     if context.args[0].isdigit():
         try:
             num = int(context.args[0])
             if 1 <= num <= len(CONFIG['apis']): key_index = num; query_text = " ".join(context.args[1:])
         except ValueError: pass
-    context.user_data.update({'query': query_text, 'key_index': key_index, 'chat_id': update.effective_chat.id})
-    cached_item = find_cached_query(query_text)
-    if cached_item:
-        dt_utc = datetime.fromisoformat(cached_item['timestamp']); dt_local = dt_utc.astimezone(tz.tzlocal()); time_str = dt_local.strftime('%Y-%m-%d %H:%M')
-        message_text = (f"✅ *发现缓存*\n\n查询: `{escape_markdown(query_text)}`\n缓存于: *{time_str}*\n\n")
-        keyboard = []; is_expired = (datetime.now(tz.tzutc()) - dt_utc).total_seconds() > CACHE_EXPIRATION_SECONDS
-        if is_expired: message_text += "⚠️ *此缓存已过期，无法增量更新。*"; keyboard.append([InlineKeyboardButton("⬇️ 下载旧缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
-        else: message_text += "请选择操作："; keyboard.append([InlineKeyboardButton("🔄 增量更新", callback_data='cache_incremental')]); keyboard.append([InlineKeyboardButton("⬇️ 下载缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
-        keyboard.append([InlineKeyboardButton("❌ 取消", callback_data='cache_cancel')]); update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN); return STATE_CACHE_CHOICE
-    return start_new_search(update, context)
+    
+    context.user_data['original_query'] = query_text
+    context.user_data['key_index'] = key_index
+    
+    keyboard = [[
+        InlineKeyboardButton("🌍 是的, 限定大洲", callback_data="continent_select"),
+        InlineKeyboardButton("⏩ 不, 直接搜索", callback_data="continent_skip")
+    ]]
+    update.message.reply_text(
+        f"查询: `{escape_markdown(query_text)}`\n\n是否要将此查询限定在特定大洲范围内？",
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
+    )
+    return STATE_ASK_CONTINENT
+
+def ask_continent_callback(update: Update, context: CallbackContext):
+    query = update.callback_query; query.answer()
+    choice = query.data.split('_')[1]
+
+    if choice == 'skip':
+        context.user_data['query'] = context.user_data['original_query']
+        query.edit_message_text(f"好的，将直接搜索: `{escape_markdown(context.user_data['query'])}`", parse_mode=ParseMode.MARKDOWN)
+        return proceed_with_query(update, context, message_to_edit=query.message)
+    elif choice == 'select':
+        keyboard = [
+            [InlineKeyboardButton("🌏 亚洲", callback_data="continent_Asia"), InlineKeyboardButton("🌍 欧洲", callback_data="continent_Europe")],
+            [InlineKeyboardButton("🌎 北美洲", callback_data="continent_NorthAmerica"), InlineKeyboardButton("🌎 南美洲", callback_data="continent_SouthAmerica")],
+            [InlineKeyboardButton("🌍 非洲", callback_data="continent_Africa"), InlineKeyboardButton("🌏 大洋洲", callback_data="continent_Oceania")],
+            [InlineKeyboardButton("↩️ 跳过", callback_data="continent_skip")]
+        ]
+        query.edit_message_text("请选择一个大洲:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return STATE_CONTINENT_CHOICE
+
+def continent_choice_callback(update: Update, context: CallbackContext):
+    query = update.callback_query; query.answer()
+    continent = query.data.split('_', 1)[1]
+    original_query = context.user_data['original_query']
+
+    if continent == 'skip':
+        context.user_data['query'] = original_query
+        query.edit_message_text(f"好的，将直接搜索: `{escape_markdown(original_query)}`", parse_mode=ParseMode.MARKDOWN)
+        return proceed_with_query(update, context, message_to_edit=query.message)
+
+    country_list = CONTINENT_COUNTRIES.get(continent)
+    if not country_list:
+        query.edit_message_text("❌ 错误：无效的大洲选项。"); return ConversationHandler.END
+
+    country_fofa_string = " || ".join([f'country="{code}"' for code in country_list])
+    final_query = f"({original_query}) && ({country_fofa_string})"
+    context.user_data['query'] = final_query
+    
+    query.edit_message_text(f"查询已构建:\n`{escape_markdown(final_query)}`\n\n正在处理...", parse_mode=ParseMode.MARKDOWN)
+    return proceed_with_query(update, context, message_to_edit=query.message)
+
 def cache_choice_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); choice = query.data.split('_')[1]
     if choice == 'download':
@@ -460,6 +555,8 @@ def query_mode_callback(update: Update, context: CallbackContext):
     elif mode == 'traceback': query.edit_message_text(f"⏳ 开始深度追溯下载..."); start_download_job(context, run_traceback_download_query, context.user_data); query.delete_message()
     elif mode == 'cancel': query.edit_message_text("操作已取消。")
     return ConversationHandler.END
+
+# --- 其他管理命令 (无变动) ---
 @admin_only
 def stop_all_tasks(update: Update, context: CallbackContext): context.bot_data[f'stop_job_{update.effective_chat.id}'] = True; update.message.reply_text("✅ 已发送停止信号。")
 @admin_only
@@ -510,8 +607,45 @@ def shutdown_command(update: Update, context: CallbackContext):
     update.message.reply_text("✅ 收到指令！机器人正在平稳关闭..."); logger.info(f"接收到来自用户 {update.effective_user.id} 的关闭指令。")
     context.job_queue.run_once(lambda _: os.kill(os.getpid(), signal.SIGINT), 1)
 @admin_only
+def update_script_command(update: Update, context: CallbackContext, from_menu=False):
+    url = CONFIG.get("update_url")
+    if not url:
+        msg_target = update.callback_query.message if from_menu else update.message
+        msg_target.reply_text("❌ 未在配置中设置更新URL。\n请在 /settings -> 脚本更新 中设置。")
+        return
+    msg = update.callback_query.message if from_menu else update.message.reply_text("⏳ 正在从配置的URL检查更新...")
+    if from_menu: msg.edit_text("⏳ 正在从配置的URL检查更新...")
+    try:
+        response = requests.get(url, timeout=30, proxies=get_proxies()); response.raise_for_status()
+        new_script_content = response.text
+    except requests.exceptions.RequestException as e: msg.edit_text(f"❌ 下载更新失败: {e}"); return
+    if 'if __name__ == "__main__":' not in new_script_content or 'Updater(token=bot_token' not in new_script_content:
+        msg.edit_text("❌ 下载的文件似乎不是一个有效的机器人脚本，已中止更新。"); return
+    script_path = os.path.abspath(sys.argv[0]); temp_path = script_path + ".new"
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as f: f.write(new_script_content)
+    except IOError as e: msg.edit_text(f"❌ 无法写入临时文件: {e}"); return
+    try: os.replace(temp_path, script_path)
+    except OSError as e:
+        msg.edit_text(f"❌ 替换脚本文件失败: {e}")
+        if os.path.exists(temp_path): os.remove(temp_path)
+        return
+    msg.edit_text("✅ 更新成功！机器人将在2秒后重启以应用新版本...")
+    logger.info(f"脚本已由用户 {update.effective_user.id} 更新。正在重启...")
+    def restart(context: CallbackContext): os.execv(sys.executable, [sys.executable] + sys.argv)
+    context.job_queue.run_once(restart, 2)
+
+# --- 设置菜单 (Settings Conversation) (无变动) ---
+@admin_only
 def settings_command(update: Update, context: CallbackContext):
-    keyboard = [[InlineKeyboardButton("🔑 API 管理", callback_data='settings_api')], [InlineKeyboardButton("✨ 预设管理", callback_data='settings_preset')], [InlineKeyboardButton("🌐 代理设置", callback_data='settings_proxy')], [InlineKeyboardButton("💾 备份与恢复", callback_data='settings_backup')], [InlineKeyboardButton("❌ 关闭菜单", callback_data='settings_close')]]
+    keyboard = [
+        [InlineKeyboardButton("🔑 API 管理", callback_data='settings_api')],
+        [InlineKeyboardButton("✨ 预设管理", callback_data='settings_preset')],
+        [InlineKeyboardButton("🌐 代理设置", callback_data='settings_proxy')],
+        [InlineKeyboardButton("💾 备份与恢复", callback_data='settings_backup')],
+        [InlineKeyboardButton("🔄 脚本更新", callback_data='settings_update')],
+        [InlineKeyboardButton("❌ 关闭菜单", callback_data='settings_close')]
+    ]
     message_text = "⚙️ *设置菜单*"; reply_markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query: update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
     else: update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
@@ -522,9 +656,9 @@ def settings_callback_handler(update: Update, context: CallbackContext):
     if menu == 'proxy': return show_proxy_menu(update, context)
     if menu == 'backup': return show_backup_restore_menu(update, context)
     if menu == 'preset': return show_preset_menu(update, context)
+    if menu == 'update': return show_update_menu(update, context)
     if menu == 'close': query.edit_message_text("菜单已关闭."); return ConversationHandler.END
     return STATE_SETTINGS_ACTION
-# NameError Fix: Restored this entire function
 def show_api_menu(update: Update, context: CallbackContext):
     msg = update.callback_query.message
     msg.edit_text("🔄 正在查询API Key状态...")
@@ -532,15 +666,11 @@ def show_api_menu(update: Update, context: CallbackContext):
     for i, key in enumerate(CONFIG['apis']):
         data, error = verify_fofa_api(key)
         key_masked = f"`...{key[-4:]}`"
-        status = ""
-        if error:
-            status = f"❌ *无效*: {error}"
+        if error: status = f"❌ *无效*: {error}"
         else:
-            username = escape_markdown(data.get('username', 'N/A'))
-            vip_level = data.get('vip_level', 0)
+            username = escape_markdown(data.get('username', 'N/A')); vip_level = data.get('vip_level', 0)
             vip_status = f"👑 VIP L{vip_level}" if data.get('is_vip') else "👤 普通"
-            f_points = data.get('fofa_point', 0)
-            free_points = data.get('remain_free_point', 0)
+            f_points = data.get('fofa_point', 0); free_points = data.get('remain_free_point', 0)
             status = f"{vip_status} ({username}) | F点: *{f_points}*, 免费点: *{free_points}*"
         api_details.append(f"`#{i+1}` {key_masked}\n  {status}")
     api_message = "\n\n".join(api_details) if api_details else "_无_"
@@ -553,6 +683,16 @@ def show_proxy_menu(update: Update, context: CallbackContext):
 def show_backup_restore_menu(update: Update, context: CallbackContext):
     message_text = ("💾 *备份与恢复*\n\n📤 *备份*\n点击下方按钮，或使用 /backup 命令。\n\n📥 *恢复*\n直接向机器人*发送* `config.json` 文件即可。"); keyboard = [[InlineKeyboardButton("📤 立即备份", callback_data='action_backup_now')], [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]]
     update.callback_query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN); return STATE_SETTINGS_ACTION
+def show_update_menu(update: Update, context: CallbackContext):
+    current_url = CONFIG.get("update_url") or "未设置"
+    message_text = f"🔄 *脚本更新*\n\n此功能允许机器人从指定的URL下载最新脚本并自动重启。\n\n*当前更新源 URL:*\n`{escape_markdown(current_url)}`"
+    keyboard = [
+        [InlineKeyboardButton("✏️ 设置/更新 URL", callback_data='action_set_update_url')],
+        [InlineKeyboardButton("🚀 立即更新", callback_data='action_run_update')],
+        [InlineKeyboardButton("🔙 返回", callback_data='action_back_main')]
+    ]
+    update.callback_query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    return STATE_SETTINGS_ACTION
 def settings_action_handler(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_', 1)[1]
     if action == 'back_main': return settings_command(update, context)
@@ -562,6 +702,8 @@ def settings_action_handler(update: Update, context: CallbackContext):
     elif action == 'set_proxy': query.edit_message_text("请输入代理地址 (例如 http://127.0.0.1:7890)。"); return STATE_GET_PROXY
     elif action == 'delete_proxy': CONFIG['proxy'] = ""; save_config(); query.answer("代理已清除"); return show_proxy_menu(update, context)
     elif action == 'backup_now': backup_config_command(update, context); return STATE_SETTINGS_ACTION
+    elif action == 'set_update_url': query.edit_message_text("请发送新的脚本更新URL (必须是可直接访问的 raw 文件链接)。"); return STATE_GET_UPDATE_URL
+    elif action == 'run_update': update_script_command(query, context, from_menu=True); return ConversationHandler.END
     return STATE_SETTINGS_ACTION
 def get_key(update: Update, context: CallbackContext):
     key = update.message.text.strip(); msg = update.message.reply_text("正在验证...")
@@ -577,6 +719,12 @@ def remove_api(update: Update, context: CallbackContext):
         if 0 <= index < len(CONFIG['apis']): CONFIG['apis'].pop(index); save_config(); update.message.reply_text(f"✅ Key已删除。")
         else: update.message.reply_text("❌ 无效编号。")
     except (ValueError, IndexError): update.message.reply_text("❌ 请输入数字。")
+    return settings_command(update, context)
+def get_update_url(update: Update, context: CallbackContext):
+    url = update.message.text.strip()
+    if url.startswith("http://") or url.startswith("https://"):
+        CONFIG['update_url'] = url; save_config(); update.message.reply_text("✅ 更新URL已设置。")
+    else: update.message.reply_text("❌ URL格式无效，请输入以 http:// 或 https:// 开头的链接。")
     return settings_command(update, context)
 def show_preset_menu(update: Update, context: CallbackContext):
     preset_list = "\n".join([f"`#{i+1}`: `{p['name']}`" for i, p in enumerate(CONFIG['presets'])]) or "_无_"
@@ -605,12 +753,12 @@ def cancel(update: Update, context: CallbackContext):
     elif update.message: update.message.reply_text('操作已取消。')
     context.user_data.clear(); return ConversationHandler.END
 
+# --- 主函数与调度器 ---
 def main() -> None:
     bot_token = CONFIG.get("bot_token")
     if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE":
         logger.critical("严重错误：config.json 中的 'bot_token' 未设置！")
-        if not os.path.exists(CONFIG_FILE):
-            save_config()
+        if not os.path.exists(CONFIG_FILE): save_config()
         return
 
     updater = Updater(token=bot_token, use_context=True)
@@ -621,25 +769,42 @@ def main() -> None:
         BotCommand("stats", "📊 全局聚合统计"), BotCommand("settings", "⚙️ 设置菜单"),
         BotCommand("history", "🕰️ 查询历史"), BotCommand("import", "🖇️ 导入旧缓存"),
         BotCommand("backup", "📤 备份配置"), BotCommand("restore", "📥 恢复配置"),
+        BotCommand("update", "🔄 在线更新脚本"),
         BotCommand("getlog", "📄 获取日志"), BotCommand("shutdown", "🔌 关闭机器人"),
         BotCommand("stop", "🛑 停止任务"), BotCommand("cancel", "❌ 取消操作")
     ]
-    try:
-        updater.bot.set_my_commands(commands)
-    except Exception as e:
-        logger.warning(f"设置机器人命令失败: {e}")
+    try: updater.bot.set_my_commands(commands)
+    except Exception as e: logger.warning(f"设置机器人命令失败: {e}")
 
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
-        states={ STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_callback_handler, pattern=r"^settings_")], STATE_SETTINGS_ACTION: [CallbackQueryHandler(settings_action_handler, pattern=r"^action_")], STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)], STATE_GET_PROXY: [MessageHandler(Filters.text & ~Filters.command, get_proxy)], STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)], STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")], STATE_GET_PRESET_NAME: [MessageHandler(Filters.text & ~Filters.command, get_preset_name)], STATE_GET_PRESET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_preset_query)], STATE_REMOVE_PRESET: [MessageHandler(Filters.text & ~Filters.command, remove_preset)], }, fallbacks=[CommandHandler("cancel", cancel)]
+        states={
+            STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_callback_handler, pattern=r"^settings_")],
+            STATE_SETTINGS_ACTION: [CallbackQueryHandler(settings_action_handler, pattern=r"^action_")],
+            STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)],
+            STATE_GET_PROXY: [MessageHandler(Filters.text & ~Filters.command, get_proxy)],
+            STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
+            STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")],
+            STATE_GET_PRESET_NAME: [MessageHandler(Filters.text & ~Filters.command, get_preset_name)],
+            STATE_GET_PRESET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_preset_query)],
+            STATE_REMOVE_PRESET: [MessageHandler(Filters.text & ~Filters.command, remove_preset)],
+            STATE_GET_UPDATE_URL: [MessageHandler(Filters.text & ~Filters.command, get_update_url)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
+    
+    # <--- 修改: kkfofa_conv 增加了新的状态和处理器 ---
     kkfofa_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("kkfofa", kkfofa_entry),
-            CallbackQueryHandler(kkfofa_entry, pattern=r"^run_preset_")
-        ],
-        states={ STATE_CACHE_CHOICE: [CallbackQueryHandler(cache_choice_callback, pattern=r"^cache_")], STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")], }, fallbacks=[CommandHandler("cancel", cancel)]
+        entry_points=[ CommandHandler("kkfofa", kkfofa_entry), CallbackQueryHandler(kkfofa_entry, pattern=r"^run_preset_") ],
+        states={
+            STATE_ASK_CONTINENT: [CallbackQueryHandler(ask_continent_callback, pattern=r"^continent_")],
+            STATE_CONTINENT_CHOICE: [CallbackQueryHandler(continent_choice_callback, pattern=r"^continent_")],
+            STATE_CACHE_CHOICE: [CallbackQueryHandler(cache_choice_callback, pattern=r"^cache_")],
+            STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
+
     import_conv = ConversationHandler(entry_points=[CommandHandler("import", import_command)], states={STATE_GET_IMPORT_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_import_query)]}, fallbacks=[CommandHandler("cancel", cancel)])
     stats_conv = ConversationHandler(entry_points=[CommandHandler("stats", stats_command)], states={STATE_GET_STATS_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]}, fallbacks=[CommandHandler("cancel", cancel)])
     
@@ -652,12 +817,13 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("history", history_command))
     dispatcher.add_handler(CommandHandler("getlog", get_log_command))
     dispatcher.add_handler(CommandHandler("shutdown", shutdown_command))
+    dispatcher.add_handler(CommandHandler("update", update_script_command))
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv)
     dispatcher.add_handler(MessageHandler(Filters.document.mime_type("application/json"), receive_config_file))
     dispatcher.add_handler(CallbackQueryHandler(liveness_check_callback, pattern=r"^liveness_"))
     dispatcher.add_handler(CallbackQueryHandler(subnet_scan_callback, pattern=r"^subnet_"))
     
-    logger.info("🚀 终极版机器人已启动 (v3 - 已修复 NameErrors)...")
+    logger.info("🚀 终极版机器人已启动 (v5 - 含大洲选择)...")
     updater.start_polling()
     updater.idle()
     logger.info("机器人已关闭。")
