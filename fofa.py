@@ -179,7 +179,7 @@ def format_host_summary(data):
     lines.append(f"*协议:* `{escape_markdown(join_list(data.get('protocol')))}`"); lines.append(f"*端口:* `{join_list(data.get('port'))}`\n"); lines.append(f"*产品:* `{escape_markdown(join_list(data.get('product')))}`"); lines.append(f"*分类:* `{escape_markdown(join_list(data.get('category')))}`")
     return "\n".join(lines)
 def format_host_details(data):
-    lines = [f"📋 *主机端口详情: `{escape_markdown(data.get('host', 'N/A'))}`*"]; lines.append(f"*IP:* `{escape_markdown(data.get('ip', 'N/A'))}`"); lines.append(f"*ASN:* `{data.get('asn', 'N/A'))}`"); lines.append(f"*组织:* `{escape_markdown(data.get('org', 'N/A'))}`"); lines.append(f"*国家:* `{escape_markdown(data.get('country_name', 'N/A'))}`\n")
+    lines = [f"📋 *主机端口详情: `{escape_markdown(data.get('host', 'N/A'))}`*"]; lines.append(f"*IP:* `{escape_markdown(data.get('ip', 'N/A'))}`"); lines.append(f"*ASN:* `{data.get('asn', 'N/A')}`"); lines.append(f"*组织:* `{escape_markdown(data.get('org', 'N/A'))}`"); lines.append(f"*国家:* `{escape_markdown(data.get('country_name', 'N/A'))}`\n")
     ports_data = data.get('ports', [])
     if not ports_data: lines.append("_未发现开放端口的详细信息。_"); return "\n".join(lines)
     for port_info in sorted(ports_data, key=lambda p: p.get('port', 0)):
@@ -830,3 +830,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
