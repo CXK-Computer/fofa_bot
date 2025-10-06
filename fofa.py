@@ -1,9 +1,8 @@
 #
-# fofa_final_complete_v8.1.py (最终完整版 for python-telegram-bot v13.x)
+# fofa_final_complete_v8.2.py (最终完整版 for python-telegram-bot v13.x)
 #
-# 核心修改 (v8.1): 1. 修复 /host 命令因未转义字符导致的 Markdown 解析错误。
-# 核心修改 (v8.1): 2. 修复 /batchfind 处理 IPv6 地址时的崩溃问题。
-# 核心修改 (v8.1): 3. 为 /batchfind 新增 banner 和 header 字段的指纹聚合分析功能，使其能识别相似的响应。
+# 核心修改 (v8.2): 1. 修复 MessageHandler 过滤器注册错误导致的 AttributeError。
+# 核心修改 (v8.2): 2. /batchfind 功能增强，在分析结束后自动构建建议的FOFA查询语法。
 #
 import os
 import sys
@@ -79,16 +78,12 @@ def normalize_banner(banner_text):
     # 移除长哈希值或UUID
     normalized = re.sub(r'[a-f0-9]{32,}', '[LONG_HASH]', normalized, flags=re.IGNORECASE)
     
-    # 移除所有数字（如果它们可能代表动态ID）
-    # normalized = re.sub(r'\b\d{5,}\b', '[NUMERIC_ID]', normalized)
-    
     # 压缩多个空格和换行符
     normalized = re.sub(r'\s+', ' ', normalized).strip()
     
     return normalized
 
 # 特征分析功能相关
-# --- 修改：新增 banner 和 header ---
 BATCH_FEATURES = {
     "protocol": "协议", "domain": "域名", "os": "操作系统", "server": "服务/组件",
     "icp": "ICP备案号", "title": "标题", "jarm": "JARM指纹",
@@ -273,13 +268,9 @@ def format_search_all_results(query_host, data):
         if res[field_map['os']]: common_info['os'].add(res[field_map['os']])
         if res[field_map['domain']]: common_info['domain'].add(res[field_map['domain']])
 
-    # --- FIX 1 START ---
-    # 修复了 join_set 函数，确保在拼接前对每个元素进行 Markdown 转义
     def join_set(s):
         s_list = sorted([item for item in s if item])
-        # 对每个元素进行转义，然后再拼接
         return '`, `'.join(map(escape_markdown, map(str, s_list))) if s_list else "N/A"
-    # --- FIX 1 END ---
 
     # Build the summary part
     lines = [f"📋 *主机详细信息: `{escape_markdown(query_host)}`*"]
@@ -321,7 +312,6 @@ def format_search_all_results(query_host, data):
         banner = first_res[field_map['banner']]
         if banner:
             banner_snippet = (banner[:200] + '...') if len(banner) > 200 else banner
-            # Banner内容在代码块中，不需要额外转义，但为安全起见，转义不会出错
             lines.append(f"  *Banner (片段):*\n  ```\n{escape_markdown(banner_snippet.strip())}\n  ```")
 
     full_text = "\n".join(lines)
@@ -839,7 +829,6 @@ def run_batch_find_job(context: CallbackContext):
 
     feature_analysis = {feature: {} for feature in selected_features}
     
-    # --- 修改：确保请求了 banner 和 header ---
     fields_to_fetch_set = set(selected_features)
     fields_to_fetch_set.add("ip")
     fields_to_fetch_set.add("port")
@@ -854,15 +843,11 @@ def run_batch_find_job(context: CallbackContext):
     def fetch_single_target(target):
         nonlocal completed_count, last_update_time
         try:
-            # --- FIX 2 START ---
-            # 使用 rsplit(':', 1) 来正确处理 IPv6 地址
-            # 并添加 try-except 块增加代码健壮性
             try:
                 ip, port = target.rsplit(':', 1)
             except ValueError:
                 logger.warning(f"Skipping malformed target in batchfind: {target}")
-                return None # 跳过格式不正确的行
-            # --- FIX 2 END ---
+                return None
             
             query_text = f'ip="{ip}" && port="{port}"'
             data, _, error = execute_query_with_fallback(
@@ -870,7 +855,7 @@ def run_batch_find_job(context: CallbackContext):
             )
             
             if not error and data and data.get('results'):
-                return data['results'][0] # returns a list of field values
+                return data['results'][0]
             return None
         finally:
             completed_count += 1
@@ -895,7 +880,6 @@ def run_batch_find_job(context: CallbackContext):
         for feature in selected_features:
             value = result[field_map[feature]]
             if value is not None and value != '':
-                # --- 修改：对 banner 和 header 进行指纹提取 ---
                 if feature in ['banner', 'header']:
                     fingerprint = normalize_banner(value)
                     if not fingerprint: continue
@@ -903,9 +887,8 @@ def run_batch_find_job(context: CallbackContext):
                     if fingerprint in feature_analysis[feature]:
                         feature_analysis[feature][fingerprint]['count'] += 1
                     else:
-                        # 存储计数、一个原始示例和指纹本身
                         feature_analysis[feature][fingerprint] = {'count': 1, 'example': value}
-                else: # 对于其他特征，使用原始逻辑
+                else:
                     if value in feature_analysis[feature]:
                         feature_analysis[feature][value] += 1
                     else:
@@ -918,13 +901,10 @@ def run_batch_find_job(context: CallbackContext):
         if not counts:
             report_lines.append("_未发现该特征的数据_")
         else:
-            # --- 修改：适配新的数据结构 ---
             if feature in ['banner', 'header']:
-                # 对字典按 'count' 字段排序
                 sorted_items = sorted(counts.values(), key=lambda item: item['count'], reverse=True)
                 for item in sorted_items[:5]:
                     count = item['count']
-                    # 显示原始示例，而不是指纹
                     display_value = (item['example'][:70] + '...') if len(item['example']) > 70 else item['example']
                     report_lines.append(f"`{escape_markdown(display_value)}`: *{count}*")
             else:
@@ -933,6 +913,34 @@ def run_batch_find_job(context: CallbackContext):
                     display_value = (str(value)[:70] + '...') if len(str(value)) > 70 else value
                     report_lines.append(f"`{escape_markdown(display_value)}`: *{count}*")
         report_lines.append("")
+
+    # --- 新增：构建建议查询 ---
+    dominant_query_parts = []
+    # 定义适合用于构建查询的特征
+    query_builder_features = ["protocol", "os", "server", "cert.issuer.cn", "cert.subject.org", "domain", "icp"]
+    threshold = total_targets / 2
+
+    for feature in query_builder_features:
+        if feature in feature_analysis and feature_analysis[feature]:
+            counts = feature_analysis[feature]
+            # 找到出现次数最多的项
+            top_item = max(counts.items(), key=lambda item: item[1])
+            top_value, top_count = top_item
+            
+            if top_count >= threshold:
+                # FOFA语法中，如果值包含空格，需要用双引号
+                if " " in str(top_value):
+                    dominant_query_parts.append(f'{feature}="{top_value}"')
+                else:
+                    dominant_query_parts.append(f'{feature}={top_value}')
+
+    if dominant_query_parts:
+        suggested_query = " && ".join(dominant_query_parts)
+        report_lines.append("--- *💡 建议的FOFA查询* ---")
+        report_lines.append("根据分析，以下查询可覆盖大部分目标:")
+        report_lines.append(f"`{escape_markdown(suggested_query)}`")
+        report_lines.append("")
+    # --- 新增结束 ---
 
     final_report = "\n".join(report_lines)
     if len(final_report) > 4096:
@@ -955,7 +963,9 @@ def restore_config_command(update: Update, context: CallbackContext): update.mes
 @admin_only
 def receive_config_file(update: Update, context: CallbackContext):
     global CONFIG;
-    if update.message.document.file_name != CONFIG_FILE: update.message.reply_text(f"❌ 文件名错误，必须为 `{CONFIG_FILE}`。"); return
+    if update.message.document.file_name != CONFIG_FILE: 
+        update.message.reply_text(f"❌ 文件名错误，必须为 `{CONFIG_FILE}`。"); 
+        return
     try:
         file = update.message.document.get_file(); temp_path = f"{CONFIG_FILE}.tmp"; file.download(temp_path)
         with open(temp_path, 'r', encoding='utf-8') as f: json.load(f)
@@ -1216,7 +1226,8 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("stop", stop_all_tasks))
     dispatcher.add_handler(CommandHandler("backup", backup_config_command))
     dispatcher.add_handler(CommandHandler("restore", restore_config_command))
-    dispatcher.add_handler(MessageHandler(Filters.document.file_name(CONFIG_FILE), receive_config_file))
+    # --- BUG修复：修正文件过滤器 ---
+    dispatcher.add_handler(MessageHandler(Filters.document, receive_config_file))
     dispatcher.add_handler(CommandHandler("history", history_command))
     dispatcher.add_handler(CommandHandler("getlog", get_log_command))
     dispatcher.add_handler(CommandHandler("shutdown", shutdown_command))
@@ -1230,7 +1241,7 @@ def main() -> None:
     dispatcher.add_handler(stats_conv)
     dispatcher.add_handler(batchfind_conv)
 
-    logger.info(f"🚀 终极版机器人已启动 (v8.1 - 智能指纹分析)...")
+    logger.info(f"🚀 终极版机器人已启动 (v8.2 - 建议查询)...")
     updater.start_polling()
     updater.idle()
 
