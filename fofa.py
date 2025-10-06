@@ -1,7 +1,8 @@
 #
-# fofa_final_complete_v8.3.py (最终完整版 for python-telegram-bot v13.x)
+# fofa_final_complete_v8.5.py (最终完整版 for python-telegram-bot v13.x)
 #
-# 核心修改 (v8.3): 1. 重构 /restore 功能，将其封装在独立的 ConversationHandler 中，彻底解决与 /batchfind 的文件上传冲突问题。
+# 核心修改 (v8.5): 1. /batchfind 报告增加“查询概览”，清晰展示成功/失败统计，解决用户困惑。
+# 核心修改 (v8.5): 2. 优化 /batchfind 的建议查询逻辑，使其基于成功找到的目标数进行计算。
 #
 import os
 import sys
@@ -97,7 +98,7 @@ logger = logging.getLogger(__name__)
     STATE_GET_UPDATE_URL,
     STATE_ASK_CONTINENT, STATE_CONTINENT_CHOICE,
     STATE_GET_BATCH_FILE, STATE_SELECT_BATCH_FEATURES,
-    STATE_GET_RESTORE_FILE # 新增状态
+    STATE_GET_RESTORE_FILE
 ) = range(19)
 
 # --- 配置管理 & 缓存 ---
@@ -163,6 +164,12 @@ def admin_only(func):
 def escape_markdown(text: str) -> str:
     if not isinstance(text, str): text = str(text)
     escape_chars = r'_*`['; return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+def create_progress_bar(percentage: float, length: int = 10) -> str:
+    if percentage < 0: percentage = 0
+    if percentage > 100: percentage = 100
+    filled_length = int(length * percentage // 100)
+    bar = '█' * filled_length + '░' * (length - filled_length)
+    return f"[{bar}] {percentage:.1f}%"
 
 # --- FOFA API 核心逻辑 ---
 def _make_api_request(url, params, timeout=60, use_b64=True, retries=10):
@@ -220,27 +227,66 @@ def execute_query_with_fallback(query_func, preferred_key_index=None):
     return None, None, "所有Key均尝试失败。"
 
 # --- /host & /stats 命令处理 ---
-def format_search_all_results(query_host, data):
-    if not data or not data.get('results'):
-        return f"🤷‍♀️ 未找到关于 `{escape_markdown(query_host)}` 的详细信息。"
+def get_common_host_info(data):
     fields = "ip,port,protocol,country,country_name,region,city,longitude,latitude,asn,org,host,domain,os,server,icp,title,jarm,header,banner,cert,base_protocol,link,cert.issuer.org,cert.issuer.cn,cert.subject.org,cert.subject.cn,tls.ja3s,tls.version,cert.sn,cert.not_before,cert.not_after,cert.domain".split(',')
     field_map = {name: idx for idx, name in enumerate(fields)}
+    
     common_info = {'ip': set(), 'asn': set(), 'org': set(), 'country': set(), 'os': set(), 'domain': set()}
     for res in data['results']:
         common_info['ip'].add(res[field_map['ip']]); common_info['asn'].add(res[field_map['asn']]); common_info['org'].add(res[field_map['org']])
         common_info['country'].add(f"{res[field_map['country_name']]} ({res[field_map['country']]})")
         if res[field_map['os']]: common_info['os'].add(res[field_map['os']])
         if res[field_map['domain']]: common_info['domain'].add(res[field_map['domain']])
+    
+    ports_data = {}
+    for res in data['results']:
+        port = res[field_map['port']]; ports_data.setdefault(port, []).append(res)
+        
+    return common_info, ports_data, field_map
+
+def create_host_summary(query_host, data):
+    if not data or not data.get('results'):
+        return f"🤷‍♀️ 未找到关于 `{escape_markdown(query_host)}` 的详细信息。"
+    
+    common_info, ports_data, field_map = get_common_host_info(data)
+    
     def join_set(s):
         s_list = sorted([item for item in s if item])
         return '`, `'.join(map(escape_markdown, map(str, s_list))) if s_list else "N/A"
+
+    lines = [f"📋 *主机摘要: `{escape_markdown(query_host)}`*"]
+    lines.append(f"*IP:* `{join_set(common_info['ip'])}`"); lines.append(f"*ASN:* `{join_set(common_info['asn'])}`"); lines.append(f"*组织:* `{join_set(common_info['org'])}`"); lines.append(f"*国家:* `{join_set(common_info['country'])}`")
+    if common_info['os']: lines.append(f"*操作系统:* `{join_set(common_info['os'])}`")
+    if common_info['domain']: lines.append(f"*关联域名:* `{join_set(common_info['domain'])}`")
+    
+    lines.append("\n*开放端口:*")
+    if not ports_data:
+        lines.append("  _未发现开放端口_")
+    else:
+        for port in sorted(ports_data.keys()):
+            first_res = ports_data[port][0]
+            protocol = first_res[field_map['protocol']]; title = first_res[field_map['title']]
+            line = f"  - `{port}` ({protocol})"
+            if title: line += f": `{escape_markdown(title)}`"
+            lines.append(line)
+            
+    return "\n".join(lines)
+
+def format_full_host_report(query_host, data):
+    if not data or not data.get('results'):
+        return f"🤷‍♀️ 未找到关于 `{escape_markdown(query_host)}` 的详细信息。"
+    
+    common_info, ports_data, field_map = get_common_host_info(data)
+    
+    def join_set(s):
+        s_list = sorted([item for item in s if item])
+        return '`, `'.join(map(escape_markdown, map(str, s_list))) if s_list else "N/A"
+
     lines = [f"📋 *主机详细信息: `{escape_markdown(query_host)}`*"]
     lines.append(f"*IP:* `{join_set(common_info['ip'])}`"); lines.append(f"*ASN:* `{join_set(common_info['asn'])}`"); lines.append(f"*组织:* `{join_set(common_info['org'])}`"); lines.append(f"*国家:* `{join_set(common_info['country'])}`")
     if common_info['os']: lines.append(f"*操作系统:* `{join_set(common_info['os'])}`")
     if common_info['domain']: lines.append(f"*关联域名:* `{join_set(common_info['domain'])}`")
-    ports_data = {}
-    for res in data['results']:
-        port = res[field_map['port']]; ports_data.setdefault(port, []).append(res)
+    
     for port in sorted(ports_data.keys()):
         first_res = ports_data[port][0]; protocol = first_res[field_map['protocol']]
         lines.append(f"\n--- *端口: {port}* ({protocol}) ---")
@@ -252,31 +298,53 @@ def format_search_all_results(query_host, data):
         if first_res[field_map['cert.domain']]:
             cert_domains = first_res[field_map['cert.domain']].split(',')
             lines.append(f"  *证书域名:* `{escape_markdown(', '.join(cert_domains[:3]))}`" + ( "..." if len(cert_domains) > 3 else ""))
+        
+        header = first_res[field_map['header']]
+        if header:
+            header_snippet = (header[:400] + '...') if len(header) > 400 else header
+            lines.append(f"  *Header (片段):*\n  ```\n{escape_markdown(header_snippet.strip())}\n  ```")
+            
         banner = first_res[field_map['banner']]
         if banner:
-            banner_snippet = (banner[:200] + '...') if len(banner) > 200 else banner
+            banner_snippet = (banner[:400] + '...') if len(banner) > 400 else banner
             lines.append(f"  *Banner (片段):*\n  ```\n{escape_markdown(banner_snippet.strip())}\n  ```")
-    full_text = "\n".join(lines)
-    return full_text[:4090] + "\n...内容过长已截断..." if len(full_text) > 4096 else full_text
+            
+    return "\n".join(lines)
 
 @admin_only
 def host_command(update: Update, context: CallbackContext) -> None:
     if not context.args:
         update.message.reply_text("用法: `/host <ip_or_domain>`\n\n示例:\n`/host 1.1.1.1`\n`/host example.com`", parse_mode=ParseMode.MARKDOWN)
         return
-    host_arg = context.args[0]; processing_message = update.message.reply_text(f"正在查询主机 `{escape_markdown(host_arg)}` 的详细信息...")
+    host_arg = context.args[0]; processing_message = update.message.reply_text(f"⏳ 正在查询主机 `{escape_markdown(host_arg)}`...")
     query = f'ip="{host_arg}"' if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host_arg) else f'domain="{host_arg}"'
     fields = "ip,port,protocol,country,country_name,region,city,longitude,latitude,asn,org,host,domain,os,server,icp,title,jarm,header,banner,cert,base_protocol,link,cert.issuer.org,cert.issuer.cn,cert.subject.org,cert.subject.cn,tls.ja3s,tls.version,cert.sn,cert.not_before,cert.not_after,cert.domain"
     data, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=100, fields=fields))
     if error:
         processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
         return
-    formatted_text = format_search_all_results(host_arg, data)
-    processing_message.edit_text(formatted_text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     
+    full_report = format_full_host_report(host_arg, data)
+    
+    if len(full_report) > 1500:
+        summary_report = create_host_summary(host_arg, data)
+        processing_message.edit_text(summary_report, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        
+        report_filename = f"host_details_{host_arg.replace('.', '_')}.txt"
+        try:
+            with open(report_filename, 'w', encoding='utf-8') as f:
+                f.write(re.sub(r'([*_`])', '', full_report))
+            with open(report_filename, 'rb') as doc:
+                context.bot.send_document(chat_id=update.effective_chat.id, document=doc, caption="📄 完整的详细报告已附上。")
+        finally:
+            if os.path.exists(report_filename):
+                os.remove(report_filename)
+    else:
+        processing_message.edit_text(full_report, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
 @admin_only
 def get_fofa_stats_query(update: Update, context: CallbackContext) -> int:
-    query_text = update.message.text; processing_message = update.message.reply_text("正在查询 FOFA 聚合统计, 请稍候...")
+    query_text = update.message.text; processing_message = update.message.reply_text(f"⏳ 正在为 `{escape_markdown(query_text)}` 查询聚合统计...")
     data, _, error = execute_query_with_fallback(lambda key: fetch_fofa_stats(key, query_text))
     if error: processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN); return ConversationHandler.END
     stats_data = data; aggs = stats_data.get("aggs", {})
@@ -760,9 +828,11 @@ def run_batch_find_job(context: CallbackContext):
             return None
         finally:
             completed_count += 1; current_time = time.time()
-            if current_time - last_update_time > 3:
+            if current_time - last_update_time > 2.5:
                 try:
-                    bot.edit_message_text(f"⏳ 正在分析... {completed_count}/{total_targets}", chat_id=chat_id, message_id=msg_id)
+                    progress_percent = (completed_count / total_targets) * 100
+                    progress_bar = create_progress_bar(progress_percent)
+                    bot.edit_message_text(f"⏳ 正在分析...\n`{progress_bar}`", chat_id=chat_id, message_id=msg_id, parse_mode=ParseMode.MARKDOWN)
                     last_update_time = current_time
                 except (BadRequest, RetryAfter): pass
 
@@ -770,9 +840,11 @@ def run_batch_find_job(context: CallbackContext):
         all_results = list(executor.map(fetch_single_target, targets))
 
     field_map = {name: idx for idx, name in enumerate(fields_to_fetch.split(','))}
-
+    
+    success_count = 0
     for result in all_results:
         if result is None: continue
+        success_count += 1
         for feature in selected_features:
             value = result[field_map[feature]]
             if value is not None and value != '':
@@ -784,42 +856,52 @@ def run_batch_find_job(context: CallbackContext):
                 else:
                     feature_analysis[feature].setdefault(value, 0); feature_analysis[feature][value] += 1
     
-    report_lines = [f"📊 *批量特征分析报告 ({total_targets}个目标)*\n"]
-    for feature, counts in feature_analysis.items():
-        feature_name = BATCH_FEATURES.get(feature, feature)
-        report_lines.append(f"--- *Top 5 {feature_name}* ---")
-        if not counts: report_lines.append("_未发现该特征的数据_")
-        else:
-            if feature in ['banner', 'header']:
-                sorted_items = sorted(counts.values(), key=lambda item: item['count'], reverse=True)
-                for item in sorted_items[:5]:
-                    count = item['count']; display_value = (item['example'][:70] + '...') if len(item['example']) > 70 else item['example']
-                    report_lines.append(f"`{escape_markdown(display_value)}`: *{count}*")
+    # --- 报告生成逻辑优化 ---
+    report_lines = [f"📊 *批量特征分析报告*"]
+    report_lines.append("\n--- *查询概览* ---")
+    report_lines.append(f"*   总目标数:* `{total_targets}`")
+    report_lines.append(f"*   成功找到:* `{success_count}`")
+    report_lines.append(f"*   未找到数据:* `{total_targets - success_count}`")
+    if success_count > 0:
+        report_lines.append(f"\n*（注意：以下特征分析仅基于成功找到的 {success_count} 个目标）*")
+    report_lines.append("")
+
+    if success_count > 0:
+        for feature, counts in feature_analysis.items():
+            feature_name = BATCH_FEATURES.get(feature, feature)
+            report_lines.append(f"--- *Top 5 {feature_name}* ---")
+            if not counts: report_lines.append("_未发现该特征的数据_")
             else:
-                sorted_items = sorted(counts.items(), key=lambda item: item[1], reverse=True)
-                for value, count in sorted_items[:5]:
-                    display_value = (str(value)[:70] + '...') if len(str(value)) > 70 else value
-                    report_lines.append(f"`{escape_markdown(display_value)}`: *{count}*")
-        report_lines.append("")
+                if feature in ['banner', 'header']:
+                    sorted_items = sorted(counts.values(), key=lambda item: item['count'], reverse=True)
+                    for item in sorted_items[:5]:
+                        count = item['count']; display_value = (item['example'][:70] + '...') if len(item['example']) > 70 else item['example']
+                        report_lines.append(f"`{escape_markdown(display_value)}`: *{count}*")
+                else:
+                    sorted_items = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+                    for value, count in sorted_items[:5]:
+                        display_value = (str(value)[:70] + '...') if len(str(value)) > 70 else value
+                        report_lines.append(f"`{escape_markdown(display_value)}`: *{count}*")
+            report_lines.append("")
 
-    dominant_query_parts = []
-    query_builder_features = ["protocol", "os", "server", "cert.issuer.cn", "cert.subject.org", "domain", "icp"]
-    threshold = total_targets / 2
+        dominant_query_parts = []
+        query_builder_features = ["protocol", "os", "server", "cert.issuer.cn", "cert.subject.org", "domain", "icp"]
+        threshold = success_count / 2 # 使用成功数作为基数
 
-    for feature in query_builder_features:
-        if feature in feature_analysis and feature_analysis[feature]:
-            counts = feature_analysis[feature]
-            top_item = max(counts.items(), key=lambda item: item[1])
-            top_value, top_count = top_item
-            if top_count >= threshold:
-                dominant_query_parts.append(f'{feature}="{top_value}"' if " " in str(top_value) else f'{feature}={top_value}')
+        for feature in query_builder_features:
+            if feature in feature_analysis and feature_analysis[feature]:
+                counts = feature_analysis[feature]
+                top_item = max(counts.items(), key=lambda item: item[1])
+                top_value, top_count = top_item
+                if top_count >= threshold:
+                    dominant_query_parts.append(f'{feature}="{top_value}"' if " " in str(top_value) else f'{feature}={top_value}')
 
-    if dominant_query_parts:
-        suggested_query = " && ".join(dominant_query_parts)
-        report_lines.append("--- *💡 建议的FOFA查询* ---")
-        report_lines.append("根据分析，以下查询可覆盖大部分目标:")
-        report_lines.append(f"`{escape_markdown(suggested_query)}`")
-        report_lines.append("")
+        if dominant_query_parts:
+            suggested_query = " && ".join(dominant_query_parts)
+            report_lines.append("--- *💡 建议的FOFA查询* ---")
+            report_lines.append("根据分析，以下查询可覆盖大部分*已找到*的目标:")
+            report_lines.append(f"`{escape_markdown(suggested_query)}`")
+            report_lines.append("")
 
     final_report = "\n".join(report_lines)
     if len(final_report) > 4096: final_report = final_report[:4090] + "\n...内容过长已截断..."
@@ -834,7 +916,6 @@ def backup_config_command(update: Update, context: CallbackContext):
     if os.path.exists(CONFIG_FILE): update.effective_chat.send_document(document=open(CONFIG_FILE, 'rb'))
     else: update.effective_chat.send_message("❌ 找不到配置文件。")
 
-# --- BUG修复：将 /restore 封装到 ConversationHandler ---
 @admin_only
 def restore_config_command(update: Update, context: CallbackContext) -> int:
     update.message.reply_text("📥 请上传您的 `config.json` 文件以恢复配置。\n\n随时可以发送 /cancel 来取消。")
@@ -857,7 +938,6 @@ def receive_config_file(update: Update, context: CallbackContext) -> int:
         if os.path.exists(temp_path): os.remove(temp_path)
     
     return ConversationHandler.END
-# --- 修复结束 ---
 
 @admin_only
 def history_command(update: Update, context: CallbackContext):
@@ -1102,7 +1182,6 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300
     )
-    # --- BUG修复：新增 restore 会话 ---
     restore_conv = ConversationHandler(
         entry_points=[CommandHandler("restore", restore_config_command)],
         states={
@@ -1128,9 +1207,9 @@ def main() -> None:
     dispatcher.add_handler(import_conv)
     dispatcher.add_handler(stats_conv)
     dispatcher.add_handler(batchfind_conv)
-    dispatcher.add_handler(restore_conv) # 添加新的会话处理器
+    dispatcher.add_handler(restore_conv)
 
-    logger.info(f"🚀 终极版机器人已启动 (v8.3 - 冲突修复)...")
+    logger.info(f"🚀 终极版机器人已启动 (v8.5 - 报告优化)...")
     updater.start_polling()
     updater.idle()
 
