@@ -1,8 +1,8 @@
 #
-# fofa_final_complete_v8.6.py (最终完整版 for python-telegram-bot v13.x)
+# fofa_final_complete_v8.7.py (最终完整版 for python-telegram-bot v13.x)
 #
-# 核心修改 (v8.6): 1. /host 命令生成的详细报告文件中，Banner和Header不再被截断，保证信息完整性。
-# 核心修改 (v8.6): 2. /batchfind 功能升级，使用正则表达式智能解析文件，兼容各种复杂的 "ip:port..." 格式。
+# 核心修改 (v8.7): 1. 重构/batchfind的查询建议逻辑，废弃旧的50%阈值算法。
+# 核心修改 (v8.7): 2. 新算法会智能忽略占比过高(>95%)的无用特征，并组合各个类别的相对优势特征，生成更精准的查询。
 #
 import os
 import sys
@@ -754,7 +754,6 @@ def get_batch_file_handler(update: Update, context: CallbackContext) -> int:
         context.user_data['selected_features'] = set()
         
         targets = []
-        # Regex to find an IP:PORT at the beginning of a line, ignoring surrounding whitespace
         ip_port_pattern = re.compile(r"^\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{1,5})")
         with open(temp_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -889,22 +888,29 @@ def run_batch_find_job(context: CallbackContext):
                         report_lines.append(f"`{escape_markdown(display_value)}`: *{count}*")
             report_lines.append("")
 
+        # --- 全新、更智能的查询建议逻辑 ---
         dominant_query_parts = []
-        query_builder_features = ["protocol", "os", "server", "cert.issuer.cn", "cert.subject.org", "domain", "icp"]
-        threshold = success_count / 2
-
+        # 按照特征的重要性或区分度排序
+        query_builder_features = ["server", "title", "cert.issuer.org", "cert.subject.cn", "os", "protocol", "domain", "icp"]
+        
         for feature in query_builder_features:
             if feature in feature_analysis and feature_analysis[feature]:
                 counts = feature_analysis[feature]
                 top_item = max(counts.items(), key=lambda item: item[1])
                 top_value, top_count = top_item
-                if top_count >= threshold:
-                    dominant_query_parts.append(f'{feature}="{top_value}"' if " " in str(top_value) else f'{feature}={top_value}')
+
+                # 智能过滤：如果一个特征的最高占比超过95%，则认为它是这个数据集的“定义”，而不是一个有用的“特征”，予以忽略。
+                # 例如，如果所有目标都是https，那么 `protocol=https` 就不是一个有用的筛选条件。
+                if success_count > 0 and (top_count / success_count) > 0.95:
+                    continue
+
+                # 将该类别中最主要的特征加入查询条件
+                dominant_query_parts.append(f'{feature}="{top_value}"' if " " in str(top_value) else f'{feature}={top_value}')
 
         if dominant_query_parts:
             suggested_query = " && ".join(dominant_query_parts)
             report_lines.append("--- *💡 建议的FOFA查询* ---")
-            report_lines.append("根据分析，以下查询可覆盖大部分*已找到*的目标:")
+            report_lines.append("根据分析，以下查询可用于寻找相似资产:")
             report_lines.append(f"`{escape_markdown(suggested_query)}`")
             report_lines.append("")
 
@@ -1214,7 +1220,7 @@ def main() -> None:
     dispatcher.add_handler(batchfind_conv)
     dispatcher.add_handler(restore_conv)
 
-    logger.info(f"🚀 终极版机器人已启动 (v8.6 - 兼容性与报告优化)...")
+    logger.info(f"🚀 终极版机器人已启动 (v8.7 - 智能建议)...")
     updater.start_polling()
     updater.idle()
 
