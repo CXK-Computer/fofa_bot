@@ -1,8 +1,8 @@
 #
-# fofa_final_complete_v8.5.py (最终完整版 for python-telegram-bot v13.x)
+# fofa_final_complete_v8.6.py (最终完整版 for python-telegram-bot v13.x)
 #
-# 核心修改 (v8.5): 1. /batchfind 报告增加“查询概览”，清晰展示成功/失败统计，解决用户困惑。
-# 核心修改 (v8.5): 2. 优化 /batchfind 的建议查询逻辑，使其基于成功找到的目标数进行计算。
+# 核心修改 (v8.6): 1. /host 命令生成的详细报告文件中，Banner和Header不再被截断，保证信息完整性。
+# 核心修改 (v8.6): 2. /batchfind 功能升级，使用正则表达式智能解析文件，兼容各种复杂的 "ip:port..." 格式。
 #
 import os
 import sys
@@ -301,13 +301,11 @@ def format_full_host_report(query_host, data):
         
         header = first_res[field_map['header']]
         if header:
-            header_snippet = (header[:400] + '...') if len(header) > 400 else header
-            lines.append(f"  *Header (片段):*\n  ```\n{escape_markdown(header_snippet.strip())}\n  ```")
+            lines.append(f"  *Header:*\n  ```\n{escape_markdown(header.strip())}\n  ```")
             
         banner = first_res[field_map['banner']]
         if banner:
-            banner_snippet = (banner[:400] + '...') if len(banner) > 400 else banner
-            lines.append(f"  *Banner (片段):*\n  ```\n{escape_markdown(banner_snippet.strip())}\n  ```")
+            lines.append(f"  *Banner:*\n  ```\n{escape_markdown(banner.strip())}\n  ```")
             
     return "\n".join(lines)
 
@@ -747,7 +745,7 @@ def get_batch_file_handler(update: Update, context: CallbackContext) -> int:
         update.message.reply_text("❌ 文件格式错误，请上传 `.txt` 文件。")
         return ConversationHandler.END
 
-    msg = update.message.reply_text("正在下载文件...")
+    msg = update.message.reply_text("正在下载并解析文件...")
     try:
         file = doc.get_file()
         temp_path = os.path.join(FOFA_CACHE_DIR, f"batch_{doc.file_id}.txt")
@@ -755,11 +753,19 @@ def get_batch_file_handler(update: Update, context: CallbackContext) -> int:
         context.user_data['batch_file_path'] = temp_path
         context.user_data['selected_features'] = set()
         
+        targets = []
+        # Regex to find an IP:PORT at the beginning of a line, ignoring surrounding whitespace
+        ip_port_pattern = re.compile(r"^\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{1,5})")
         with open(temp_path, 'r', encoding='utf-8') as f:
-            targets = [line.strip() for line in f if ':' in line.strip()][:100]
+            for line in f:
+                if len(targets) >= 100:
+                    break
+                match = ip_port_pattern.match(line)
+                if match:
+                    targets.append(match.group(1))
         
         if not targets:
-            msg.edit_text("❌ 文件为空或格式不正确 (需要 `ip:port` 格式)，操作已取消。")
+            msg.edit_text("❌ 文件为空或无法从中提取任何 `ip:port` 格式的数据，操作已取消。")
             os.remove(temp_path)
             return ConversationHandler.END
 
@@ -856,7 +862,6 @@ def run_batch_find_job(context: CallbackContext):
                 else:
                     feature_analysis[feature].setdefault(value, 0); feature_analysis[feature][value] += 1
     
-    # --- 报告生成逻辑优化 ---
     report_lines = [f"📊 *批量特征分析报告*"]
     report_lines.append("\n--- *查询概览* ---")
     report_lines.append(f"*   总目标数:* `{total_targets}`")
@@ -886,7 +891,7 @@ def run_batch_find_job(context: CallbackContext):
 
         dominant_query_parts = []
         query_builder_features = ["protocol", "os", "server", "cert.issuer.cn", "cert.subject.org", "domain", "icp"]
-        threshold = success_count / 2 # 使用成功数作为基数
+        threshold = success_count / 2
 
         for feature in query_builder_features:
             if feature in feature_analysis and feature_analysis[feature]:
@@ -1209,7 +1214,7 @@ def main() -> None:
     dispatcher.add_handler(batchfind_conv)
     dispatcher.add_handler(restore_conv)
 
-    logger.info(f"🚀 终极版机器人已启动 (v8.5 - 报告优化)...")
+    logger.info(f"🚀 终极版机器人已启动 (v8.6 - 兼容性与报告优化)...")
     updater.start_polling()
     updater.idle()
 
