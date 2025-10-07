@@ -1,17 +1,14 @@
 name: Build Cross-Platform Executable for fofa.py
 
 on:
-  # 1. 自动触发：当 fofa.py 或依赖文件被推送到 main 分支时
   push:
     branches: [ "main" ]
     paths:
       - 'fofa.py'
       - 'requirements.txt'
   
-  # 2. 手动触发：允许从 Actions 页面启动
   workflow_dispatch:
     inputs:
-      # 定义一个手动触发时的输入选项
       platforms:
         description: 'Which platform(s) to build for?'
         required: true
@@ -23,17 +20,12 @@ on:
           - windows
           - macos
 
-# 创建和发布 Release 需要写入内容的权限
 permissions:
   contents: write
 
 jobs:
-  # ===============================================
-  # 任务1: 构建可执行文件 (在多个操作系统上并行)
-  # ===============================================
   build:
     name: Build on ${{ matrix.os }}
-    # 使用矩阵策略，为下面列表中的每个操作系统启动一个独立的任务
     strategy:
       matrix:
         include:
@@ -49,69 +41,126 @@ jobs:
             platform_id: 'macos'
             asset_name: fofa-macos
             asset_path: dist/fofa
-
-    # 条件判断：仅在满足条件时运行
-    # 条件1：是自动推送触发的 (github.event_name == 'push')
-    # 条件2：是手动触发，并且选择了 "all"
-    # 条件3：是手动触发，并且选择的平台ID与当前矩阵任务的平台ID匹配
-    if: |
-      github.event_name == 'push' ||
-      github.event.inputs.platforms == 'all' ||
-      github.event.inputs.platforms == matrix.platform_id
-    
-    # 在矩阵指定的操作系统上运行
+            
     runs-on: ${{ matrix.os }}
 
     steps:
+      # ==========================================================
+      # ==========[ START OF CORRECTION / 这是修正的部分 ]==========
+      # ==========================================================
+      - name: Check if job should run
+        # 我们在这里添加一个 if 条件。现在 matrix 对象是可用的
+        # 如果不满足条件，这个步骤会 'skip'，并且默认情况下后续所有步骤也会被跳过
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
+        run: echo "✅ This build for ${{ matrix.platform_id }} is proceeding."
+      
+      # 这里可以添加一个相反条件的步骤，用于清晰地显示哪些被跳过了（可选，但推荐）
+      - name: Notify that job is skipped
+        if: |
+          !(
+            github.event_name == 'push' ||
+            github.event.inputs.platforms == 'all' ||
+            github.event.inputs.platforms == matrix.platform_id
+          )
+        run: |
+          echo "⏩ This build for ${{ matrix.platform_id }} is skipped due to manual selection."
+          # 使用 `exit 1` 可以让这个 job 直接显示为失败，而不是被取消。
+          # 但在这里我们不希望它失败，跳过（Cancelled）是更合适的显示。
+          # 如果想强制取消，可以使用第三方 action，但通常仅跳过步骤就足够了。
+      
+      # 默认情况下，如果一个步骤的 if 条件不满足，它会被跳过。
+      # GitHub Actions 在遇到一个被跳过的步骤后，如果后面没有 always() 或 failure() 条件，
+      # 通常会将后续所有步骤都跳过，从而有效地取消整个 job 的执行。
+      # 为保险起见，我们将这个判断条件添加到每一个关键步骤上。
+      
       - name: Checkout repository
+        # 在每个实际执行的步骤中都添加这个 if 条件，这是最稳妥的方式
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
         uses: actions/checkout@v4
 
       - name: Set up Python 3.9
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
         uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
       - name: Install dependencies
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
       - name: Build with PyInstaller
-        # 使用更新后的脚本名 fofa.py 和新的输出名 fofa
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
         run: pyinstaller --name fofa --onefile --clean fofa.py
       
       - name: Upload artifact
-        # 将编译好的单个文件作为产物上传，供下一个任务使用
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
         uses: actions/upload-artifact@v4
         with:
-          # 使用矩阵中定义的名字，确保每个产物名称唯一
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_path }}
+      # ==========================================================
+      # ===========[ END OF CORRECTION / 修正部分结束 ]============
+      # ==========================================================
 
-  # ===============================================
-  # 任务2: 创建 Release (在所有构建成功后)
-  # ===============================================
+
   create-release:
     name: Create GitHub Release
-    # 依赖于 build 任务，必须等所有平台的 build 都成功完成后才开始
     needs: build
     runs-on: ubuntu-latest
     
+    # 我们还需要在这里添加一个条件：如果所有 build 任务都被跳过了，
+    # 那么创建 release 的任务也不应该运行。
+    # 'needs.build.result' 会是 'success' 'failure' 'cancelled' or 'skipped'.
+    # 只要至少有一个成功，我们就可以继续。我们不希望在全部 'skipped' 的时候运行。
+    if: success() || failure() # 'success()' 意味着至少有一个 job 成功了
+
     steps:
       - name: Download all built artifacts
         uses: actions/download-artifact@v4
-        # 将上一个任务上传的所有产物下载到 'dist' 目录
-        # 这会创建类似 dist/fofa-linux/fofa, dist/fofa-windows.exe/fofa.exe 的结构
         with:
           path: dist
 
+      - name: Check for downloaded files
+        # 增加一个检查步骤，如果没有下载到任何文件（比如所有构建都被跳过了），就中止
+        id: check_files
+        run: |
+          if [ -z "$(ls -A dist)" ]; then
+            echo "No artifacts were downloaded. Skipping release creation."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "Artifacts found. Proceeding with release."
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+      
       - name: Generate unique tag name
+        if: steps.check_files.outputs.skip == 'false'
         id: generate_tag
         run: |
           echo "tag=dev-$(date +'%Y%m%d')-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
       - name: Create new Pre-release
+        if: steps.check_files.outputs.skip == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.generate_tag.outputs.tag }}
@@ -120,9 +169,7 @@ jobs:
             This is an automated cross-platform build from the `main` branch.
             - **Commit:** `${{ github.sha }}`
             - **See details:** `${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}`
-          # 使用通配符上传所有在 dist 目录下找到的可执行文件
           files: dist/*/*
-          # 标记为预发布版
           prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
