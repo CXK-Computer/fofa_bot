@@ -1,4 +1,6 @@
 # FOFA 数据下载机器人 (FOFA Data Downloader Bot)
+[English](https://github.com/CXK-Computer/fofa_bot/blob/main/README_English.md)
+
 
 **您的私人FOFA资产搜索引擎与分析助手。**
 
