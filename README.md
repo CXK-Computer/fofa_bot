@@ -55,9 +55,9 @@
 
 在开始之前，您需要准备以下三样东西：
 
-1.  **一台服务器**: 一台可以7x24小时运行Python脚本的Linux服务器（或任何支持Python的PC/Mac）。
+1.  **一台服务器**: 一台可以7x24小时运行Python脚本的Linux服务器（或任何支持Python的PC/Mac）。最好不要在中国或其他Telegram被封锁的地区（比如伊朗）使用（由于GFW，需要配置网络代理）。
 2.  **FOFA API 密钥**:
-    *   您必须拥有一个 [FOFA](https://fofa.info) 个人会员或以上账户。
+    *   您必须拥有一个 [FOFA](https://fofa.info) 个人会员或以上账户。（或者不开会员，多充点F点）
     *   登录后，在“个人中心” -> “API接口”中找到您的`Key`。
 3.  **Telegram Bot Token**:
     *   在Telegram中搜索 `@BotFather` 并开始对话。
@@ -72,6 +72,14 @@
 ### 步骤 1: 下载脚本
 
 将本项目提供的最新版Python脚本（ `fofa.py`）下载到您的服务器上。
+```bash
+wget https://raw.githubusercontent.com/CXK-Computer/fofa_bot/refs/heads/main/fofa.py
+```
+也可以把requirements.txt也下载到服务器上。
+```bash
+wget https://raw.githubusercontent.com/CXK-Computer/fofa_bot/refs/heads/main/requirements.txt
+```
+你也可以直接去发行版中下载已经编译好的二进制文件。
 
 ### 步骤 2: 安装依赖
 
@@ -80,6 +88,11 @@
 ```bash
 pip3 install python-telegram-bot==13.15 requests "urllib3<2.0"
 ```
+或者（如果你已经下载了requirements.txt）
+```bash
+pip3 install -r requirements.txt
+```
+
 *注意：我们指定了 `python-telegram-bot` 的版本为 `13.15` 以确保兼容性。*
 
 ### 步骤 3: 配置机器人
@@ -106,7 +119,7 @@ pip3 install python-telegram-bot==13.15 requests "urllib3<2.0"
     *   `"bot_token"`: 替换为你在 **准备工作** 中从 `@BotFather` 获取的 Token。
     *   `"apis"`: 替换为你的 FOFA API Key。你可以添加多个Key，用逗号隔开，例如：`["key1", "key2"]`。
     *   `"admins"`: **这一项先留空**。当你第一次启动机器人并向它发送 `/start` 命令时，它会自动将你的Telegram用户ID添加为第一个管理员。
-    *   `"proxy"`: 如果你的服务器需要通过代理才能访问Telegram，请在这里填写代理地址，例如 `"http://127.0.0.1:7890"`。如果不需要，请保持为空 `""`。
+    *   `"proxy"`: 如果你的服务器需要通过代理才能访问Telegram（如中国，伊朗等地），请在这里填写代理地址，例如 `"http://127.0.0.1:7890"`。如果不需要，请保持为空 `""`。
 
 ### 步骤 4: 运行机器人
 
@@ -254,5 +267,3 @@ python3 fofa.py
 [X-Fofa](https://github.com/sv3nbeast/X-Fofa) 提供深度追溯实现
 
 `Github社区`
-
-`Google Gemini 2.5 PRO` 
