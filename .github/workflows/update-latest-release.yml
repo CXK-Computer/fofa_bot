@@ -31,53 +31,28 @@ jobs:
         include:
           - os: ubuntu-latest
             platform_id: 'linux'
-            asset_name: fofa-linux
+            asset_name: fofa-linux  # <-- 我们将使用这个名字来重命名
             asset_path: dist/fofa
           - os: windows-latest
             platform_id: 'windows'
-            asset_name: fofa-windows.exe
+            asset_name: fofa-windows.exe # <-- 和这个
             asset_path: dist/fofa.exe
           - os: macos-latest
             platform_id: 'macos'
-            asset_name: fofa-macos
+            asset_name: fofa-macos # <-- 和这个
             asset_path: dist/fofa
             
     runs-on: ${{ matrix.os }}
 
     steps:
-      # ==========================================================
-      # ==========[ START OF CORRECTION / 这是修正的部分 ]==========
-      # ==========================================================
       - name: Check if job should run
-        # 我们在这里添加一个 if 条件。现在 matrix 对象是可用的
-        # 如果不满足条件，这个步骤会 'skip'，并且默认情况下后续所有步骤也会被跳过
         if: |
           github.event_name == 'push' ||
           github.event.inputs.platforms == 'all' ||
           github.event.inputs.platforms == matrix.platform_id
         run: echo "✅ This build for ${{ matrix.platform_id }} is proceeding."
       
-      # 这里可以添加一个相反条件的步骤，用于清晰地显示哪些被跳过了（可选，但推荐）
-      - name: Notify that job is skipped
-        if: |
-          !(
-            github.event_name == 'push' ||
-            github.event.inputs.platforms == 'all' ||
-            github.event.inputs.platforms == matrix.platform_id
-          )
-        run: |
-          echo "⏩ This build for ${{ matrix.platform_id }} is skipped due to manual selection."
-          # 使用 `exit 1` 可以让这个 job 直接显示为失败，而不是被取消。
-          # 但在这里我们不希望它失败，跳过（Cancelled）是更合适的显示。
-          # 如果想强制取消，可以使用第三方 action，但通常仅跳过步骤就足够了。
-      
-      # 默认情况下，如果一个步骤的 if 条件不满足，它会被跳过。
-      # GitHub Actions 在遇到一个被跳过的步骤后，如果后面没有 always() 或 failure() 条件，
-      # 通常会将后续所有步骤都跳过，从而有效地取消整个 job 的执行。
-      # 为保险起见，我们将这个判断条件添加到每一个关键步骤上。
-      
       - name: Checkout repository
-        # 在每个实际执行的步骤中都添加这个 if 条件，这是最稳妥的方式
         if: |
           github.event_name == 'push' ||
           github.event.inputs.platforms == 'all' ||
@@ -119,21 +94,12 @@ jobs:
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_path }}
-      # ==========================================================
-      # ===========[ END OF CORRECTION / 修正部分结束 ]============
-      # ==========================================================
-
 
   create-release:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    
-    # 我们还需要在这里添加一个条件：如果所有 build 任务都被跳过了，
-    # 那么创建 release 的任务也不应该运行。
-    # 'needs.build.result' 会是 'success' 'failure' 'cancelled' or 'skipped'.
-    # 只要至少有一个成功，我们就可以继续。我们不希望在全部 'skipped' 的时候运行。
-    if: success() || failure() # 'success()' 意味着至少有一个 job 成功了
+    if: success() || failure()
 
     steps:
       - name: Download all built artifacts
@@ -141,12 +107,38 @@ jobs:
         with:
           path: dist
 
-      - name: Check for downloaded files
-        # 增加一个检查步骤，如果没有下载到任何文件（比如所有构建都被跳过了），就中止
+      # ==========================================================
+      # ==========[ START OF CORRECTION / 这是修正的部分 ]==========
+      # ==========================================================
+      - name: Rename artifacts for unique release names
+        run: |
+          echo "Listing downloaded artifacts and their structure:"
+          ls -R dist
+
+          # 循环处理每个下载下来的文件夹 (e.g., dist/fofa-linux, dist/fofa-windows.exe)
+          for dir in dist/*; do
+            # 获取文件夹名 (e.g., fofa-linux)
+            asset_name=$(basename "$dir")
+            # 找到文件夹里实际的文件 (e.g., fofa 或 fofa.exe)
+            original_file=$(find "$dir" -type f -name "fofa*")
+            if [ -n "$original_file" ]; then
+              # 重命名文件 (e.g., mv dist/fofa-linux/fofa dist/fofa-linux/fofa-linux)
+              mv "$original_file" "$dir/$asset_name"
+              echo "Renamed '$original_file' to '$dir/$asset_name'"
+            fi
+          done
+          
+          echo "Listing files after renaming:"
+          ls -R dist
+      # ==========================================================
+      # ===========[ END OF CORRECTION / 修正部分结束 ]============
+      # ==========================================================
+
+      - name: Check for renamed files
         id: check_files
         run: |
           if [ -z "$(ls -A dist)" ]; then
-            echo "No artifacts were downloaded. Skipping release creation."
+            echo "No artifacts were found. Skipping release creation."
             echo "skip=true" >> $GITHUB_OUTPUT
           else
             echo "Artifacts found. Proceeding with release."
@@ -169,6 +161,7 @@ jobs:
             This is an automated cross-platform build from the `main` branch.
             - **Commit:** `${{ github.sha }}`
             - **See details:** `${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}`
+          # 这个通配符现在可以找到被重命名后的唯一文件了
           files: dist/*/*
           prerelease: true
         env:
