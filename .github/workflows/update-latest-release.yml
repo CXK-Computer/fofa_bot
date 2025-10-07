@@ -1,21 +1,67 @@
-name: Continuous Development Build
+name: Build Cross-Platform Executable for fofa.py
 
 on:
+  # 1. 自动触发：当 fofa.py 或依赖文件被推送到 main 分支时
   push:
     branches: [ "main" ]
-    # 只有脚本或依赖文件被修改时才触发
     paths:
       - 'fofa.py'
       - 'requirements.txt'
+  
+  # 2. 手动触发：允许从 Actions 页面启动
+  workflow_dispatch:
+    inputs:
+      # 定义一个手动触发时的输入选项
+      platforms:
+        description: 'Which platform(s) to build for?'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - linux
+          - windows
+          - macos
 
-# 创建 Release 所需的权限
+# 创建和发布 Release 需要写入内容的权限
 permissions:
   contents: write
 
 jobs:
-  build-and-create-prerelease:
-    name: Build and Create Pre-release
-    runs-on: ubuntu-latest
+  # ===============================================
+  # 任务1: 构建可执行文件 (在多个操作系统上并行)
+  # ===============================================
+  build:
+    name: Build on ${{ matrix.os }}
+    # 使用矩阵策略，为下面列表中的每个操作系统启动一个独立的任务
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform_id: 'linux'
+            asset_name: fofa-linux
+            asset_path: dist/fofa
+          - os: windows-latest
+            platform_id: 'windows'
+            asset_name: fofa-windows.exe
+            asset_path: dist/fofa.exe
+          - os: macos-latest
+            platform_id: 'macos'
+            asset_name: fofa-macos
+            asset_path: dist/fofa
+
+    # 条件判断：仅在满足条件时运行
+    # 条件1：是自动推送触发的 (github.event_name == 'push')
+    # 条件2：是手动触发，并且选择了 "all"
+    # 条件3：是手动触发，并且选择的平台ID与当前矩阵任务的平台ID匹配
+    if: |
+      github.event_name == 'push' ||
+      github.event.inputs.platforms == 'all' ||
+      github.event.inputs.platforms == matrix.platform_id
+    
+    # 在矩阵指定的操作系统上运行
+    runs-on: ${{ matrix.os }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,38 +71,58 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Install dependencies and PyInstaller
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build executable
-        run: pyinstaller --name fofa-bot --onefile --clean fofa.py
+      - name: Build with PyInstaller
+        # 使用更新后的脚本名 fofa.py 和新的输出名 fofa
+        run: pyinstaller --name fofa --onefile --clean fofa.py
       
-      # 关键步骤：动态生成唯一的标签名
-      - name: Generate unique tag name
-        # 这个步骤会生成一个类似 "nightly-20251007-a1b2c3d" 的字符串
-        # 并将其保存到一个名为 TAG_NAME 的环境变量中，供后续步骤使用
-        run: |
-          echo "TAG_NAME=nightly-$(date +'%Y%m%d')-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_ENV
+      - name: Upload artifact
+        # 将编译好的单个文件作为产物上传，供下一个任务使用
+        uses: actions/upload-artifact@v4
+        with:
+          # 使用矩阵中定义的名字，确保每个产物名称唯一
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_path }}
 
-      - name: Create a new Pre-release
+  # ===============================================
+  # 任务2: 创建 Release (在所有构建成功后)
+  # ===============================================
+  create-release:
+    name: Create GitHub Release
+    # 依赖于 build 任务，必须等所有平台的 build 都成功完成后才开始
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        # 将上一个任务上传的所有产物下载到 'dist' 目录
+        # 这会创建类似 dist/fofa-linux/fofa, dist/fofa-windows.exe/fofa.exe 的结构
+        with:
+          path: dist
+
+      - name: Generate unique tag name
+        id: generate_tag
+        run: |
+          echo "tag=dev-$(date +'%Y%m%d')-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Create new Pre-release
         uses: softprops/action-gh-release@v2
         with:
-          # 使用我们上一步生成的唯一标签名
-          tag_name: ${{ env.TAG_NAME }}
-          # 发布版的标题也使用这个标签名，清晰明了
-          name: "Dev Build ${{ env.TAG_NAME }}"
+          tag_name: ${{ steps.generate_tag.outputs.tag }}
+          name: "Dev Build ${{ steps.generate_tag.outputs.tag }}"
           body: |
-            This is an automated build from the `main` branch.
-            **Warning:** This is a development build and may be unstable.
-
-            *   **Commit:** `${{ github.sha }}`
-            *   **See details:** `${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}`
-          # 将编译好的文件附加到这个新的 Release
-          files: dist/fofa-bot
-          # 关键！将这个版本标记为 "Pre-release"
+            This is an automated cross-platform build from the `main` branch.
+            - **Commit:** `${{ github.sha }}`
+            - **See details:** `${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}`
+          # 使用通配符上传所有在 dist 目录下找到的可执行文件
+          files: dist/*/*
+          # 标记为预发布版
           prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
