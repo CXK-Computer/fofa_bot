@@ -32,7 +32,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build executable
-        run: pyinstaller --name fofa-bot --onefile --clean fofa_bot.py
+        run: pyinstaller --name fofa-bot --onefile --clean fofa.py
       
       # 关键步骤：动态生成唯一的标签名
       - name: Generate unique tag name
