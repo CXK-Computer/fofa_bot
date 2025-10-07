@@ -1,4 +1,3 @@
-#
 # fofa_final_complete_v8.7.py (最终完整版 for python-telegram-bot v13.x)
 #
 # 核心修改 (v8.7): 1. 重构/batchfind的查询建议逻辑，废弃旧的50%阈值算法。
@@ -1226,3 +1225,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
