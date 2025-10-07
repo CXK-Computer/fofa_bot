@@ -1,0 +1,62 @@
+name: Continuous Development Build
+
+on:
+  push:
+    branches: [ "main" ]
+    # 只有脚本或依赖文件被修改时才触发
+    paths:
+      - 'fofa.py'
+      - 'requirements.txt'
+
+# 创建 Release 所需的权限
+permissions:
+  contents: write
+
+jobs:
+  build-and-create-prerelease:
+    name: Build and Create Pre-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --name fofa-bot --onefile --clean fofa_bot.py
+      
+      # 关键步骤：动态生成唯一的标签名
+      - name: Generate unique tag name
+        # 这个步骤会生成一个类似 "nightly-20251007-a1b2c3d" 的字符串
+        # 并将其保存到一个名为 TAG_NAME 的环境变量中，供后续步骤使用
+        run: |
+          echo "TAG_NAME=nightly-$(date +'%Y%m%d')-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_ENV
+
+      - name: Create a new Pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          # 使用我们上一步生成的唯一标签名
+          tag_name: ${{ env.TAG_NAME }}
+          # 发布版的标题也使用这个标签名，清晰明了
+          name: "Dev Build ${{ env.TAG_NAME }}"
+          body: |
+            This is an automated build from the `main` branch.
+            **Warning:** This is a development build and may be unstable.
+
+            *   **Commit:** `${{ github.sha }}`
+            *   **See details:** `${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}`
+          # 将编译好的文件附加到这个新的 Release
+          files: dist/fofa-bot
+          # 关键！将这个版本标记为 "Pre-release"
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
