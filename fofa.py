@@ -1284,6 +1284,7 @@ def cancel(update: Update, context: CallbackContext):
 
 # --- 主函数与调度器 ---
 def main() -> None:
+    global CONFIG
     os.makedirs(FOFA_CACHE_DIR, exist_ok=True)
     if not os.path.exists(CONFIG_FILE) or CONFIG.get("bot_token") == "YOUR_BOT_TOKEN_HERE":
         print("--- 首次运行或配置不完整，进入交互式设置 ---")
@@ -1292,7 +1293,7 @@ def main() -> None:
         if not bot_token or not admin_id.isdigit():
             print("错误：Bot Token 和 Admin ID 不能为空且ID必须是数字。请重新运行脚本。")
             sys.exit(1)
-        global CONFIG
+        
         CONFIG["bot_token"] = bot_token
         CONFIG["admins"] = [int(admin_id)]
         fofa_keys = []
@@ -1394,3 +1395,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
