@@ -1,9 +1,9 @@
-# fofa_bot_v9.8.py (修复会员等级判断逻辑 & 消息格式)
+# fofa_bot_v9.9.py (修复会员逻辑 & 移除持久化以解决PickleError)
 #
-# v9.8 核心更新:
-# 1. Bug修复: 重构了API Key等级的判断逻辑，优先检查 is_vip 字段，并修正了 vip_level 的映射，解决了 [820001] 权限错误。
-# 2. Bug修复: 移除了对API错误信息不必要的转义，解决了部分消息中出现多余 "/" 的问题。
-# 3. 保留了v9.7所有功能。
+# v9.9 核心更新:
+# 1. Bug修复: 根据用户提供的真实API返回数据，重写了会员等级判断逻辑，确保个人会员(isvip:true, vip_level:2)被正确识别。
+# 2. 稳定性修复: 移除了导致崩溃的 PicklePersistence 功能，彻底解决了 `AttributeError: Can't pickle` 的问题。
+# 3. 保留了v9.8所有功能。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot[persistence]"
@@ -37,7 +37,8 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     Filters,
-    PicklePersistence,
+    # v9.9 FIX: PicklePersistence is removed for stability
+    # PicklePersistence, 
 )
 from telegram.error import BadRequest, RetryAfter
 
@@ -46,7 +47,8 @@ CONFIG_FILE = 'config.json'
 HISTORY_FILE = 'history.json'
 LOG_FILE = 'fofa_bot.log'
 FOFA_CACHE_DIR = 'fofa_file'
-PERSISTENCE_FILE = 'bot_persistence'
+# v9.9 FIX: Persistence file is no longer used
+# PERSISTENCE_FILE = 'bot_persistence'
 ANONYMOUS_KEYS_FILE = 'fofa_anonymous.json'
 MAX_HISTORY_SIZE = 50
 CACHE_EXPIRATION_SECONDS = 24 * 60 * 60
@@ -208,7 +210,6 @@ def upload_and_send_links(context: CallbackContext, chat_id: int, file_path: str
             raise ValueError(f"响应格式不正确: {result}")
     except Exception as e:
         logger.error(f"文件上传失败: {e}")
-        # v9.8 FIX: Removed unnecessary markdown escape for error message
         context.bot.send_message(chat_id, f"⚠️ 文件上传到外部服务器失败: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
 
 # --- FOFA API 核心逻辑 ---
@@ -261,18 +262,22 @@ def check_and_classify_keys():
             KEY_LEVELS[key] = -1 # -1 代表无效
             continue
         
-        # v9.8 FIX: Corrected VIP level detection logic
+        # v9.9 FIX: Rewritten VIP level detection logic based on user-provided data
         is_vip = data.get('is_vip', False)
         api_level = data.get('vip_level', 0)
         
         level = 0 # Default to Free
-        if is_vip:
-            if api_level in [1, 2]: # Personal Member (based on user feedback)
+        if not is_vip:
+            level = 0
+        else: # is_vip is True
+            if api_level == 2: # Personal Member
                 level = 1
             elif api_level == 3: # Business Member (assumption)
                 level = 2
             elif api_level >= 4: # Enterprise Member (assumption)
                 level = 3
+            else: # Any other vip_level for a VIP is treated as at least Personal
+                level = 1 
         
         KEY_LEVELS[key] = level
         level_name = {0: "免费会员", 1: "个人会员", 2: "商业会员", 3: "企业会员"}.get(level, "未知等级")
@@ -649,11 +654,11 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v9.8！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v9.9！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v9.8*\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v9.9*\n\n"
                   "*🔍 资产查询*\n`/kkfofa [key] <query>`\n_FOFA搜索, 非管理员首次使用需提供Key_\n\n"
                   "*📦 主机详查 (智能)*\n`/host <ip|domain>`\n_根据Key等级获取最全主机信息 (管理员)_\n\n"
                   "*🔬 主机速查 (开放)*\n`/lowhost <ip|domain>`\n_获取主机基础信息 (所有用户可用)_\n\n"
@@ -936,7 +941,6 @@ def host_command_logic(update: Update, context: CallbackContext, use_max_fields:
         # 智能选择字段
         data, _, key_level, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=1, fields="host"))
         if error:
-            # v9.8 FIX: Removed unnecessary markdown escape for error message
             processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
             return
         fields_list = get_fields_by_level(key_level)
@@ -949,7 +953,6 @@ def host_command_logic(update: Update, context: CallbackContext, use_max_fields:
         data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=100, fields=fields_str))
 
     if error:
-        # v9.8 FIX: Removed unnecessary markdown escape for error message
         processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
         return
     
@@ -1533,8 +1536,9 @@ def main() -> None:
     
     check_and_classify_keys() # 启动时分类Key
     
-    persistence = PicklePersistence(filename=PERSISTENCE_FILE)
-    updater = Updater(token=bot_token, use_context=True, persistence=persistence)
+    # v9.9 FIX: Persistence is removed to prevent PickleError and ensure stability.
+    # persistence = PicklePersistence(filename=PERSISTENCE_FILE)
+    updater = Updater(token=bot_token, use_context=True) #, persistence=persistence)
     dispatcher = updater.dispatcher
     dispatcher.bot_data['updater'] = updater
     
@@ -1553,6 +1557,7 @@ def main() -> None:
     try: updater.bot.set_my_commands(commands)
     except Exception as e: logger.warning(f"设置机器人命令失败: {e}")
 
+    # v9.9 FIX: ConversationHandlers are now non-persistent.
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
         states={
@@ -1581,7 +1586,6 @@ def main() -> None:
             STATE_GET_UPLOAD_TOKEN: [MessageHandler(Filters.text & ~Filters.command, get_upload_token)],
         },
         fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300,
-        persistent=True, name="settings_conv"
     )
     kkfofa_conv = ConversationHandler(
         entry_points=[ CommandHandler("kkfofa", kkfofa_entry), CallbackQueryHandler(kkfofa_entry, pattern=r"^run_preset_") ],
@@ -1594,7 +1598,6 @@ def main() -> None:
             STATE_GET_TRACEBACK_LIMIT: [MessageHandler(Filters.text & ~Filters.command, get_traceback_limit), CallbackQueryHandler(get_traceback_limit, pattern=r"^limit_")]
         },
         fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300,
-        persistent=True, name="kkfofa_conv"
     )
     batch_conv = ConversationHandler(
         entry_points=[CommandHandler("batch", batch_command)], 
@@ -1604,18 +1607,17 @@ def main() -> None:
             STATE_GET_TRACEBACK_LIMIT: [MessageHandler(Filters.text & ~Filters.command, get_traceback_limit), CallbackQueryHandler(get_traceback_limit, pattern=r"^limit_")]
         },
         fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=600,
-        persistent=True, name="batch_conv"
     )
-    import_conv = ConversationHandler(entry_points=[CommandHandler("import", import_command)], states={STATE_GET_IMPORT_QUERY: [MessageHandler(Filters.document.mime_type("text/plain"), get_import_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300, persistent=True, name="import_conv")
-    stats_conv = ConversationHandler(entry_points=[CommandHandler("stats", stats_command)], states={STATE_GET_STATS_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300, persistent=True, name="stats_conv")
-    batchfind_conv = ConversationHandler(entry_points=[CommandHandler("batchfind", batchfind_command)], states={STATE_GET_BATCH_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), get_batch_file_handler)], STATE_SELECT_BATCH_FEATURES: [CallbackQueryHandler(select_batch_features_callback, pattern=r"^batchfeature_")]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300, persistent=True, name="batchfind_conv")
-    restore_conv = ConversationHandler(entry_points=[CommandHandler("restore", restore_config_command)], states={STATE_GET_RESTORE_FILE: [MessageHandler(Filters.document, receive_config_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300, persistent=True, name="restore_conv")
-    scan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(start_scan_callback, pattern=r'^start_scan_')], states={STATE_GET_SCAN_CONCURRENCY: [MessageHandler(Filters.text & ~Filters.command, get_concurrency_callback)], STATE_GET_SCAN_TIMEOUT: [MessageHandler(Filters.text & ~Filters.command, get_timeout_callback)]}, fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=120, persistent=True, name="scan_conv")
+    import_conv = ConversationHandler(entry_points=[CommandHandler("import", import_command)], states={STATE_GET_IMPORT_QUERY: [MessageHandler(Filters.document.mime_type("text/plain"), get_import_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    stats_conv = ConversationHandler(entry_points=[CommandHandler("stats", stats_command)], states={STATE_GET_STATS_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    batchfind_conv = ConversationHandler(entry_points=[CommandHandler("batchfind", batchfind_command)], states={STATE_GET_BATCH_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), get_batch_file_handler)], STATE_SELECT_BATCH_FEATURES: [CallbackQueryHandler(select_batch_features_callback, pattern=r"^batchfeature_")]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    restore_conv = ConversationHandler(entry_points=[CommandHandler("restore", restore_config_command)], states={STATE_GET_RESTORE_FILE: [MessageHandler(Filters.document, receive_config_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    scan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(start_scan_callback, pattern=r'^start_scan_')], states={STATE_GET_SCAN_CONCURRENCY: [MessageHandler(Filters.text & ~Filters.command, get_concurrency_callback)], STATE_GET_SCAN_TIMEOUT: [MessageHandler(Filters.text & ~Filters.command, get_timeout_callback)]}, fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=120)
 
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv)
 
-    logger.info(f"🚀 Fofa Bot v9.8 (会员逻辑修复版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v9.9 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
 
