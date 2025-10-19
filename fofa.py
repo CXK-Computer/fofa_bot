@@ -1,9 +1,8 @@
-# fofa_bot_v9.4.py (修复/host命令崩溃并增加持久化)
+# fofa_bot_v9.5.py (修复重启/更新功能)
 #
-# v9.4 核心更新:
-# 1. Bug修复: 完全重构了 /host 命令的数据处理逻辑，修复了因API返回列表而非字典导致的 AttributeError 崩溃问题。
-# 2. 功能增强: 引入了 PicklePersistence 持久化功能。现在机器人的任务状态（包括扫描任务）可以在重启后恢复，彻底解决了“任务已过期”的问题。
-# 3. 保留了v9.3所有功能：UI化配置上传接口、高性能异步子网扫描等。
+# v9.5 核心更新:
+# 1. Bug修复: 修正了 /shutdown 和 /update 命令中获取 updater 对象的方式，彻底解决了 'Dispatcher' object has no attribute 'updater' 的崩溃问题。
+# 2. 保留了v9.4所有功能：修复了 /host 命令的崩溃问题，并引入了持久化功能以解决“任务已过期”的问题。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot[persistence]"
@@ -563,11 +562,11 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v9.4！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v9.5！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v9.4*\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v9.5*\n\n"
                   "*🔍 资产查询*\n`/kkfofa [key] <query>`\n_FOFA搜索, 不带参数则显示预设菜单_\n\n"
                   "*📦 主机详查*\n`/host <ip|domain>`\n_获取单个主机的详细聚合信息_\n\n"
                   "*📊 聚合统计*\n`/stats <query>`\n_获取全局聚合统计_\n\n"
@@ -752,7 +751,7 @@ def batch_command(update: Update, context: CallbackContext):
         keyboard = [[InlineKeyboardButton("💎 导出前1万条", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯导出", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
         msg.edit_text(f"{success_message}\n请选择导出模式:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_KKFOFA_MODE
 
-# --- /host 命令 (v9.4 修复版) ---
+# --- /host 命令 (v9.5 修复版) ---
 def _create_dict_from_fofa_result(result_list, fields_list):
     """辅助函数，将FOFA返回的列表和字段名列表转换为字典"""
     return {fields_list[i]: result_list[i] for i in range(len(fields_list))}
@@ -766,7 +765,6 @@ def get_common_host_info(results, fields_list):
         "ASN": f"{first_entry.get('asn', 'N/A')} ({first_entry.get('org', 'N/A')})",
         "操作系统": first_entry.get('os', 'N/A'),
     }
-    # 提取所有端口
     port_index = fields_list.index('port') if 'port' in fields_list else -1
     if port_index != -1:
         all_ports = sorted(list(set(res[port_index] for res in results if len(res) > port_index)))
@@ -778,7 +776,6 @@ def create_host_summary(host_arg, results, fields_list):
     summary = [f"📌 *主机概览: `{host_arg}`*"]
     for key, value in info.items():
         if value and value != 'N/A':
-            # 对列表进行特殊处理
             if isinstance(value, list):
                 summary.append(f"*{key}:* `{', '.join(map(str, value))}`")
             else:
@@ -792,7 +789,7 @@ def format_full_host_report(host_arg, results, fields_list):
     for key, value in info.items():
         if value and value != 'N/A':
             if isinstance(value, list):
-                summary.append(f"*{key}:* `{', '.join(map(str, value))}`")
+                report.append(f"*{key}:* `{', '.join(map(str, value))}`")
             else:
                 report.append(f"*{key}:* `{value}`")
 
@@ -805,14 +802,13 @@ def format_full_host_report(host_arg, results, fields_list):
         if d.get('icp'): port_info.append(f"  - *ICP:* `{d.get('icp')}`")
         if d.get('jarm'): port_info.append(f"  - *JARM:* `{d.get('jarm')}`")
         
-        # FOFA API返回的cert是字符串，需要手动解析
         cert_str = d.get('cert', '{}')
         try:
             cert_info = json.loads(cert_str) if isinstance(cert_str, str) and cert_str.startswith('{') else {}
             if cert_info.get('issuer', {}).get('CN'): port_info.append(f"  - *证书颁发者:* `{cert_info['issuer']['CN']}`")
             if cert_info.get('subject', {}).get('CN'): port_info.append(f"  - *证书使用者:* `{cert_info['subject']['CN']}`")
         except json.JSONDecodeError:
-            pass # 忽略无法解析的证书信息
+            pass
 
         if d.get('header'): port_info.append(f"  - *Header:* ```\n{d.get('header')}\n```")
         if d.get('banner'): port_info.append(f"  - *Banner:* ```\n{d.get('banner')}\n```")
@@ -845,12 +841,11 @@ def host_command(update: Update, context: CallbackContext):
 
     full_report = format_full_host_report(host_arg, results, fields_list)
     
-    if len(full_report) > 3800:  # Telegram message limit is 4096, leave some buffer
+    if len(full_report) > 3800:
         summary_report = create_host_summary(host_arg, results, fields_list)
         processing_message.edit_text(summary_report, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
         report_filename = f"host_details_{host_arg.replace('.', '_')}.txt"
         try:
-            # 移除Markdown标记以便于阅读
             plain_text_report = re.sub(r'([*_`\[\]])', '', full_report)
             with open(report_filename, 'w', encoding='utf-8') as f:
                 f.write(plain_text_report)
@@ -1068,9 +1063,17 @@ def shutdown_command(update: Update, context: CallbackContext, restart=False):
     message = "🤖 机器人正在重启..." if restart else "🤖 机器人正在关闭..."
     update.message.reply_text(message)
     logger.info(f"Shutdown/Restart initiated by user {update.effective_user.id}")
+    
+    # v9.5 FIX: Correctly get the updater object
+    updater = context.bot_data.get('updater')
+    if not updater:
+        logger.error("Could not find updater object in bot_data for shutdown!")
+        update.message.reply_text("❌ 内部错误: 无法找到核心组件，无法关闭。")
+        return
+
     context.job_queue.stop()
-    updater = context.dispatcher.updater
     updater.stop()
+    
     if restart:
         try:
             os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -1296,11 +1299,14 @@ def main() -> None:
     bot_token = CONFIG.get("bot_token")
     if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE": logger.critical("错误: 'bot_token' 未在 config.json 中设置!"); return
     
-    # 创建持久化对象
     persistence = PicklePersistence(filename=PERSISTENCE_FILE)
     
     updater = Updater(token=bot_token, use_context=True, persistence=persistence)
     dispatcher = updater.dispatcher
+    
+    # v9.5 FIX: Store the updater object in bot_data for later access
+    dispatcher.bot_data['updater'] = updater
+    
     commands = [
         BotCommand("start", "🚀 启动机器人"), BotCommand("help", "❓ 命令手册"),
         BotCommand("kkfofa", "🔍 资产搜索/预设"), BotCommand("host", "📦 主机详查"),
@@ -1369,7 +1375,7 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv)
 
-    logger.info(f"🚀 Fofa Bot v9.4 (持久化修复版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v9.5 (持久化修复版) 已启动...")
     updater.start_polling()
     updater.idle()
 
