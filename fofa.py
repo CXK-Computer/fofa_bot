@@ -82,7 +82,7 @@ if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > (5 * 1024 * 1024):
     try: os.rename(LOG_FILE, LOG_FILE + '.old')
     except OSError as e: print(f"无法轮换日志文件: {e}")
 logging.basicConfig(
-    level=logging.INFO, format='%(asctime_s)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8'), logging.StreamHandler()]
 )
 logging.getLogger("requests").setLevel(logging.WARNING); logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -1610,3 +1610,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
