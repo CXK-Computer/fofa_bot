@@ -1,12 +1,9 @@
-# fofa_bot_v9.6.py (智能密钥管理、交互式Batch、访客模式)
+# fofa_bot_v9.8.py (修复会员等级判断逻辑 & 消息格式)
 #
-# v9.6 核心更新:
-# 1. 新功能: 智能密钥管理。启动时通过 /info/my 接口自动识别Key的会员等级 (免费/个人/商业/企业)。
-# 2. 功能增强: /host 和 /batch 命令现在会根据使用的Key等级，自动请求最高权限的字段集。
-# 3. 功能重构: /batch 命令完全重构为交互式菜单，支持按会员等级分类、翻页选择字段，极大提升易用性。
-# 4. 新命令: 增加 /lowhost 命令，作为 /host 的轻量版，仅查询免费字段，且对所有用户开放。
-# 5. 新功能: 为非管理员用户增加访客模式。首次使用 /kkfofa 需提供自己的API Key，机器人会加密保存并后续自动使用。
-# 6. 保留了v9.5所有功能：修复了重启/更新的bug，持久化等。
+# v9.8 核心更新:
+# 1. Bug修复: 重构了API Key等级的判断逻辑，优先检查 is_vip 字段，并修正了 vip_level 的映射，解决了 [820001] 权限错误。
+# 2. Bug修复: 移除了对API错误信息不必要的转义，解决了部分消息中出现多余 "/" 的问题。
+# 3. 保留了v9.7所有功能。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot[persistence]"
@@ -211,7 +208,8 @@ def upload_and_send_links(context: CallbackContext, chat_id: int, file_path: str
             raise ValueError(f"响应格式不正确: {result}")
     except Exception as e:
         logger.error(f"文件上传失败: {e}")
-        context.bot.send_message(chat_id, f"⚠️ 文件上传到外部服务器失败: `{escape_markdown(str(e))}`", parse_mode=ParseMode.MARKDOWN)
+        # v9.8 FIX: Removed unnecessary markdown escape for error message
+        context.bot.send_message(chat_id, f"⚠️ 文件上传到外部服务器失败: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
 
 # --- FOFA API 核心逻辑 ---
 def _make_api_request(url, params, timeout=60, use_b64=True, retries=10):
@@ -262,9 +260,20 @@ def check_and_classify_keys():
             logger.warning(f"Key '...{key[-4:]}' 无效: {error}")
             KEY_LEVELS[key] = -1 # -1 代表无效
             continue
-        level = data.get('vip_level', 0)
-        is_vip = data.get('isvip', False)
-        if not is_vip: level = 0 # 确保免费用户等级为0
+        
+        # v9.8 FIX: Corrected VIP level detection logic
+        is_vip = data.get('is_vip', False)
+        api_level = data.get('vip_level', 0)
+        
+        level = 0 # Default to Free
+        if is_vip:
+            if api_level in [1, 2]: # Personal Member (based on user feedback)
+                level = 1
+            elif api_level == 3: # Business Member (assumption)
+                level = 2
+            elif api_level >= 4: # Enterprise Member (assumption)
+                level = 3
+        
         KEY_LEVELS[key] = level
         level_name = {0: "免费会员", 1: "个人会员", 2: "商业会员", 3: "企业会员"}.get(level, "未知等级")
         logger.info(f"Key '...{key[-4:]}' ({data.get('username', 'N/A')}) - 等级: {level} ({level_name})")
@@ -640,11 +649,11 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v9.6！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v9.8！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v9.6*\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v9.8*\n\n"
                   "*🔍 资产查询*\n`/kkfofa [key] <query>`\n_FOFA搜索, 非管理员首次使用需提供Key_\n\n"
                   "*📦 主机详查 (智能)*\n`/host <ip|domain>`\n_根据Key等级获取最全主机信息 (管理员)_\n\n"
                   "*🔬 主机速查 (开放)*\n`/lowhost <ip|domain>`\n_获取主机基础信息 (所有用户可用)_\n\n"
@@ -927,7 +936,8 @@ def host_command_logic(update: Update, context: CallbackContext, use_max_fields:
         # 智能选择字段
         data, _, key_level, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=1, fields="host"))
         if error:
-            processing_message.edit_text(f"查询失败 😞\n*原因:* `{escape_markdown(error)}`", parse_mode=ParseMode.MARKDOWN)
+            # v9.8 FIX: Removed unnecessary markdown escape for error message
+            processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
             return
         fields_list = get_fields_by_level(key_level)
         fields_str = ",".join(fields_list)
@@ -939,7 +949,8 @@ def host_command_logic(update: Update, context: CallbackContext, use_max_fields:
         data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=100, fields=fields_str))
 
     if error:
-        processing_message.edit_text(f"查询失败 😞\n*原因:* `{escape_markdown(error)}`", parse_mode=ParseMode.MARKDOWN)
+        # v9.8 FIX: Removed unnecessary markdown escape for error message
+        processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
         return
     
     results = data.get('results', [])
@@ -1604,10 +1615,9 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv)
 
-    logger.info(f"🚀 Fofa Bot v9.6 (智能密钥/访客模式版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v9.8 (会员逻辑修复版) 已启动...")
     updater.start_polling()
     updater.idle()
 
 if __name__ == "__main__":
     main()
-
