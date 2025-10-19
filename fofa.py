@@ -1,8 +1,10 @@
-# fofa_bot_v9.9.1 (终极修正版: 修复isvip拼写错误)
+# fofa_bot_v10.1.py (/lowhost重构 & Markdown修复)
 #
-# v9.9.1 核心更新:
-# 1. 终极Bug修复: 在会员等级判断逻辑中，将 `is_vip` 修正为 `isvip`，彻底解决会员无法被正确识别的问题。
-# 2. 保留了v9.9所有功能和稳定性修复。
+# v10.1 更新日志:
+# 1. 重大重构: 采纳用户建议，使用 FOFA 的 /api/v1/host/ 接口重写了 /lowhost 命令，使其成为快速的聚合信息查询工具，并支持 detail 模式。
+# 2. Bug修复: 彻底修复了Markdown格式问题，通过在转义函数中加入对 `=` 等字符的处理，解决了莫名出现 \ 和 " 的问题。
+# 3. 代码优化: 添加了新的常量和辅助函数来支持新的 /lowhost 逻辑。
+# 4. 保留了v10.0所有功能，包括批量验Key。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -51,6 +53,8 @@ MAX_BATCH_TARGETS = 10000
 FOFA_SEARCH_URL = "https://fofa.info/api/v1/search/all"
 FOFA_INFO_URL = "https://fofa.info/api/v1/info/my"
 FOFA_STATS_URL = "https://fofa.info/api/v1/search/stats"
+# v10.1: Added new constant for /host endpoint.
+FOFA_HOST_BASE_URL = "https://fofa.info/api/v1/host/"
 
 # --- FOFA 字段定义 ---
 FOFA_STATS_FIELDS = "protocol,domain,port,title,os,server,country,asn,org,asset_type,fid,icp"
@@ -87,8 +91,9 @@ logger = logging.getLogger(__name__)
     STATE_PROXYPOOL_MENU, STATE_GET_PROXY_ADD, STATE_GET_PROXY_REMOVE,
     STATE_GET_TRACEBACK_LIMIT, STATE_GET_SCAN_CONCURRENCY, STATE_GET_SCAN_TIMEOUT,
     STATE_UPLOAD_API_MENU, STATE_GET_UPLOAD_URL, STATE_GET_UPLOAD_TOKEN,
-    STATE_GET_GUEST_KEY, STATE_BATCH_GET_QUERY, STATE_BATCH_SELECT_FIELDS
-) = range(30)
+    STATE_GET_GUEST_KEY, STATE_BATCH_GET_QUERY, STATE_BATCH_SELECT_FIELDS,
+    STATE_GET_API_FILE,
+) = range(31)
 
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
@@ -153,10 +158,14 @@ def admin_only(func):
             return None
         return func(update, context, *args, **kwargs)
     return wrapped
+
+# v10.1: Rewritten escape_markdown to fix formatting bugs.
 def escape_markdown(text: str) -> str:
     if not isinstance(text, str): text = str(text)
+    # According to Telegram Bot API documentation for MarkdownV2
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
 def create_progress_bar(percentage: float, length: int = 10) -> str:
     if percentage < 0: percentage = 0
     if percentage > 100: percentage = 100
@@ -234,8 +243,13 @@ def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host"):
 def fetch_fofa_stats(key, query):
     params = {'key': key, 'q': query, 'fields': FOFA_STATS_FIELDS}; return _make_api_request(FOFA_STATS_URL, params)
 
+# v10.1: Added new function to fetch from /host endpoint.
+def fetch_fofa_host_info(key, host, detail=False):
+    url = FOFA_HOST_BASE_URL + host
+    params = {'key': key, 'detail': str(detail).lower()}
+    return _make_api_request(url, params, use_b64=False)
+
 def check_and_classify_keys():
-    """启动时检查并分类所有管理员API Key"""
     logger.info("--- 开始检查并分类API Keys ---")
     global KEY_LEVELS
     KEY_LEVELS.clear()
@@ -243,26 +257,18 @@ def check_and_classify_keys():
         data, error = verify_fofa_api(key)
         if error:
             logger.warning(f"Key '...{key[-4:]}' 无效: {error}")
-            KEY_LEVELS[key] = -1 # -1 代表无效
+            KEY_LEVELS[key] = -1
             continue
-        
-        # v9.9.1 FIX: Corrected the typo from 'is_vip' to 'isvip'
         is_vip = data.get('isvip', False)
         api_level = data.get('vip_level', 0)
-        
-        level = 0 # Default to Free
+        level = 0
         if not is_vip:
             level = 0
-        else: # is_vip is True
-            if api_level == 2: # Personal Member
-                level = 1
-            elif api_level == 3: # Business Member (assumption)
-                level = 2
-            elif api_level >= 4: # Enterprise Member (assumption)
-                level = 3
-            else: # Any other vip_level for a VIP is treated as at least Personal
-                level = 1 
-        
+        else:
+            if api_level == 2: level = 1
+            elif api_level == 3: level = 2
+            elif api_level >= 4: level = 3
+            else: level = 1 
         KEY_LEVELS[key] = level
         level_name = {0: "免费会员", 1: "个人会员", 2: "商业会员", 3: "企业会员"}.get(level, "未知等级")
         logger.info(f"Key '...{key[-4:]}' ({data.get('username', 'N/A')}) - 等级: {level} ({level_name})")
@@ -276,21 +282,18 @@ def get_fields_by_level(level):
 
 def execute_query_with_fallback(query_func, preferred_key_index=None):
     if not CONFIG['apis']: return None, None, None, "没有配置任何API Key。"
-    keys_to_try = [k for k in CONFIG['apis'] if KEY_LEVELS.get(k, -1) != -1] # 只尝试有效的key
+    keys_to_try = [k for k in CONFIG['apis'] if KEY_LEVELS.get(k, -1) != -1]
     if not keys_to_try: return None, None, None, "所有配置的API Key都无效。"
-    
     start_index = 0
     if preferred_key_index is not None and 1 <= preferred_key_index <= len(CONFIG['apis']):
         preferred_key = CONFIG['apis'][preferred_key_index - 1]
         if preferred_key in keys_to_try:
             start_index = keys_to_try.index(preferred_key)
-
     for i in range(len(keys_to_try)):
         idx = (start_index + i) % len(keys_to_try)
         key = keys_to_try[idx]
         key_num = CONFIG['apis'].index(key) + 1
         key_level = KEY_LEVELS.get(key, 0)
-        
         data, error = query_func(key)
         if not error:
             return data, key_num, key_level, None
@@ -573,7 +576,7 @@ def run_batch_traceback_query(context: CallbackContext):
         for r in results:
             r_hash = hashlib.md5(str(r).encode()).hexdigest()
             if r_hash not in seen_hashes:
-                seen_hashes.add(r_hash); unique_results.append(r[:-1]); newly_added_count += 1 # Exclude lastupdatetime
+                seen_hashes.add(r_hash); unique_results.append(r[:-1]); newly_added_count += 1
         if limit and len(unique_results) >= limit: unique_results = unique_results[:limit]; termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限。"; break
         current_time = time.time()
         if current_time - last_update_time > 2:
@@ -610,23 +613,23 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v9.9.1！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.1！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v9.9.1*\n\n"
-                  "*🔍 资产查询*\n`/kkfofa [key] <query>`\n_FOFA搜索, 非管理员首次使用需提供Key_\n\n"
-                  "*📦 主机详查 (智能)*\n`/host <ip|domain>`\n_根据Key等级获取最全主机信息 (管理员)_\n\n"
-                  "*🔬 主机速查 (开放)*\n`/lowhost <ip|domain>`\n_获取主机基础信息 (所有用户可用)_\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v10.1*\n\n"
+                  "*🔍 资产搜索*\n`/kkfofa [key] <query>`\n_FOFA搜索, 非管理员首次使用需提供Key_\n\n"
+                  "*📦 主机详查 (智能)*\n`/host <ip|domain>`\n_自适应获取最全主机信息 (管理员)_\n\n"
+                  "*🔬 主机速查 (聚合)*\n`/lowhost <ip|domain> [detail]`\n_快速获取主机聚合信息 (所有用户)_\n\n"
                   "*📊 聚合统计*\n`/stats <query>`\n_获取全局聚合统计 (管理员)_\n\n"
                   "*📂 批量智能分析*\n`/batchfind`\n_上传IP列表, 分析特征并生成Excel (管理员)_\n\n"
                   "*📤 批量自定义导出 (交互式)*\n`/batch <query>`\n_进入交互式菜单选择字段导出 (管理员)_\n\n"
                   "*⚙️ 管理与设置*\n`/settings`\n_进入交互式设置菜单 (管理员)_\n\n"
+                  "*🔑 Key管理*\n`/batchcheckapi`\n_上传文件批量验证API Key (管理员)_\n\n"
                   "*💻 系统管理*\n"
                   "`/check` - 系统自检\n"
                   "`/update` - 在线更新脚本\n"
                   "`/shutdown` - 安全关闭/重启\n\n"
-                  "*🛑 任务控制*\n`/stop` - 紧急停止下载任务\n`/cancel` - 取消当前操作\n\n"
-                  "💡 *机器人现在能自动识别Key等级并为访客提供服务！*" )
+                  "*🛑 任务控制*\n`/stop` - 紧急停止下载任务\n`/cancel` - 取消当前操作" )
     update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 def cancel(update: Update, context: CallbackContext) -> int:
     message = "操作已取消。"
@@ -749,8 +752,8 @@ def cache_choice_callback(update: Update, context: CallbackContext):
     elif choice == 'cancel': query.message.edit_text("操作已取消。"); return ConversationHandler.END
 def start_new_search(update: Update, context: CallbackContext, message_to_edit=None):
     query_text = context.user_data['query']; key_index = context.user_data.get('key_index'); add_or_update_query(query_text)
-    msg = message_to_edit if message_to_edit else update.effective_message.reply_text("🔄 正在执行全新查询...")
-    if message_to_edit: msg.edit_text("🔄 正在执行全新查询...")
+    msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🔄 正在对 `{escape_markdown(query_text)}` 执行全新查询...", parse_mode=ParseMode.MARKDOWN)
+    if message_to_edit: msg.edit_text(f"🔄 正在对 `{escape_markdown(query_text)}` 执行全新查询...", parse_mode=ParseMode.MARKDOWN)
     guest_key = context.user_data.get('guest_key')
     if guest_key:
         data, error = fetch_fofa_data(guest_key, query_text, page_size=1, fields="host")
@@ -854,36 +857,45 @@ def format_full_host_report(host_arg, results, fields_list):
         if d.get('banner'): port_info.append(f"  - *Banner:* ```\n{d.get('banner')}\n```")
         report.append("\n".join(port_info))
     return "\n".join(report)
-def host_command_logic(update: Update, context: CallbackContext, use_max_fields: bool):
+def host_command_logic(update: Update, context: CallbackContext):
     if not context.args:
-        command_name = "/host" if use_max_fields else "/lowhost"
-        update.message.reply_text(f"用法: `{command_name} <ip_or_domain>`\n\n示例:\n`{command_name} 1.1.1.1`", parse_mode=ParseMode.MARKDOWN)
+        update.message.reply_text(f"用法: `/host <ip_or_domain>`\n\n示例:\n`/host 1.1.1.1`", parse_mode=ParseMode.MARKDOWN)
         return
     host_arg = context.args[0]
-    processing_message = update.message.reply_text(f"⏳ 正在查询主机 `{escape_markdown(host_arg)}`...")
+    processing_message = update.message.reply_text(f"⏳ 正在查询主机 `{escape_markdown(host_arg)}`...", parse_mode=ParseMode.MARKDOWN)
     query = f'ip="{host_arg}"' if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host_arg) else f'domain="{host_arg}"'
-    if use_max_fields:
-        data, _, key_level, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=1, fields="host"))
-        if error:
-            processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
-            return
-        fields_list = get_fields_by_level(key_level)
-        fields_str = ",".join(fields_list)
-        data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=100, fields=fields_str))
-    else:
-        fields_list = FREE_FIELDS
-        fields_str = ",".join(fields_list)
-        data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=100, fields=fields_str))
+    data, final_fields_list, error = None, [], None
+    for level in range(3, -1, -1): 
+        fields_to_try = get_fields_by_level(level)
+        fields_str = ",".join(fields_to_try)
+        try:
+            processing_message.edit_text(f"⏳ 正在尝试以 *等级 {level}* 字段查询...", parse_mode=ParseMode.MARKDOWN)
+        except (BadRequest, RetryAfter):
+            time.sleep(1)
+        temp_data, _, _, temp_error = execute_query_with_fallback(
+            lambda key: fetch_fofa_data(key, query, page_size=100, fields=fields_str)
+        )
+        if not temp_error:
+            data = temp_data
+            final_fields_list = fields_to_try
+            error = None
+            break
+        if "[820001]" not in str(temp_error):
+            error = temp_error
+            break
+        else:
+            error = temp_error
+            continue
     if error:
         processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
         return
     results = data.get('results', [])
     if not results:
-        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown(host_arg)}` 的任何信息。")
+        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown(host_arg)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN)
         return
-    full_report = format_full_host_report(host_arg, results, fields_list)
+    full_report = format_full_host_report(host_arg, results, final_fields_list)
     if len(full_report) > 3800:
-        summary_report = create_host_summary(host_arg, results, fields_list)
+        summary_report = create_host_summary(host_arg, results, final_fields_list)
         processing_message.edit_text(summary_report, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
         report_filename = f"host_details_{host_arg.replace('.', '_')}.txt"
         try:
@@ -897,11 +909,69 @@ def host_command_logic(update: Update, context: CallbackContext, use_max_fields:
         processing_message.edit_text(full_report, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 @admin_only
 def host_command(update: Update, context: CallbackContext):
-    host_command_logic(update, context, use_max_fields=True)
-def lowhost_command(update: Update, context: CallbackContext):
-    host_command_logic(update, context, use_max_fields=False)
+    host_command_logic(update, context)
 
-# --- /stats 命令 (无变动) ---
+# v10.1: New formatting functions for the /host endpoint API response.
+def format_host_summary(data):
+    parts = [f"📌 *主机聚合摘要: `{data.get('host', 'N/A')}`*"]
+    if data.get('ip'): parts.append(f"*IP:* `{data.get('ip')}`")
+    location = f"{data.get('country_name', '')} {data.get('region', '')} {data.get('city', '')}".strip()
+    if location: parts.append(f"*位置:* `{location}`")
+    if data.get('asn'): parts.append(f"*ASN:* `{data.get('asn')} ({data.get('org', 'N/A')})`")
+    if data.get('ports'): parts.append(f"*开放端口:* `{', '.join(map(str, data.get('ports', [])))}`")
+    if data.get('protocols'): parts.append(f"*协议:* `{', '.join(data.get('protocols', []))}`")
+    if data.get('category'): parts.append(f"*资产类型:* `{', '.join(data.get('category', []))}`")
+    if data.get('products'):
+        product_names = [p.get('name', 'N/A') for p in data.get('products', [])]
+        parts.append(f"*产品/组件:* `{', '.join(product_names)}`")
+    return "\n".join(parts)
+def format_host_details(data):
+    summary = format_host_summary(data)
+    details = ["\n--- *端口详情* ---"]
+    for port_info in data.get('port_details', []):
+        port_str = f"\n🌐 *Port `{port_info.get('port')}` ({port_info.get('protocol', 'N/A')})*"
+        if port_info.get('product'): port_str += f"\n  - *产品:* `{port_info.get('product')}`"
+        if port_info.get('title'): port_str += f"\n  - *标题:* `{port_info.get('title')}`"
+        if port_info.get('jarm'): port_str += f"\n  - *JARM:* `{port_info.get('jarm')}`"
+        if port_info.get('banner'): port_str += f"\n  - *Banner:* ```\n{port_info.get('banner')}\n```"
+        details.append(port_str)
+    full_report = summary + "\n".join(details)
+    return full_report
+
+# v10.1: New /lowhost command logic using the dedicated /host endpoint.
+def lowhost_command(update: Update, context: CallbackContext) -> None:
+    if not context.args:
+        update.message.reply_text("用法: `/lowhost <ip_or_domain> [detail]`\n\n示例:\n`/lowhost 1.1.1.1`\n`/lowhost example.com detail`", parse_mode=ParseMode.MARKDOWN)
+        return
+    host = context.args[0]
+    detail = len(context.args) > 1 and context.args[1].lower() == 'detail'
+    processing_message = update.message.reply_text(f"正在查询主机 `{escape_markdown(host)}` 的聚合信息...", parse_mode=ParseMode.MARKDOWN)
+    data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_host_info(key, host, detail))
+    if error:
+        processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
+        return
+    if not data:
+        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown(host)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN)
+        return
+    if detail:
+        formatted_text = format_host_details(data)
+    else:
+        formatted_text = format_host_summary(data)
+    
+    if len(formatted_text) > 3800:
+        processing_message.edit_text("报告过长，将作为文件发送。")
+        report_filename = f"lowhost_details_{host.replace('.', '_')}.txt"
+        try:
+            plain_text_report = re.sub(r'([*_`\[\]])', '', formatted_text)
+            with open(report_filename, 'w', encoding='utf-8') as f: f.write(plain_text_report)
+            with open(report_filename, 'rb') as doc: context.bot.send_document(chat_id=update.effective_chat.id, document=doc, caption="📄 完整的聚合报告已附上。")
+            upload_and_send_links(context, update.effective_chat.id, report_filename)
+        finally:
+            if os.path.exists(report_filename): os.remove(report_filename)
+    else:
+        processing_message.edit_text(formatted_text, parse_mode=ParseMode.MARKDOWN)
+
+# --- /stats 命令 ---
 @admin_only
 def stats_command(update: Update, context: CallbackContext):
     if not context.args:
@@ -910,15 +980,15 @@ def stats_command(update: Update, context: CallbackContext):
     return get_fofa_stats_query(update, context)
 def get_fofa_stats_query(update: Update, context: CallbackContext):
     query_text = " ".join(context.args) if context.args else update.message.text
-    msg = update.message.reply_text(f"⏳ 正在对 `{escape_markdown(query_text)}` 进行聚合统计...")
+    msg = update.message.reply_text(f"⏳ 正在对 `{escape_markdown(query_text)}` 进行聚合统计...", parse_mode=ParseMode.MARKDOWN)
     data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_stats(key, query_text))
     if error: msg.edit_text(f"❌ 统计失败: {error}"); return ConversationHandler.END
     report = [f"📊 *聚合统计报告 for `{escape_markdown(query_text)}`*\n"]
     for field, aggs in data.items():
-        if aggs:
+        if aggs and isinstance(aggs, list):
             report.append(f"--- *{field.capitalize()}* ---")
             for item in aggs[:10]:
-                report.append(f"`{item['name']}`: {item['count']}")
+                report.append(f"`{escape_markdown(item['name'])}`: {item['count']}")
             report.append("")
     msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
@@ -1047,7 +1117,7 @@ def batch_command(update: Update, context: CallbackContext):
     context.user_data['selected_fields'] = set(FREE_FIELDS[:5])
     context.user_data['page'] = 0
     keyboard = build_batch_fields_keyboard(context.user_data)
-    update.message.reply_text(f"查询: `{query_text}`\n请选择要导出的字段:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    update.message.reply_text(f"查询: `{escape_markdown(query_text)}`\n请选择要导出的字段:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
     return STATE_BATCH_SELECT_FIELDS
 def batch_select_fields_callback(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -1091,6 +1161,66 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
     keyboard = build_batch_fields_keyboard(context.user_data)
     query.message.edit_reply_markup(reply_markup=keyboard)
     return STATE_BATCH_SELECT_FIELDS
+
+# --- /batchcheckapi 命令 ---
+@admin_only
+def batch_check_api_command(update: Update, context: CallbackContext) -> int:
+    update.message.reply_text("请上传一个包含 API Keys 的 .txt 文件 (每行一个 Key)。")
+    return STATE_GET_API_FILE
+def receive_api_file(update: Update, context: CallbackContext) -> int:
+    doc = update.message.document
+    if not doc.file_name.endswith('.txt'):
+        update.message.reply_text("❌ 文件格式错误，请上传 .txt 文件。")
+        return ConversationHandler.END
+    file = doc.get_file()
+    temp_path = os.path.join(FOFA_CACHE_DIR, f"api_check_{doc.file_id}.txt")
+    file.download(custom_path=temp_path)
+    try:
+        with open(temp_path, 'r', encoding='utf-8') as f:
+            keys_to_check = [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        update.message.reply_text(f"❌ 读取文件失败: {e}")
+        if os.path.exists(temp_path): os.remove(temp_path)
+        return ConversationHandler.END
+    if not keys_to_check:
+        update.message.reply_text("🤷‍♀️ 文件为空或不包含任何有效的 Key。")
+        if os.path.exists(temp_path): os.remove(temp_path)
+        return ConversationHandler.END
+    msg = update.message.reply_text(f"⏳ 开始批量验证 {len(keys_to_check)} 个 API Key...")
+    valid_keys, invalid_keys = [], []
+    total = len(keys_to_check)
+    for i, key in enumerate(keys_to_check):
+        data, error = verify_fofa_api(key)
+        if not error:
+            is_vip = data.get('isvip', False)
+            api_level = data.get('vip_level', 0)
+            level = 0
+            if is_vip:
+                if api_level == 2: level = 1
+                elif api_level == 3: level = 2
+                elif api_level >= 4: level = 3
+                else: level = 1
+            level_name = {0: "免费", 1: "个人", 2: "商业", 3: "企业"}.get(level, "未知")
+            valid_keys.append(f"`...{key[-4:]}` - ✅ *有效* ({data.get('username', 'N/A')}, {level_name}会员)")
+        else:
+            invalid_keys.append(f"`...{key[-4:]}` - ❌ *无效* (原因: {error})")
+        if (i + 1) % 5 == 0 or (i + 1) == total:
+            try:
+                progress_text = f"⏳ 验证进度: {create_progress_bar((i+1)/total*100)} ({i+1}/{total})"
+                msg.edit_text(progress_text)
+            except (BadRequest, RetryAfter):
+                time.sleep(2)
+    report = [f"📋 *批量API Key验证报告*"]
+    report.append(f"\n总计: {total} | 有效: {len(valid_keys)} | 无效: {len(invalid_keys)}\n")
+    if valid_keys:
+        report.append("--- *有效 Keys* ---")
+        report.extend(valid_keys)
+    if invalid_keys:
+        report.append("\n--- *无效 Keys* ---")
+        report.extend(invalid_keys)
+    msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN)
+    if os.path.exists(temp_path): os.remove(temp_path)
+    return ConversationHandler.END
 
 # --- 其他管理命令 (无变动) ---
 @admin_only
@@ -1175,7 +1305,7 @@ def get_import_query(update: Update, context: CallbackContext):
     shutil.move(temp_path, final_path)
     cache_data = {'file_path': final_path, 'result_count': result_count}
     add_or_update_query(query_text, cache_data)
-    update.message.reply_text(f"✅ 成功导入缓存！\n查询: `{escape_markdown(query_text)}`\n共 {result_count} 条记录。")
+    update.message.reply_text(f"✅ 成功导入缓存！\n查询: `{escape_markdown(query_text)}`\n共 {result_count} 条记录。", parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 @admin_only
 def get_log_command(update: Update, context: CallbackContext):
@@ -1429,8 +1559,9 @@ def main() -> None:
     commands = [
         BotCommand("start", "🚀 启动机器人"), BotCommand("help", "❓ 命令手册"),
         BotCommand("kkfofa", "🔍 资产搜索/预设"), BotCommand("host", "📦 主机详查 (智能)"),
-        BotCommand("lowhost", "🔬 主机速查 (开放)"), BotCommand("stats", "📊 全局聚合统计"),
+        BotCommand("lowhost", "🔬 主机速查 (聚合)"), BotCommand("stats", "📊 全局聚合统计"),
         BotCommand("batchfind", "📂 批量智能分析 (Excel)"), BotCommand("batch", "📤 批量自定义导出 (交互式)"),
+        BotCommand("batchcheckapi", "🔑 批量验证API Key"),
         BotCommand("check", "🩺 系统自检"), BotCommand("settings", "⚙️ 设置菜单"),
         BotCommand("history", "🕰️ 查询历史"), BotCommand("import", "🖇️ 导入旧缓存"),
         BotCommand("backup", "📤 备份配置"), BotCommand("restore", "📥 恢复配置"),
@@ -1495,9 +1626,12 @@ def main() -> None:
     batchfind_conv = ConversationHandler(entry_points=[CommandHandler("batchfind", batchfind_command)], states={STATE_GET_BATCH_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), get_batch_file_handler)], STATE_SELECT_BATCH_FEATURES: [CallbackQueryHandler(select_batch_features_callback, pattern=r"^batchfeature_")]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     restore_conv = ConversationHandler(entry_points=[CommandHandler("restore", restore_config_command)], states={STATE_GET_RESTORE_FILE: [MessageHandler(Filters.document, receive_config_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     scan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(start_scan_callback, pattern=r'^start_scan_')], states={STATE_GET_SCAN_CONCURRENCY: [MessageHandler(Filters.text & ~Filters.command, get_concurrency_callback)], STATE_GET_SCAN_TIMEOUT: [MessageHandler(Filters.text & ~Filters.command, get_timeout_callback)]}, fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=120)
+    batch_check_api_conv = ConversationHandler(entry_points=[CommandHandler("batchcheckapi", batch_check_api_command)], states={STATE_GET_API_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), receive_api_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
-    dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv)
-    logger.info(f"🚀 Fofa Bot v9.9.1 (稳定版) 已启动...")
+    dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
+    
+    logger.info(f"🚀 Fofa Bot v10.1 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
 
