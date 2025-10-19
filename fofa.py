@@ -1,10 +1,10 @@
-# fofa_bot_v10.1.py (/lowhost重构 & Markdown修复)
+# fofa_bot_v10.2.py (/host去重 & /lowhost修复 & /batchcheckapi修复)
 #
-# v10.1 更新日志:
-# 1. 重大重构: 采纳用户建议，使用 FOFA 的 /api/v1/host/ 接口重写了 /lowhost 命令，使其成为快速的聚合信息查询工具，并支持 detail 模式。
-# 2. Bug修复: 彻底修复了Markdown格式问题，通过在转义函数中加入对 `=` 等字符的处理，解决了莫名出现 \ 和 " 的问题。
-# 3. 代码优化: 添加了新的常量和辅助函数来支持新的 /lowhost 逻辑。
-# 4. 保留了v10.0所有功能，包括批量验Key。
+# v10.2 更新日志:
+# 1. 重大修复 (/host): 增加了核心的服务去重逻辑，确保 /host 命令的报告中每个端口服务只出现一次，彻底解决内容重复问题。
+# 2. Bug修复 (/lowhost): 修正了对 /api/v1/host/ 接口返回的端口列表的解析逻辑，确保端口号能被正确、美观地显示。
+# 3. Bug修复 (/batchcheckapi): 解决了在处理大量API Key时因报告超长而导致的程序崩溃问题。现在超长报告会自动转为文件发送。
+# 4. 保留了v10.1所有功能和修复。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -53,7 +53,6 @@ MAX_BATCH_TARGETS = 10000
 FOFA_SEARCH_URL = "https://fofa.info/api/v1/search/all"
 FOFA_INFO_URL = "https://fofa.info/api/v1/info/my"
 FOFA_STATS_URL = "https://fofa.info/api/v1/search/stats"
-# v10.1: Added new constant for /host endpoint.
 FOFA_HOST_BASE_URL = "https://fofa.info/api/v1/host/"
 
 # --- FOFA 字段定义 ---
@@ -158,14 +157,10 @@ def admin_only(func):
             return None
         return func(update, context, *args, **kwargs)
     return wrapped
-
-# v10.1: Rewritten escape_markdown to fix formatting bugs.
 def escape_markdown(text: str) -> str:
     if not isinstance(text, str): text = str(text)
-    # According to Telegram Bot API documentation for MarkdownV2
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
-
 def create_progress_bar(percentage: float, length: int = 10) -> str:
     if percentage < 0: percentage = 0
     if percentage > 100: percentage = 100
@@ -242,8 +237,6 @@ def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host"):
     params = {'key': key, 'q': query, 'size': page_size, 'page': page, 'fields': fields, 'full': CONFIG.get("full_mode", False)}; return _make_api_request(FOFA_SEARCH_URL, params)
 def fetch_fofa_stats(key, query):
     params = {'key': key, 'q': query, 'fields': FOFA_STATS_FIELDS}; return _make_api_request(FOFA_STATS_URL, params)
-
-# v10.1: Added new function to fetch from /host endpoint.
 def fetch_fofa_host_info(key, host, detail=False):
     url = FOFA_HOST_BASE_URL + host
     params = {'key': key, 'detail': str(detail).lower()}
@@ -613,10 +606,10 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.1！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.2！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v10.1*\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v10.2*\n\n"
                   "*🔍 资产搜索*\n`/kkfofa [key] <query>`\n_FOFA搜索, 非管理员首次使用需提供Key_\n\n"
                   "*📦 主机详查 (智能)*\n`/host <ip|domain>`\n_自适应获取最全主机信息 (管理员)_\n\n"
                   "*🔬 主机速查 (聚合)*\n`/lowhost <ip|domain> [detail]`\n_快速获取主机聚合信息 (所有用户)_\n\n"
@@ -889,10 +882,26 @@ def host_command_logic(update: Update, context: CallbackContext):
     if error:
         processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
         return
-    results = data.get('results', [])
-    if not results:
+    raw_results = data.get('results', [])
+    if not raw_results:
         processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown(host_arg)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN)
         return
+    
+    # v10.2: Deduplication logic to prevent massive reports
+    unique_services = {}
+    ip_idx = final_fields_list.index('ip') if 'ip' in final_fields_list else -1
+    port_idx = final_fields_list.index('port') if 'port' in final_fields_list else -1
+    protocol_idx = final_fields_list.index('protocol') if 'protocol' in final_fields_list else -1
+    
+    if port_idx != -1 and protocol_idx != -1:
+        for res in raw_results:
+            key = (res[ip_idx] if ip_idx != -1 else host_arg, res[port_idx], res[protocol_idx])
+            if key not in unique_services:
+                unique_services[key] = res
+        results = list(unique_services.values())
+    else:
+        results = raw_results
+
     full_report = format_full_host_report(host_arg, results, final_fields_list)
     if len(full_report) > 3800:
         summary_report = create_host_summary(host_arg, results, final_fields_list)
@@ -910,15 +919,22 @@ def host_command_logic(update: Update, context: CallbackContext):
 @admin_only
 def host_command(update: Update, context: CallbackContext):
     host_command_logic(update, context)
-
-# v10.1: New formatting functions for the /host endpoint API response.
 def format_host_summary(data):
     parts = [f"📌 *主机聚合摘要: `{data.get('host', 'N/A')}`*"]
     if data.get('ip'): parts.append(f"*IP:* `{data.get('ip')}`")
     location = f"{data.get('country_name', '')} {data.get('region', '')} {data.get('city', '')}".strip()
     if location: parts.append(f"*位置:* `{location}`")
     if data.get('asn'): parts.append(f"*ASN:* `{data.get('asn')} ({data.get('org', 'N/A')})`")
-    if data.get('ports'): parts.append(f"*开放端口:* `{', '.join(map(str, data.get('ports', [])))}`")
+    
+    # v10.2: Fix for parsing port list
+    if data.get('ports'):
+        port_list = data.get('ports', [])
+        if port_list and isinstance(port_list[0], dict):
+            port_numbers = sorted([p.get('port') for p in port_list if p.get('port')])
+            parts.append(f"*开放端口:* `{', '.join(map(str, port_numbers))}`")
+        else: # Fallback for simple list
+            parts.append(f"*开放端口:* `{', '.join(map(str, port_list))}`")
+
     if data.get('protocols'): parts.append(f"*协议:* `{', '.join(data.get('protocols', []))}`")
     if data.get('category'): parts.append(f"*资产类型:* `{', '.join(data.get('category', []))}`")
     if data.get('products'):
@@ -937,8 +953,6 @@ def format_host_details(data):
         details.append(port_str)
     full_report = summary + "\n".join(details)
     return full_report
-
-# v10.1: New /lowhost command logic using the dedicated /host endpoint.
 def lowhost_command(update: Update, context: CallbackContext) -> None:
     if not context.args:
         update.message.reply_text("用法: `/lowhost <ip_or_domain> [detail]`\n\n示例:\n`/lowhost 1.1.1.1`\n`/lowhost example.com detail`", parse_mode=ParseMode.MARKDOWN)
@@ -957,7 +971,6 @@ def lowhost_command(update: Update, context: CallbackContext) -> None:
         formatted_text = format_host_details(data)
     else:
         formatted_text = format_host_summary(data)
-    
     if len(formatted_text) > 3800:
         processing_message.edit_text("报告过长，将作为文件发送。")
         report_filename = f"lowhost_details_{host.replace('.', '_')}.txt"
@@ -1204,12 +1217,14 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
             valid_keys.append(f"`...{key[-4:]}` - ✅ *有效* ({data.get('username', 'N/A')}, {level_name}会员)")
         else:
             invalid_keys.append(f"`...{key[-4:]}` - ❌ *无效* (原因: {error})")
-        if (i + 1) % 5 == 0 or (i + 1) == total:
+        if (i + 1) % 10 == 0 or (i + 1) == total:
             try:
                 progress_text = f"⏳ 验证进度: {create_progress_bar((i+1)/total*100)} ({i+1}/{total})"
                 msg.edit_text(progress_text)
             except (BadRequest, RetryAfter):
                 time.sleep(2)
+    
+    # v10.2: Handle long reports by sending a file
     report = [f"📋 *批量API Key验证报告*"]
     report.append(f"\n总计: {total} | 有效: {len(valid_keys)} | 无效: {len(invalid_keys)}\n")
     if valid_keys:
@@ -1218,7 +1233,21 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
     if invalid_keys:
         report.append("\n--- *无效 Keys* ---")
         report.extend(invalid_keys)
-    msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN)
+    
+    report_text = "\n".join(report)
+    if len(report_text) > 3800:
+        summary = f"✅ 验证完成！\n总计: {total} | 有效: {len(valid_keys)} | 无效: {len(invalid_keys)}\n\n报告过长，已作为文件发送。"
+        msg.edit_text(summary)
+        report_filename = f"api_check_report_{int(time.time())}.txt"
+        try:
+            plain_text_report = re.sub(r'([*_`\[\]])', '', report_text)
+            with open(report_filename, 'w', encoding='utf-8') as f: f.write(plain_text_report)
+            with open(report_filename, 'rb') as doc: context.bot.send_document(chat_id=update.effective_chat.id, document=doc)
+        finally:
+            if os.path.exists(report_filename): os.remove(report_filename)
+    else:
+        msg.edit_text(report_text, parse_mode=ParseMode.MARKDOWN)
+
     if os.path.exists(temp_path): os.remove(temp_path)
     return ConversationHandler.END
 
@@ -1631,7 +1660,7 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
     
-    logger.info(f"🚀 Fofa Bot v10.1 (稳定版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v10.2 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
 
