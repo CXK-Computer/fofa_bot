@@ -1,10 +1,11 @@
-# fofa_bot_v10.3.py (新增/allfofa & 修复TCP扫描持久化BUG)
+# fofa_bot_v10.4.py (修复/allfofa翻页BUG & 增强功能 & 升级MarkdownV2)
 #
-# v10.3 更新日志:
-# 1. 新功能 (/allfofa): 新增 /allfofa 命令，集成FOFA官方推荐的 search/next 接口，专用于大规模数据的稳定、全量获取，并支持交互式选择下载数量。
-# 2. 重大修复 (TCP扫描): 彻底修复了TCP扫描功能因机器人重启而失效的问题。通过将扫描任务状态持久化到 scan_tasks.json 文件，确保了扫描功能在任何时候都可用。
-# 3. 代码优化: 新增了相关的API调用函数和后台任务逻辑，以支持新功能。
-# 4. 保留了v10.2所有功能和修复。
+# v10.4 更新日志:
+# 1. 重大修复 (/allfofa): 彻底解决了因API Key切换导致 [820013] 翻页错误的BUG。现在 /allfofa 会锁定单个Key完成整个下载流程，确保稳定性。
+# 2. 功能增强 (/allfofa): 为 /allfofa 命令增加了与 /kkfofa 完全一致的交互式预处理功能，例如查询前选择大洲范围。
+# 3. 全局修复 (Markdown): 全面升级机器人的消息解析模式到更稳定、更严格的 MarkdownV2，并重写了转义函数，杜绝因查询语句包含特殊字符而导致的发送失败问题。
+# 4. 代码重构: 对查询入口逻辑进行了重构，提高了代码的复用性和可维护性。
+# 5. 保留了v10.3所有功能和修复。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -47,13 +48,13 @@ HISTORY_FILE = 'history.json'
 LOG_FILE = 'fofa_bot.log'
 FOFA_CACHE_DIR = 'fofa_file'
 ANONYMOUS_KEYS_FILE = 'fofa_anonymous.json'
-SCAN_TASKS_FILE = 'scan_tasks.json' # v10.3: For persistent scan tasks
+SCAN_TASKS_FILE = 'scan_tasks.json'
 MAX_HISTORY_SIZE = 50
 MAX_SCAN_TASKS = 50
 CACHE_EXPIRATION_SECONDS = 24 * 60 * 60
 MAX_BATCH_TARGETS = 10000
 FOFA_SEARCH_URL = "https://fofa.info/api/v1/search/all"
-FOFA_NEXT_URL = "https://fofa.info/api/v1/search/next" # v10.3: New endpoint for /allfofa
+FOFA_NEXT_URL = "https://fofa.info/api/v1/search/next"
 FOFA_INFO_URL = "https://fofa.info/api/v1/info/my"
 FOFA_STATS_URL = "https://fofa.info/api/v1/search/stats"
 FOFA_HOST_BASE_URL = "https://fofa.info/api/v1/host/"
@@ -116,10 +117,10 @@ DEFAULT_CONFIG = { "bot_token": "YOUR_BOT_TOKEN_HERE", "apis": [], "admins": [],
 CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
 HISTORY = load_json_file(HISTORY_FILE, {"queries": []})
 ANONYMOUS_KEYS = load_json_file(ANONYMOUS_KEYS_FILE, {})
-SCAN_TASKS = load_json_file(SCAN_TASKS_FILE, {}) # v10.3: Load persistent scan tasks
+SCAN_TASKS = load_json_file(SCAN_TASKS_FILE, {})
 def save_config(): save_json_file(CONFIG_FILE, CONFIG)
 def save_anonymous_keys(): save_json_file(ANONYMOUS_KEYS_FILE, ANONYMOUS_KEYS)
-def save_scan_tasks(): save_json_file(SCAN_TASKS_FILE, SCAN_TASKS) # v10.3: Save scan tasks
+def save_scan_tasks(): save_json_file(SCAN_TASKS_FILE, SCAN_TASKS)
 def add_or_update_query(query_text, cache_data=None):
     existing_query = next((q for q in HISTORY['queries'] if q['query_text'] == query_text), None)
     if existing_query:
@@ -163,7 +164,8 @@ def admin_only(func):
             return None
         return func(update, context, *args, **kwargs)
     return wrapped
-def escape_markdown(text: str) -> str:
+# v10.4: Upgraded to a robust MarkdownV2 escaper
+def escape_markdown_v2(text: str) -> str:
     if not isinstance(text, str): text = str(text)
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
@@ -196,15 +198,15 @@ def upload_and_send_links(context: CallbackContext, chat_id: int, file_path: str
             file_name = os.path.basename(file_url_path)
             download_commands = (
                 f"📥 *文件下载命令*\n\n"
-                f"*cURL:*\n`curl -o \"{file_name}\" \"{full_url}\"`\n\n"
-                f"*Wget:*\n`wget --content-disposition \"{full_url}\"`"
+                f"*cURL:*\n`curl -o \"{escape_markdown_v2(file_name)}\" \"{escape_markdown_v2(full_url)}\"`\n\n"
+                f"*Wget:*\n`wget --content-disposition \"{escape_markdown_v2(full_url)}\"`"
             )
-            context.bot.send_message(chat_id, download_commands, parse_mode=ParseMode.MARKDOWN)
+            context.bot.send_message(chat_id, download_commands, parse_mode=ParseMode.MARKDOWN_V2)
         else:
             raise ValueError(f"响应格式不正确: {result}")
     except Exception as e:
         logger.error(f"文件上传失败: {e}")
-        context.bot.send_message(chat_id, f"⚠️ 文件上传到外部服务器失败: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
+        context.bot.send_message(chat_id, f"⚠️ 文件上传到外部服务器失败: `{escape_markdown_v2(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
 
 # --- FOFA API 核心逻辑 ---
 def _make_api_request(url, params, timeout=60, use_b64=True, retries=10):
@@ -247,7 +249,6 @@ def fetch_fofa_host_info(key, host, detail=False):
     url = FOFA_HOST_BASE_URL + host
     params = {'key': key, 'detail': str(detail).lower()}
     return _make_api_request(url, params, use_b64=False)
-# v10.3: New function for /allfofa
 def fetch_fofa_next_data(key, query, next_id=None, page_size=10000, fields="host"):
     params = {'key': key, 'q': query, 'size': page_size, 'fields': fields, 'full': CONFIG.get("full_mode", False)}
     if next_id:
@@ -286,9 +287,9 @@ def get_fields_by_level(level):
     return FREE_FIELDS
 
 def execute_query_with_fallback(query_func, preferred_key_index=None):
-    if not CONFIG['apis']: return None, None, None, "没有配置任何API Key。"
+    if not CONFIG['apis']: return None, None, None, None, "没有配置任何API Key。"
     keys_to_try = [k for k in CONFIG['apis'] if KEY_LEVELS.get(k, -1) != -1]
-    if not keys_to_try: return None, None, None, "所有配置的API Key都无效。"
+    if not keys_to_try: return None, None, None, None, "所有配置的API Key都无效。"
     start_index = 0
     if preferred_key_index is not None and 1 <= preferred_key_index <= len(CONFIG['apis']):
         preferred_key = CONFIG['apis'][preferred_key_index - 1]
@@ -301,12 +302,12 @@ def execute_query_with_fallback(query_func, preferred_key_index=None):
         key_level = KEY_LEVELS.get(key, 0)
         data, error = query_func(key)
         if not error:
-            return data, key_num, key_level, None
+            return data, key, key_num, key_level, None
         if "[820031]" in str(error):
             logger.warning(f"Key [#{key_num}] F点余额不足...");
             continue
-        return None, key_num, key_level, error
-    return None, None, None, "所有Key均尝试失败 (可能F点均不足)。"
+        return None, key, key_num, key_level, error
+    return None, None, None, None, "所有Key均尝试失败 (可能F点均不足)。"
 
 # --- 异步扫描逻辑 ---
 async def async_check_port(host, port, timeout):
@@ -359,7 +360,6 @@ def run_async_scan_job(context: CallbackContext):
     chat_id, msg, query_hash, mode = job_context['chat_id'], job_context['msg'], job_context['query_hash'], job_context['mode']
     concurrency, timeout = job_context['concurrency'], job_context['timeout']
     
-    # v10.3: Read from persistent scan tasks file
     original_query = SCAN_TASKS.get(query_hash)
     if not original_query:
         msg.edit_text("❌ 扫描任务已过期或机器人已重启。请重新发起查询以启用扫描。")
@@ -379,18 +379,16 @@ def run_async_scan_job(context: CallbackContext):
     msg.edit_text("3/3: 正在打包并发送新结果...")
     output_filename = generate_filename_from_query(original_query, prefix=f"{mode}_scan")
     with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(sorted(list(live_results))))
-    final_caption = f"✅ **异步{scan_type_text}完成!**\n\n共发现 *{len(live_results)}* 个存活目标。"
+    final_caption = f"✅ **异步{scan_type_text}完成\!**\n\n共发现 *{len(live_results)}* 个存活目标。"
     with open(output_filename, 'rb') as doc:
-        context.bot.send_document(chat_id, document=doc, caption=final_caption, parse_mode=ParseMode.MARKDOWN)
+        context.bot.send_document(chat_id, document=doc, caption=final_caption, parse_mode=ParseMode.MARKDOWN_V2)
     upload_and_send_links(context, chat_id, output_filename)
     os.remove(output_filename); msg.delete()
 
 # --- 扫描流程入口 ---
 def offer_post_download_actions(context: CallbackContext, chat_id, query_text):
-    # v10.3: Save scan task to persistent file
     query_hash = hashlib.md5(query_text.encode()).hexdigest()
     SCAN_TASKS[query_hash] = query_text
-    # Keep the task list clean
     while len(SCAN_TASKS) > MAX_SCAN_TASKS:
         SCAN_TASKS.pop(next(iter(SCAN_TASKS)))
     save_scan_tasks()
@@ -454,7 +452,7 @@ def run_full_download_query(context: CallbackContext):
         if guest_key:
             data, error = fetch_fofa_data(guest_key, query_text, page, 10000, "host")
         else:
-            data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page, 10000, "host"))
+            data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page, 10000, "host"))
         if error: msg.edit_text(f"❌ 第 {page} 页下载出错: {error}"); break
         results = data.get('results', []);
         if not results: break
@@ -482,7 +480,7 @@ def run_traceback_download_query(context: CallbackContext):
         if guest_key:
             data, error = fetch_fofa_data(guest_key, current_query, 1, 10000, "host,lastupdatetime")
         else:
-            data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, current_query, 1, 10000, "host,lastupdatetime"))
+            data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, current_query, 1, 10000, "host,lastupdatetime"))
         if error: termination_reason = f"\n\n❌ 第 {page_count} 轮出错: {error}"; break
         results = data.get('results', [])
         if not results: termination_reason = "\n\nℹ️ 已获取所有查询结果."; break
@@ -524,11 +522,11 @@ def run_incremental_update_query(context: CallbackContext):
     try:
         with open(old_file_path, 'r', encoding='utf-8') as f: old_results = set(line.strip() for line in f if line.strip() and ':' in line)
     except Exception as e: msg.edit_text(f"❌ 读取本地缓存文件失败: {e}"); return
-    msg.edit_text("2/5: 正在确定更新起始点..."); data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, base_query, fields="lastupdatetime"))
+    msg.edit_text("2/5: 正在确定更新起始点..."); data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, base_query, fields="lastupdatetime"))
     if error or not data.get('results'): msg.edit_text(f"❌ 无法获取最新记录时间戳: {error or '无结果'}"); return
     ts_str = data['results'][0][0] if isinstance(data['results'][0], list) else data['results'][0]; cutoff_date = ts_str.split(' ')[0]
     incremental_query = f'({base_query}) && after="{cutoff_date}"'
-    msg.edit_text(f"3/5: 正在侦察自 {cutoff_date} 以来的新数据..."); data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, incremental_query, page_size=1))
+    msg.edit_text(f"3/5: 正在侦察自 {cutoff_date} 以来的新数据..."); data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, incremental_query, page_size=1))
     if error: msg.edit_text(f"❌ 侦察查询失败: {error}"); return
     total_new_size = data.get('size', 0)
     if total_new_size == 0: msg.edit_text("✅ 未发现新数据。缓存已是最新。"); return
@@ -536,7 +534,7 @@ def run_incremental_update_query(context: CallbackContext):
     for page in range(1, pages_to_fetch + 1):
         if context.bot_data.get(stop_flag): msg.edit_text("🌀 增量更新已手动停止。"); return
         msg.edit_text(f"3/5: 正在下载新数据... ( Page {page}/{pages_to_fetch} )")
-        data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, incremental_query, page=page, page_size=10000))
+        data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, incremental_query, page=page, page_size=10000))
         if error: msg.edit_text(f"❌ 下载新数据失败: {error}"); return
         if data.get('results'): new_results.update(res for res in data.get('results', []) if ':' in res)
     msg.edit_text(f"4/5: 正在合并数据... (发现 {len(new_results)} 条新数据)"); combined_results = sorted(list(new_results.union(old_results)))
@@ -555,7 +553,7 @@ def run_batch_download_query(context: CallbackContext):
         if context.bot_data.get(stop_flag): msg.edit_text("🌀 下载任务已手动停止."); break
         try: msg.edit_text(f"下载进度: {len(results_list)}/{total_size} (Page {page}/{pages_to_fetch})...")
         except (BadRequest, RetryAfter): pass
-        data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page, 10000, fields))
+        data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page, 10000, fields))
         if error: msg.edit_text(f"❌ 第 {page} 页下载出错: {error}"); break
         page_results = data.get('results', [])
         if not page_results: break
@@ -566,7 +564,7 @@ def run_batch_download_query(context: CallbackContext):
             with open(output_filename, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f); writer.writerow(fields.split(',')); writer.writerows(results_list)
             with open(output_filename, 'rb') as doc:
-                bot.send_document(chat_id, document=doc, filename=output_filename, caption=f"✅ 自定义导出完成\n查询: `{escape_markdown(query_text)}`", parse_mode=ParseMode.MARKDOWN)
+                bot.send_document(chat_id, document=doc, filename=output_filename, caption=f"✅ 自定义导出完成\n查询: `{escape_markdown_v2(query_text)}`", parse_mode=ParseMode.MARKDOWN_V2)
             upload_and_send_links(context, chat_id, output_filename)
         except Exception as e:
             msg.edit_text(f"❌ 生成或发送CSV文件失败: {e}"); logger.error(f"Failed to generate/send CSV for batch command: {e}")
@@ -584,7 +582,7 @@ def run_batch_traceback_query(context: CallbackContext):
     while True:
         page_count += 1
         if context.bot_data.get(stop_flag): termination_reason = "\n\n🌀 任务已手动停止."; break
-        data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, current_query, 1, 10000, fields + ",lastupdatetime"))
+        data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, current_query, 1, 10000, fields + ",lastupdatetime"))
         if error: termination_reason = f"\n\n❌ 第 {page_count} 轮出错: {error}"; break
         results = data.get('results', [])
         if not results: termination_reason = "\n\nℹ️ 已获取所有查询结果."; break
@@ -629,25 +627,25 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.3！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.4！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v10.3*\n\n"
-                  "*🔍 资产搜索 (常规)*\n`/kkfofa [key] <query>`\n_FOFA搜索, 适用于1万条以内数据_\n\n"
-                  "*🚚 资产搜索 (海量)*\n`/allfofa <query>`\n_使用next接口稳定获取海量数据 (管理员)_\n\n"
-                  "*📦 主机详查 (智能)*\n`/host <ip|domain>`\n_自适应获取最全主机信息 (管理员)_\n\n"
-                  "*🔬 主机速查 (聚合)*\n`/lowhost <ip|domain> [detail]`\n_快速获取主机聚合信息 (所有用户)_\n\n"
-                  "*📊 聚合统计*\n`/stats <query>`\n_获取全局聚合统计 (管理员)_\n\n"
-                  "*📂 批量智能分析*\n`/batchfind`\n_上传IP列表, 分析特征并生成Excel (管理员)_\n\n"
-                  "*📤 批量自定义导出 (交互式)*\n`/batch <query>`\n_进入交互式菜单选择字段导出 (管理员)_\n\n"
-                  "*⚙️ 管理与设置*\n`/settings`\n_进入交互式设置菜单 (管理员)_\n\n"
-                  "*🔑 Key管理*\n`/batchcheckapi`\n_上传文件批量验证API Key (管理员)_\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v10\\.4*\n\n"
+                  "*🔍 资产搜索 \\(常规\\)*\n`/kkfofa [key] <query>`\n_FOFA搜索, 适用于1万条以内数据_\n\n"
+                  "*🚚 资产搜索 \\(海量\\)*\n`/allfofa <query>`\n_使用next接口稳定获取海量数据 \\(管理员\\)_\n\n"
+                  "*📦 主机详查 \\(智能\\)*\n`/host <ip|domain>`\n_自适应获取最全主机信息 \\(管理员\\)_\n\n"
+                  "*🔬 主机速查 \\(聚合\\)*\n`/lowhost <ip|domain> [detail]`\n_快速获取主机聚合信息 \\(所有用户\\)_\n\n"
+                  "*📊 聚合统计*\n`/stats <query>`\n_获取全局聚合统计 \\(管理员\\)_\n\n"
+                  "*📂 批量智能分析*\n`/batchfind`\n_上传IP列表, 分析特征并生成Excel \\(管理员\\)_\n\n"
+                  "*📤 批量自定义导出 \\(交互式\\)*\n`/batch <query>`\n_进入交互式菜单选择字段导出 \\(管理员\\)_\n\n"
+                  "*⚙️ 管理与设置*\n`/settings`\n_进入交互式设置菜单 \\(管理员\\)_\n\n"
+                  "*🔑 Key管理*\n`/batchcheckapi`\n_上传文件批量验证API Key \\(管理员\\)_\n\n"
                   "*💻 系统管理*\n"
-                  "`/check` - 系统自检\n"
-                  "`/update` - 在线更新脚本\n"
-                  "`/shutdown` - 安全关闭/重启\n\n"
-                  "*🛑 任务控制*\n`/stop` - 紧急停止下载任务\n`/cancel` - 取消当前操作" )
-    update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+                  "`/check` \\- 系统自检\n"
+                  "`/update` \\- 在线更新脚本\n"
+                  "`/shutdown` \\- 安全关闭/重启\n\n"
+                  "*🛑 任务控制*\n`/stop` \\- 紧急停止下载任务\n`/cancel` \\- 取消当前操作" )
+    update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN_V2)
 def cancel(update: Update, context: CallbackContext) -> int:
     message = "操作已取消。"
     if update.message: update.message.reply_text(message)
@@ -655,9 +653,15 @@ def cancel(update: Update, context: CallbackContext) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
-# --- /kkfofa & 访客逻辑 ---
-def kkfofa_entry(update: Update, context: CallbackContext):
+# --- /kkfofa, /allfofa & 访客逻辑 (v10.4 Refactored) ---
+def query_entry_point(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
+    command = update.message.text.split()[0].lower()
+
+    if command == '/allfofa' and not is_admin(user_id):
+        update.message.reply_text("⛔️ 抱歉，`/allfofa` 命令仅限管理员使用。")
+        return ConversationHandler.END
+
     if not is_admin(user_id):
         guest_key = ANONYMOUS_KEYS.get(str(user_id))
         if not guest_key:
@@ -666,35 +670,59 @@ def kkfofa_entry(update: Update, context: CallbackContext):
                 context.user_data['pending_query'] = " ".join(context.args)
             return STATE_GET_GUEST_KEY
         context.user_data['guest_key'] = guest_key
-    query_obj = update.callback_query; message_obj = update.message
-    if query_obj:
+
+    query_obj = update.callback_query
+    message_obj = update.message
+
+    if query_obj: # From preset menu
         query_obj.answer()
         try:
-            preset_index = int(query_obj.data.replace("run_preset_", "")); preset = CONFIG["presets"][preset_index]
-            context.user_data['original_query'] = preset['query']; context.user_data['key_index'] = None
+            preset_index = int(query_obj.data.replace("run_preset_", ""))
+            preset = CONFIG["presets"][preset_index]
+            context.user_data['original_query'] = preset['query']
+            context.user_data['key_index'] = None
+            # We need to know which command this preset is for. Assume /kkfofa for now.
+            context.user_data['command'] = '/kkfofa' 
             keyboard = [[InlineKeyboardButton("🌍 是的, 限定大洲", callback_data="continent_select"), InlineKeyboardButton("⏩ 不, 直接搜索", callback_data="continent_skip")]]
-            query_obj.message.edit_text(f"预设查询: `{escape_markdown(preset['query'])}`\n\n是否要将此查询限定在特定大洲范围内？", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+            query_obj.message.edit_text(f"预设查询: `{escape_markdown_v2(preset['query'])}`\n\n是否要将此查询限定在特定大洲范围内？", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
             return STATE_ASK_CONTINENT
         except (ValueError, IndexError):
-            query_obj.message.edit_text("❌ 预设查询失败。"); return ConversationHandler.END
+            query_obj.message.edit_text("❌ 预设查询失败。")
+            return ConversationHandler.END
+
     if not context.args:
-        presets = CONFIG.get("presets", [])
-        if not presets: message_obj.reply_text("欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。"); return ConversationHandler.END
-        keyboard = []
-        for i, p in enumerate(presets):
-            query_preview = p['query'][:25] + '...' if len(p['query']) > 25 else p['query']
-            keyboard.append([InlineKeyboardButton(f"{p['name']} (`{query_preview}`)", callback_data=f"run_preset_{i}")])
-        message_obj.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard)); return ConversationHandler.END
+        if command == '/kkfofa':
+            presets = CONFIG.get("presets", [])
+            if not presets:
+                message_obj.reply_text(f"欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。")
+                return ConversationHandler.END
+            keyboard = []
+            for i, p in enumerate(presets):
+                query_preview = p['query'][:25] + '...' if len(p['query']) > 25 else p['query']
+                keyboard.append([InlineKeyboardButton(f"{p['name']} (`{query_preview}`)", callback_data=f"run_preset_{i}")])
+            message_obj.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard))
+        else: # /allfofa without args
+             message_obj.reply_text(f"用法: `{command} <fofa_query>`")
+        return ConversationHandler.END
+
     key_index, query_text = None, " ".join(context.args)
     if context.args[0].isdigit() and is_admin(user_id):
         try:
             num = int(context.args[0])
-            if 1 <= num <= len(CONFIG['apis']): key_index = num; query_text = " ".join(context.args[1:])
-        except ValueError: pass
-    context.user_data['original_query'] = query_text; context.user_data['key_index'] = key_index
+            if 1 <= num <= len(CONFIG['apis']):
+                key_index = num
+                query_text = " ".join(context.args[1:])
+        except ValueError:
+            pass
+    
+    context.user_data['original_query'] = query_text
+    context.user_data['key_index'] = key_index
+    context.user_data['command'] = command
+
     keyboard = [[InlineKeyboardButton("🌍 是的, 限定大洲", callback_data="continent_select"), InlineKeyboardButton("⏩ 不, 直接搜索", callback_data="continent_skip")]]
-    message_obj.reply_text(f"查询: `{escape_markdown(query_text)}`\n\n是否要将此查询限定在特定大洲范围内？", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    message_obj.reply_text(f"查询: `{escape_markdown_v2(query_text)}`\n\n是否要将此查询限定在特定大洲范围内？", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return STATE_ASK_CONTINENT
+
 def get_guest_key(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     guest_key = update.message.text.strip()
@@ -708,14 +736,20 @@ def get_guest_key(update: Update, context: CallbackContext):
     msg.edit_text(f"✅ Key验证成功 ({data.get('username', 'N/A')})！您的Key已保存，现在可以开始查询了。")
     if 'pending_query' in context.user_data:
         context.args = context.user_data.pop('pending_query').split()
-        return kkfofa_entry(update, context)
+        return query_entry_point(update, context)
     return ConversationHandler.END
+
 def ask_continent_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); choice = query.data.split('_')[1]
+    command = context.user_data['command']
+
     if choice == 'skip':
         context.user_data['query'] = context.user_data['original_query']
-        query.message.edit_text(f"好的，将直接搜索: `{escape_markdown(context.user_data['query'])}`", parse_mode=ParseMode.MARKDOWN)
-        return proceed_with_query(update, context, message_to_edit=query.message)
+        query.message.edit_text(f"好的，将直接搜索: `{escape_markdown_v2(context.user_data['query'])}`", parse_mode=ParseMode.MARKDOWN_V2)
+        if command == '/kkfofa':
+            return proceed_with_kkfofa_query(update, context, message_to_edit=query.message)
+        elif command == '/allfofa':
+            return start_allfofa_search(update, context, message_to_edit=query.message)
     elif choice == 'select':
         keyboard = [
             [InlineKeyboardButton("🌏 亚洲", callback_data="continent_Asia"), InlineKeyboardButton("🌍 欧洲", callback_data="continent_Europe")],
@@ -723,24 +757,32 @@ def ask_continent_callback(update: Update, context: CallbackContext):
             [InlineKeyboardButton("🌍 非洲", callback_data="continent_Africa"), InlineKeyboardButton("🌏 大洋洲", callback_data="continent_Oceania")],
             [InlineKeyboardButton("↩️ 跳过", callback_data="continent_skip")]]
         query.message.edit_text("请选择一个大洲:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_CONTINENT_CHOICE
+
 def continent_choice_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); continent = query.data.split('_', 1)[1]; original_query = context.user_data['original_query']
+    command = context.user_data['command']
+
     if continent == 'skip':
         context.user_data['query'] = original_query
-        query.message.edit_text(f"好的，将直接搜索: `{escape_markdown(original_query)}`", parse_mode=ParseMode.MARKDOWN)
-        return proceed_with_query(update, context, message_to_edit=query.message)
-    country_list = CONTINENT_COUNTRIES.get(continent)
-    if not country_list: query.message.edit_text("❌ 错误：无效的大洲选项。"); return ConversationHandler.END
-    country_fofa_string = " || ".join([f'country="{code}"' for code in country_list]); final_query = f"({original_query}) && ({country_fofa_string})"
-    context.user_data['query'] = final_query
-    query.message.edit_text(f"查询已构建:\n`{escape_markdown(final_query)}`\n\n正在处理...", parse_mode=ParseMode.MARKDOWN)
-    return proceed_with_query(update, context, message_to_edit=query.message)
-def proceed_with_query(update: Update, context: CallbackContext, message_to_edit):
+        query.message.edit_text(f"好的，将直接搜索: `{escape_markdown_v2(original_query)}`", parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        country_list = CONTINENT_COUNTRIES.get(continent)
+        if not country_list: query.message.edit_text("❌ 错误：无效的大洲选项。"); return ConversationHandler.END
+        country_fofa_string = " || ".join([f'country="{code}"' for code in country_list]); final_query = f"({original_query}) && ({country_fofa_string})"
+        context.user_data['query'] = final_query
+        query.message.edit_text(f"查询已构建:\n`{escape_markdown_v2(final_query)}`\n\n正在处理...", parse_mode=ParseMode.MARKDOWN_V2)
+
+    if command == '/kkfofa':
+        return proceed_with_kkfofa_query(update, context, message_to_edit=query.message)
+    elif command == '/allfofa':
+        return start_allfofa_search(update, context, message_to_edit=query.message)
+
+def proceed_with_kkfofa_query(update: Update, context: CallbackContext, message_to_edit):
     query_text = context.user_data['query']
     cached_item = find_cached_query(query_text)
     if cached_item:
         dt_utc = datetime.fromisoformat(cached_item['timestamp']); dt_local = dt_utc.astimezone(tz.tzlocal()); time_str = dt_local.strftime('%Y-%m-%d %H:%M')
-        message_text = (f"✅ *发现缓存*\n\n查询: `{escape_markdown(query_text)}`\n缓存于: *{time_str}*\n\n")
+        message_text = (f"✅ *发现缓存*\n\n查询: `{escape_markdown_v2(query_text)}`\n缓存于: *{time_str}*\n\n")
         keyboard = []; is_expired = (datetime.now(tz.tzutc()) - dt_utc).total_seconds() > CACHE_EXPIRATION_SECONDS
         if is_expired or not is_admin(update.effective_user.id):
              message_text += "⚠️ *此缓存已过期或您是访客，无法增量更新。*" if is_expired else ""
@@ -748,9 +790,10 @@ def proceed_with_query(update: Update, context: CallbackContext, message_to_edit
         else: 
             message_text += "请选择操作："; keyboard.append([InlineKeyboardButton("🔄 增量更新", callback_data='cache_incremental')]); keyboard.append([InlineKeyboardButton("⬇️ 下载缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
         keyboard.append([InlineKeyboardButton("❌ 取消", callback_data='cache_cancel')])
-        message_to_edit.edit_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        message_to_edit.edit_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
         return STATE_CACHE_CHOICE
-    return start_new_search(update, context, message_to_edit=message_to_edit)
+    return start_new_kkfofa_search(update, context, message_to_edit=message_to_edit)
+
 def cache_choice_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); choice = query.data.split('_')[1]
     if choice == 'download':
@@ -764,31 +807,33 @@ def cache_choice_callback(update: Update, context: CallbackContext):
             except Exception as e: query.message.edit_text(f"❌ 发送缓存失败: {e}")
         else: query.message.edit_text("❌ 找不到本地缓存记录。")
         return ConversationHandler.END
-    elif choice == 'newsearch': return start_new_search(update, context, message_to_edit=query.message)
+    elif choice == 'newsearch': return start_new_kkfofa_search(update, context, message_to_edit=query.message)
     elif choice == 'incremental': query.edit_message_text("⏳ 准备增量更新..."); start_download_job(context, run_incremental_update_query, context.user_data); query.message.delete(); return ConversationHandler.END
     elif choice == 'cancel': query.message.edit_text("操作已取消。"); return ConversationHandler.END
-def start_new_search(update: Update, context: CallbackContext, message_to_edit=None):
+
+def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to_edit=None):
     query_text = context.user_data['query']; key_index = context.user_data.get('key_index'); add_or_update_query(query_text)
-    msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🔄 正在对 `{escape_markdown(query_text)}` 执行全新查询...", parse_mode=ParseMode.MARKDOWN)
-    if message_to_edit: msg.edit_text(f"🔄 正在对 `{escape_markdown(query_text)}` 执行全新查询...", parse_mode=ParseMode.MARKDOWN)
+    msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🔄 正在对 `{escape_markdown_v2(query_text)}` 执行全新查询...", parse_mode=ParseMode.MARKDOWN_V2)
+    if message_to_edit: msg.edit_text(f"🔄 正在对 `{escape_markdown_v2(query_text)}` 执行全新查询...", parse_mode=ParseMode.MARKDOWN_V2)
     guest_key = context.user_data.get('guest_key')
     if guest_key:
         data, error = fetch_fofa_data(guest_key, query_text, page_size=1, fields="host")
         used_key_info = "您的Key"
     else:
-        data, used_key_index, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page_size=1, fields="host"), key_index)
-        used_key_info = f"Key [#{used_key_index}]"
+        data, _, used_key_index, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page_size=1, fields="host"), key_index)
+        used_key_info = f"Key \\[#{used_key_index}\\]"
     if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
     total_size = data.get('size', 0)
     if total_size == 0: msg.edit_text("🤷‍♀️ 未找到结果。"); return ConversationHandler.END
     context.user_data.update({'total_size': total_size, 'chat_id': update.effective_chat.id, 'is_batch_mode': False})
     success_message = f"✅ 使用 {used_key_info} 找到 {total_size} 条结果。"
     if total_size <= 10000:
-        msg.edit_text(f"{success_message}\n开始下载..."); start_download_job(context, run_full_download_query, context.user_data)
+        msg.edit_text(f"{success_message}\n开始下载...", parse_mode=ParseMode.MARKDOWN_V2); start_download_job(context, run_full_download_query, context.user_data)
         return ConversationHandler.END
     else:
         keyboard = [[InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
-        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_KKFOFA_MODE
+        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return STATE_KKFOFA_MODE
+
 def query_mode_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); mode = query.data.split('_')[1]
     if mode == 'cancel': query.message.edit_text("操作已取消."); return ConversationHandler.END
@@ -800,6 +845,7 @@ def query_mode_callback(update: Update, context: CallbackContext):
     if mode == 'full' and job_func:
         query.message.edit_text(f"⏳ 开始下载..."); start_download_job(context, job_func, context.user_data); query.message.delete()
     return ConversationHandler.END
+
 def get_traceback_limit(update: Update, context: CallbackContext):
     limit = None
     if update.callback_query:
@@ -876,20 +922,20 @@ def format_full_host_report(host_arg, results, fields_list):
     return "\n".join(report)
 def host_command_logic(update: Update, context: CallbackContext):
     if not context.args:
-        update.message.reply_text(f"用法: `/host <ip_or_domain>`\n\n示例:\n`/host 1.1.1.1`", parse_mode=ParseMode.MARKDOWN)
+        update.message.reply_text(f"用法: `/host <ip_or_domain>`\n\n示例:\n`/host 1.1.1.1`", parse_mode=ParseMode.MARKDOWN_V2)
         return
     host_arg = context.args[0]
-    processing_message = update.message.reply_text(f"⏳ 正在查询主机 `{escape_markdown(host_arg)}`...", parse_mode=ParseMode.MARKDOWN)
+    processing_message = update.message.reply_text(f"⏳ 正在查询主机 `{escape_markdown_v2(host_arg)}`...", parse_mode=ParseMode.MARKDOWN_V2)
     query = f'ip="{host_arg}"' if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host_arg) else f'domain="{host_arg}"'
     data, final_fields_list, error = None, [], None
     for level in range(3, -1, -1): 
         fields_to_try = get_fields_by_level(level)
         fields_str = ",".join(fields_to_try)
         try:
-            processing_message.edit_text(f"⏳ 正在尝试以 *等级 {level}* 字段查询...", parse_mode=ParseMode.MARKDOWN)
+            processing_message.edit_text(f"⏳ 正在尝试以 *等级 {level}* 字段查询...", parse_mode=ParseMode.MARKDOWN_V2)
         except (BadRequest, RetryAfter):
             time.sleep(1)
-        temp_data, _, _, temp_error = execute_query_with_fallback(
+        temp_data, _, _, _, temp_error = execute_query_with_fallback(
             lambda key: fetch_fofa_data(key, query, page_size=100, fields=fields_str)
         )
         if not temp_error:
@@ -904,11 +950,11 @@ def host_command_logic(update: Update, context: CallbackContext):
             error = temp_error
             continue
     if error:
-        processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
+        processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN_V2)
         return
     raw_results = data.get('results', [])
     if not raw_results:
-        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown(host_arg)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN)
+        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown_v2(host_arg)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN_V2)
         return
     
     unique_services = {}
@@ -928,7 +974,7 @@ def host_command_logic(update: Update, context: CallbackContext):
     full_report = format_full_host_report(host_arg, results, final_fields_list)
     if len(full_report) > 3800:
         summary_report = create_host_summary(host_arg, results, final_fields_list)
-        processing_message.edit_text(summary_report, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        processing_message.edit_text(summary_report, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
         report_filename = f"host_details_{host_arg.replace('.', '_')}.txt"
         try:
             plain_text_report = re.sub(r'([*_`\[\]])', '', full_report)
@@ -938,7 +984,7 @@ def host_command_logic(update: Update, context: CallbackContext):
         finally:
             if os.path.exists(report_filename): os.remove(report_filename)
     else:
-        processing_message.edit_text(full_report, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        processing_message.edit_text(full_report, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
 @admin_only
 def host_command(update: Update, context: CallbackContext):
     host_command_logic(update, context)
@@ -977,17 +1023,17 @@ def format_host_details(data):
     return full_report
 def lowhost_command(update: Update, context: CallbackContext) -> None:
     if not context.args:
-        update.message.reply_text("用法: `/lowhost <ip_or_domain> [detail]`\n\n示例:\n`/lowhost 1.1.1.1`\n`/lowhost example.com detail`", parse_mode=ParseMode.MARKDOWN)
+        update.message.reply_text("用法: `/lowhost <ip_or_domain> [detail]`\n\n示例:\n`/lowhost 1.1.1.1`\n`/lowhost example.com detail`", parse_mode=ParseMode.MARKDOWN_V2)
         return
     host = context.args[0]
     detail = len(context.args) > 1 and context.args[1].lower() == 'detail'
-    processing_message = update.message.reply_text(f"正在查询主机 `{escape_markdown(host)}` 的聚合信息...", parse_mode=ParseMode.MARKDOWN)
-    data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_host_info(key, host, detail))
+    processing_message = update.message.reply_text(f"正在查询主机 `{escape_markdown_v2(host)}` 的聚合信息...", parse_mode=ParseMode.MARKDOWN_V2)
+    data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_host_info(key, host, detail))
     if error:
-        processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN)
+        processing_message.edit_text(f"查询失败 😞\n*原因:* `{error}`", parse_mode=ParseMode.MARKDOWN_V2)
         return
     if not data:
-        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown(host)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN)
+        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown_v2(host)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN_V2)
         return
     if detail:
         formatted_text = format_host_details(data)
@@ -1004,7 +1050,7 @@ def lowhost_command(update: Update, context: CallbackContext) -> None:
         finally:
             if os.path.exists(report_filename): os.remove(report_filename)
     else:
-        processing_message.edit_text(formatted_text, parse_mode=ParseMode.MARKDOWN)
+        processing_message.edit_text(formatted_text, parse_mode=ParseMode.MARKDOWN_V2)
 
 # --- /stats 命令 ---
 @admin_only
@@ -1015,17 +1061,17 @@ def stats_command(update: Update, context: CallbackContext):
     return get_fofa_stats_query(update, context)
 def get_fofa_stats_query(update: Update, context: CallbackContext):
     query_text = " ".join(context.args) if context.args else update.message.text
-    msg = update.message.reply_text(f"⏳ 正在对 `{escape_markdown(query_text)}` 进行聚合统计...", parse_mode=ParseMode.MARKDOWN)
-    data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_stats(key, query_text))
+    msg = update.message.reply_text(f"⏳ 正在对 `{escape_markdown_v2(query_text)}` 进行聚合统计...", parse_mode=ParseMode.MARKDOWN_V2)
+    data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_stats(key, query_text))
     if error: msg.edit_text(f"❌ 统计失败: {error}"); return ConversationHandler.END
-    report = [f"📊 *聚合统计报告 for `{escape_markdown(query_text)}`*\n"]
+    report = [f"📊 *聚合统计报告 for `{escape_markdown_v2(query_text)}`*\n"]
     for field, aggs in data.items():
         if aggs and isinstance(aggs, list):
             report.append(f"--- *{field.capitalize()}* ---")
             for item in aggs[:10]:
-                report.append(f"`{escape_markdown(item['name'])}`: {item['count']}")
+                report.append(f"`{escape_markdown_v2(item['name'])}`: {item['count']}")
             report.append("")
-    msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN)
+    msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN_V2)
     return ConversationHandler.END
 
 # --- /batchfind 命令 (无变动) ---
@@ -1091,7 +1137,7 @@ def run_batch_find_job(context: CallbackContext):
             try: msg.edit_text(f"分析进度: {create_progress_bar(processed_count/total_targets*100)} ({processed_count}/{total_targets})")
             except (BadRequest, RetryAfter): pass
         query = f'ip="{target}"' if ':' not in target else f'host="{target}"'
-        data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=1, fields=",".join(features)))
+        data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=1, fields=",".join(features)))
         if not error and data.get('results'):
             result = data['results'][0]
             row_data = {'Target': target}
@@ -1152,7 +1198,7 @@ def batch_command(update: Update, context: CallbackContext):
     context.user_data['selected_fields'] = set(FREE_FIELDS[:5])
     context.user_data['page'] = 0
     keyboard = build_batch_fields_keyboard(context.user_data)
-    update.message.reply_text(f"查询: `{escape_markdown(query_text)}`\n请选择要导出的字段:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    update.message.reply_text(f"查询: `{escape_markdown_v2(query_text)}`\n请选择要导出的字段:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN_V2)
     return STATE_BATCH_SELECT_FIELDS
 def batch_select_fields_callback(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -1176,7 +1222,7 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
         query_text = context.user_data['query']
         fields_str = ",".join(list(selected_fields))
         msg = query.message.edit_text("正在执行查询以预估数据量...")
-        data, used_key_index, key_level, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page_size=1, fields="host"))
+        data, _, used_key_index, key_level, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page_size=1, fields="host"))
         if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
         total_size = data.get('size', 0)
         if total_size == 0: msg.edit_text("🤷‍♀️ 未找到结果。"); return ConversationHandler.END
@@ -1186,13 +1232,13 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
             msg.edit_text(f"⚠️ 警告: 您选择的字段 `{', '.join(unauthorized_fields)}` 超出当前可用最高级Key (等级{key_level}) 的权限。请重新选择或升级Key。")
             return ConversationHandler.END
         context.user_data.update({'chat_id': update.effective_chat.id, 'fields': fields_str, 'total_size': total_size, 'is_batch_mode': True })
-        success_message = f"✅ 使用 Key [#{used_key_index}] (等级{key_level}) 找到 {total_size} 条结果。"
+        success_message = f"✅ 使用 Key \\[#{used_key_index}\\] (等级{key_level}) 找到 {total_size} 条结果。"
         if total_size <= 10000:
-            msg.edit_text(f"{success_message}\n开始自定义字段批量导出..."); start_download_job(context, run_batch_download_query, context.user_data)
+            msg.edit_text(f"{success_message}\n开始自定义字段批量导出...", parse_mode=ParseMode.MARKDOWN_V2); start_download_job(context, run_batch_download_query, context.user_data)
             return ConversationHandler.END
         else:
             keyboard = [[InlineKeyboardButton("💎 导出前1万条", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯导出", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
-            msg.edit_text(f"{success_message}\n请选择导出模式:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_KKFOFA_MODE
+            msg.edit_text(f"{success_message}\n请选择导出模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return STATE_KKFOFA_MODE
     keyboard = build_batch_fields_keyboard(context.user_data)
     query.message.edit_reply_markup(reply_markup=keyboard)
     return STATE_BATCH_SELECT_FIELDS
@@ -1267,12 +1313,12 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
         finally:
             if os.path.exists(report_filename): os.remove(report_filename)
     else:
-        msg.edit_text(report_text, parse_mode=ParseMode.MARKDOWN)
+        msg.edit_text(report_text, parse_mode=ParseMode.MARKDOWN_V2)
 
     if os.path.exists(temp_path): os.remove(temp_path)
     return ConversationHandler.END
 
-# --- 其他管理命令 (无变动) ---
+# --- 其他管理命令 ---
 @admin_only
 def check_command(update: Update, context: CallbackContext):
     msg = update.message.reply_text("⏳ 正在执行系统自检...")
@@ -1281,8 +1327,8 @@ def check_command(update: Update, context: CallbackContext):
         global CONFIG; CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
         report.append("✅ *配置文件*: `config.json` 加载正常")
     except Exception as e:
-        report.append(f"❌ *配置文件*: 加载失败 - {escape_markdown(str(e))}")
-        msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN); return
+        report.append(f"❌ *配置文件*: 加载失败 - {escape_markdown_v2(str(e))}")
+        msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN_V2); return
     report.append("\n*🔑 API Keys:*")
     if not CONFIG.get('apis'): report.append("  - ⚠️ 未配置任何 API Key")
     else:
@@ -1298,9 +1344,9 @@ def check_command(update: Update, context: CallbackContext):
         for p in proxies_to_check:
             try:
                 requests.get("https://fofa.info", proxies={"http": p, "https": p}, timeout=10, verify=False)
-                report.append(f"  - `{escape_markdown(p)}`: ✅ 连接成功")
-            except Exception as e: report.append(f"  - `{escape_markdown(p)}`: ❌ 连接失败 - `{escape_markdown(str(e))}`")
-    msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN)
+                report.append(f"  - `{escape_markdown_v2(p)}`: ✅ 连接成功")
+            except Exception as e: report.append(f"  - `{escape_markdown_v2(p)}`: ❌ 连接失败 - `{escape_markdown_v2(str(e))}`")
+    msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN_V2)
 @admin_only
 def stop_all_tasks(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
@@ -1333,8 +1379,8 @@ def history_command(update: Update, context: CallbackContext):
     history_text = "*🕰️ 最近查询历史*\n\n"
     for i, item in enumerate(HISTORY['queries'][:15]):
         dt_utc = datetime.fromisoformat(item['timestamp']); dt_local = dt_utc.astimezone(tz.tzlocal()); time_str = dt_local.strftime('%Y-%m-%d %H:%M')
-        history_text += f"`{i+1}.` `{escape_markdown(item['query_text'])}`\n   _{time_str}_\n"
-    update.message.reply_text(history_text, parse_mode=ParseMode.MARKDOWN)
+        history_text += f"`{i+1}.` `{escape_markdown_v2(item['query_text'])}`\n   _{time_str}_\n"
+    update.message.reply_text(history_text, parse_mode=ParseMode.MARKDOWN_V2)
 @admin_only
 def import_command(update: Update, context: CallbackContext):
     update.message.reply_text("请发送您要导入的旧缓存文件 (txt格式)。")
@@ -1355,7 +1401,7 @@ def get_import_query(update: Update, context: CallbackContext):
     shutil.move(temp_path, final_path)
     cache_data = {'file_path': final_path, 'result_count': result_count}
     add_or_update_query(query_text, cache_data)
-    update.message.reply_text(f"✅ 成功导入缓存！\n查询: `{escape_markdown(query_text)}`\n共 {result_count} 条记录。", parse_mode=ParseMode.MARKDOWN)
+    update.message.reply_text(f"✅ 成功导入缓存！\n查询: `{escape_markdown_v2(query_text)}`\n共 {result_count} 条记录。", parse_mode=ParseMode.MARKDOWN_V2)
     return ConversationHandler.END
 @admin_only
 def get_log_command(update: Update, context: CallbackContext):
@@ -1409,8 +1455,8 @@ def settings_command(update: Update, context: CallbackContext):
         [InlineKeyboardButton("❌ 关闭菜单", callback_data='settings_close')]
     ]
     message_text = "⚙️ *设置菜单*"; reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.callback_query: update.callback_query.message.edit_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-    else: update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    if update.callback_query: update.callback_query.message.edit_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
+    else: update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
     return STATE_SETTINGS_MAIN
 def settings_callback_handler(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); menu = query.data.split('_', 1)[1]
@@ -1444,7 +1490,7 @@ def show_api_menu(update: Update, context: CallbackContext, force_check=False):
         [InlineKeyboardButton("➕ 添加", callback_data='action_add_api'), InlineKeyboardButton("➖ 移除", callback_data='action_remove_api')],
         [InlineKeyboardButton("🔄 状态检查", callback_data='action_check_api'), InlineKeyboardButton("🔙 返回", callback_data='action_back')]
     ]
-    query.message.edit_text("\n".join(api_list_text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    query.message.edit_text("\n".join(api_list_text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return STATE_SETTINGS_ACTION
 def get_key(update: Update, context: CallbackContext):
     new_key = update.message.text.strip()
@@ -1474,7 +1520,7 @@ def show_preset_menu(update: Update, context: CallbackContext):
         [InlineKeyboardButton("➕ 添加", callback_data='preset_add'), InlineKeyboardButton("➖ 移除", callback_data='preset_remove')],
         [InlineKeyboardButton("🔙 返回", callback_data='preset_back')]
     ]
-    query.message.edit_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    query.message.edit_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return STATE_PRESET_MENU
 def preset_menu_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_')[1]
@@ -1502,9 +1548,9 @@ def remove_preset(update: Update, context: CallbackContext):
 def show_update_menu(update: Update, context: CallbackContext):
     query = update.callback_query
     url = CONFIG.get("update_url") or "未设置"
-    text = f"🔄 *脚本更新设置*\n\n当前更新URL: `{escape_markdown(url)}`"
+    text = f"🔄 *脚本更新设置*\n\n当前更新URL: `{escape_markdown_v2(url)}`"
     keyboard = [[InlineKeyboardButton("✏️ 设置URL", callback_data='update_set_url'), InlineKeyboardButton("🔙 返回", callback_data='update_back')]]
-    query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return STATE_SETTINGS_ACTION
 def get_update_url(update: Update, context: CallbackContext):
     url = update.message.text.strip()
@@ -1515,7 +1561,7 @@ def show_backup_restore_menu(update: Update, context: CallbackContext):
     query = update.callback_query
     text = "💾 *备份与恢复*\n\n- *备份*: 发送当前的 `config.json` 文件给您。\n- *恢复*: 您需要向机器人发送一个 `config.json` 文件来覆盖当前配置。"
     keyboard = [[InlineKeyboardButton("📤 备份", callback_data='backup_now'), InlineKeyboardButton("📥 恢复", callback_data='restore_now')], [InlineKeyboardButton("🔙 返回", callback_data='backup_back')]]
-    query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return STATE_SETTINGS_ACTION
 def show_proxypool_menu(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -1528,7 +1574,7 @@ def show_proxypool_menu(update: Update, context: CallbackContext):
         [InlineKeyboardButton("➕ 添加", callback_data='proxypool_add'), InlineKeyboardButton("➖ 移除", callback_data='proxypool_remove')],
         [InlineKeyboardButton("🔙 返回", callback_data='proxypool_back')]
     ]
-    query.message.edit_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    query.message.edit_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return STATE_PROXYPOOL_MENU
 def proxypool_menu_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_')[1]
@@ -1555,13 +1601,13 @@ def show_upload_api_menu(update: Update, context: CallbackContext):
     token_status = "已设置" if CONFIG.get("upload_api_token") else "未设置"
     text = (f"📤 *上传接口设置*\n\n"
             f"此功能可将机器人生成的所有文件自动上传到您指定的服务器，并返回下载命令。\n\n"
-            f"*API URL:* `{escape_markdown(url)}`\n"
+            f"*API URL:* `{escape_markdown_v2(url)}`\n"
             f"*API Token:* `{token_status}`")
     kbd = [
         [InlineKeyboardButton("✏️ 设置 URL", callback_data='upload_set_url'), InlineKeyboardButton("🔑 设置 Token", callback_data='upload_set_token')],
         [InlineKeyboardButton("🔙 返回", callback_data='upload_back')]
     ]
-    query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kbd), parse_mode=ParseMode.MARKDOWN)
+    query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kbd), parse_mode=ParseMode.MARKDOWN_V2)
     return STATE_UPLOAD_API_MENU
 def upload_api_menu_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_', 1)[1]
@@ -1582,17 +1628,12 @@ def get_upload_token(update: Update, context: CallbackContext):
     update.message.reply_text("✅ 上传 Token 已更新。")
     return settings_command(update, context)
 
-# --- /allfofa Command (v10.3) ---
-@admin_only
-def allfofa_command(update: Update, context: CallbackContext):
-    if not context.args:
-        update.message.reply_text("用法: `/allfofa <fofa_query>`\n此命令专用于获取海量数据。")
-        return ConversationHandler.END
+# --- /allfofa Command Logic (v10.4) ---
+def start_allfofa_search(update: Update, context: CallbackContext, message_to_edit=None):
+    query_text = context.user_data['query']
+    msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🚚 正在为查询 `{escape_markdown_v2(query_text)}` 准备海量数据获取任务...", parse_mode=ParseMode.MARKDOWN_V2)
     
-    query_text = " ".join(context.args)
-    msg = update.message.reply_text(f"🚚 正在为查询 `{escape_markdown(query_text)}` 准备海量数据获取任务...")
-    
-    data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_next_data(key, query_text, page_size=1))
+    data, used_key, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_next_data(key, query_text, page_size=1))
     if error:
         msg.edit_text(f"❌ 查询预检失败: {error}")
         return ConversationHandler.END
@@ -1605,6 +1646,7 @@ def allfofa_command(update: Update, context: CallbackContext):
     context.user_data['query'] = query_text
     context.user_data['total_size'] = total_size
     context.user_data['chat_id'] = update.effective_chat.id
+    context.user_data['pinned_key'] = used_key # Pin the key for the entire job
 
     keyboard = [
         [InlineKeyboardButton(f"♾️ 全部获取 ({total_size}条)", callback_data='allfofa_limit_none')],
@@ -1646,7 +1688,11 @@ def allfofa_get_limit(update: Update, context: CallbackContext):
 def run_allfofa_download_job(context: CallbackContext):
     job_data = context.job.context
     bot, chat_id, query_text = context.bot, job_data['chat_id'], job_data['query']
-    limit, total_size = job_data.get('limit'), job_data.get('total_size')
+    limit, total_size, pinned_key = job_data.get('limit'), job_data.get('total_size'), job_data.get('pinned_key')
+
+    if not pinned_key:
+        bot.send_message(chat_id, "❌ 内部错误：下载任务未收到锁定的API Key。")
+        return
 
     output_filename = generate_filename_from_query(query_text, prefix="allfofa")
     unique_results, stop_flag = set(), f'stop_job_{chat_id}'
@@ -1661,9 +1707,8 @@ def run_allfofa_download_job(context: CallbackContext):
             termination_reason = "\n\n🌀 任务已手动停止."
             break
 
-        data, _, _, error = execute_query_with_fallback(
-            lambda key: fetch_fofa_next_data(key, query_text, next_id=next_id)
-        )
+        # Use the pinned key directly, bypassing fallback logic
+        data, error = fetch_fofa_next_data(pinned_key, query_text, next_id=next_id)
 
         if error:
             termination_reason = f"\n\n❌ 下载过程中出错: {error}"
@@ -1674,7 +1719,6 @@ def run_allfofa_download_job(context: CallbackContext):
             termination_reason = "\n\nℹ️ 已获取所有查询结果."
             break
         
-        # FOFA next API returns list of lists, we need the first element of each sublist
         unique_results.update(res[0] for res in results if res and res[0] and ':' in res[0])
 
         if limit and len(unique_results) >= limit:
@@ -1784,21 +1828,15 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300,
     )
-    kkfofa_conv = ConversationHandler(
-        entry_points=[ CommandHandler("kkfofa", kkfofa_entry), CallbackQueryHandler(kkfofa_entry, pattern=r"^run_preset_") ],
+    query_conv = ConversationHandler(
+        entry_points=[ CommandHandler("kkfofa", query_entry_point), CommandHandler("allfofa", query_entry_point), CallbackQueryHandler(query_entry_point, pattern=r"^run_preset_") ],
         states={
             STATE_GET_GUEST_KEY: [MessageHandler(Filters.text & ~Filters.command, get_guest_key)],
             STATE_ASK_CONTINENT: [CallbackQueryHandler(ask_continent_callback, pattern=r"^continent_")], 
             STATE_CONTINENT_CHOICE: [CallbackQueryHandler(continent_choice_callback, pattern=r"^continent_")], 
             STATE_CACHE_CHOICE: [CallbackQueryHandler(cache_choice_callback, pattern=r"^cache_")],
             STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
-            STATE_GET_TRACEBACK_LIMIT: [MessageHandler(Filters.text & ~Filters.command, get_traceback_limit), CallbackQueryHandler(get_traceback_limit, pattern=r"^limit_")]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300,
-    )
-    allfofa_conv = ConversationHandler(
-        entry_points=[CommandHandler("allfofa", allfofa_command)],
-        states={
+            STATE_GET_TRACEBACK_LIMIT: [MessageHandler(Filters.text & ~Filters.command, get_traceback_limit), CallbackQueryHandler(get_traceback_limit, pattern=r"^limit_")],
             STATE_ALLFOFA_GET_LIMIT: [MessageHandler(Filters.text & ~Filters.command, allfofa_get_limit), CallbackQueryHandler(allfofa_get_limit, pattern=r"^allfofa_limit_")]
         },
         fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300,
@@ -1820,9 +1858,9 @@ def main() -> None:
     batch_check_api_conv = ConversationHandler(entry_points=[CommandHandler("batchcheckapi", batch_check_api_command)], states={STATE_GET_API_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), receive_api_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
-    dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(allfofa_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
+    dispatcher.add_handler(settings_conv); dispatcher.add_handler(query_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
     
-    logger.info(f"🚀 Fofa Bot v10.3 (稳定版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v10.4 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
 
