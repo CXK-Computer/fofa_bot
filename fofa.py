@@ -1,11 +1,9 @@
-# fofa_bot_v10.5.py (修复systemd重启 & MarkdownV2崩溃 & 扫描持久化BUG)
+# fofa_bot_v10.6.py (修复CallbackQuery导致的AttributeError崩溃)
 #
-# v10.5 更新日志:
-# 1. 重大修复 (重启/更新): 重构了关机和更新逻辑，移除 os.execv，改为标准的 sys.exit()，完美适配 systemd 的 Restart=always 策略，解决了进程残留和更新需要手动 kill 的问题。
-# 2. 重大修复 (UI崩溃): 全面排查并修复了因 MarkdownV2 特殊字符未转义导致的界面崩溃和按钮无响应问题。
-# 3. 重大修复 (扫描功能): 通过解决重启问题，从根本上确保了 scan_tasks.json 状态文件能够被正确写入，使扫描功能在重启后依然可靠。
-# 4. 代码健壮性: 增加了部分日志记录，优化了退出流程。
-# 5. 保留了v10.4所有功能。
+# v10.6 更新日志:
+# 1. 重大修复 (崩溃): 彻底解决了因点击预设查询按钮（CallbackQuery）而导致 AttributeError: 'NoneType' object has no attribute 'text' 崩溃的BUG。
+# 2. 代码健壮性: 优化了查询入口函数的逻辑，使其能更稳定地处理不同类型的用户交互。
+# 3. 保留了v10.5所有修复 (systemd重启, MarkdownV2渲染, 扫描持久化)。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -361,7 +359,6 @@ def run_async_scan_job(context: CallbackContext):
     chat_id, msg, query_hash, mode = job_context['chat_id'], job_context['msg'], job_context['query_hash'], job_context['mode']
     concurrency, timeout = job_context['concurrency'], job_context['timeout']
     
-    # Reload tasks from disk to ensure we have the latest version
     current_scan_tasks = load_json_file(SCAN_TASKS_FILE, {})
     original_query = current_scan_tasks.get(query_hash)
     if not original_query:
@@ -630,10 +627,10 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.5！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.6！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v10\\.5*\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v10\\.6*\n\n"
                   "*🔍 资产搜索 \\(常规\\)*\n`/kkfofa [key] <query>`\n_FOFA搜索, 适用于1万条以内数据_\n\n"
                   "*🚚 资产搜索 \\(海量\\)*\n`/allfofa <query>`\n_使用next接口稳定获取海量数据 \\(管理员\\)_\n\n"
                   "*📦 主机详查 \\(智能\\)*\n`/host <ip|domain>`\n_自适应获取最全主机信息 \\(管理员\\)_\n\n"
@@ -656,35 +653,30 @@ def cancel(update: Update, context: CallbackContext) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
-# --- /kkfofa, /allfofa & 访客逻辑 ---
+# --- /kkfofa, /allfofa & 访客逻辑 (v10.6 Refactored) ---
 def query_entry_point(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
-    command = update.message.text.split()[0].lower()
-
-    if command == '/allfofa' and not is_admin(user_id):
-        update.message.reply_text("⛔️ 抱歉，`/allfofa` 命令仅限管理员使用。")
-        return ConversationHandler.END
-
-    if not is_admin(user_id):
-        guest_key = ANONYMOUS_KEYS.get(str(user_id))
-        if not guest_key:
-            update.message.reply_text("👋 欢迎！作为首次使用的访客，请输入您的FOFA API Key以继续。您的Key只会被您自己使用。")
-            if context.args:
-                context.user_data['pending_query'] = " ".join(context.args)
-            return STATE_GET_GUEST_KEY
-        context.user_data['guest_key'] = guest_key
-
     query_obj = update.callback_query
     message_obj = update.message
 
-    if query_obj: # From preset menu
+    # v10.6 FIX: Handle CallbackQuery (button press) first to avoid AttributeError
+    if query_obj:
         query_obj.answer()
+        # This path is for preset buttons, which implies /kkfofa
+        context.user_data['command'] = '/kkfofa'
+        
+        if not is_admin(user_id):
+            guest_key = ANONYMOUS_KEYS.get(str(user_id))
+            if not guest_key:
+                query_obj.message.edit_text("👋 欢迎！作为首次使用的访客，请先发送您的FOFA API Key。")
+                return ConversationHandler.END # Can't proceed without key
+            context.user_data['guest_key'] = guest_key
+
         try:
             preset_index = int(query_obj.data.replace("run_preset_", ""))
             preset = CONFIG["presets"][preset_index]
             context.user_data['original_query'] = preset['query']
             context.user_data['key_index'] = None
-            context.user_data['command'] = '/kkfofa' 
             keyboard = [[InlineKeyboardButton("🌍 是的, 限定大洲", callback_data="continent_select"), InlineKeyboardButton("⏩ 不, 直接搜索", callback_data="continent_skip")]]
             query_obj.message.edit_text(f"预设查询: `{escape_markdown_v2(preset['query'])}`\n\n是否要将此查询限定在特定大洲范围内？", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
             return STATE_ASK_CONTINENT
@@ -692,38 +684,59 @@ def query_entry_point(update: Update, context: CallbackContext):
             query_obj.message.edit_text("❌ 预设查询失败。")
             return ConversationHandler.END
 
-    if not context.args:
-        if command == '/kkfofa':
-            presets = CONFIG.get("presets", [])
-            if not presets:
-                message_obj.reply_text(f"欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。")
-                return ConversationHandler.END
-            keyboard = []
-            for i, p in enumerate(presets):
-                query_preview = p['query'][:25] + '...' if len(p['query']) > 25 else p['query']
-                keyboard.append([InlineKeyboardButton(f"{p['name']} (`{query_preview}`)", callback_data=f"run_preset_{i}")])
-            message_obj.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard))
-        else: # /allfofa without args
-             message_obj.reply_text(f"用法: `{command} <fofa_query>`")
-        return ConversationHandler.END
+    # Handle text messages (commands)
+    elif message_obj:
+        command = message_obj.text.split()[0].lower()
 
-    key_index, query_text = None, " ".join(context.args)
-    if context.args[0].isdigit() and is_admin(user_id):
-        try:
-            num = int(context.args[0])
-            if 1 <= num <= len(CONFIG['apis']):
-                key_index = num
-                query_text = " ".join(context.args[1:])
-        except ValueError:
-            pass
+        if command == '/allfofa' and not is_admin(user_id):
+            message_obj.reply_text("⛔️ 抱歉，`/allfofa` 命令仅限管理员使用。")
+            return ConversationHandler.END
+
+        if not is_admin(user_id):
+            guest_key = ANONYMOUS_KEYS.get(str(user_id))
+            if not guest_key:
+                message_obj.reply_text("👋 欢迎！作为首次使用的访客，请输入您的FOFA API Key以继续。您的Key只会被您自己使用。")
+                if context.args:
+                    context.user_data['pending_query'] = " ".join(context.args)
+                return STATE_GET_GUEST_KEY
+            context.user_data['guest_key'] = guest_key
+
+        if not context.args:
+            if command == '/kkfofa':
+                presets = CONFIG.get("presets", [])
+                if not presets:
+                    message_obj.reply_text(f"欢迎使用FOFA查询机器人。\n\n➡️ 直接输入查询语法: `/kkfofa domain=\"example.com\"`\nℹ️ 当前没有可用的预设查询。管理员可通过 /settings 添加。")
+                    return ConversationHandler.END
+                keyboard = []
+                for i, p in enumerate(presets):
+                    query_preview = p['query'][:25] + '...' if len(p['query']) > 25 else p['query']
+                    keyboard.append([InlineKeyboardButton(f"{p['name']} (`{query_preview}`)", callback_data=f"run_preset_{i}")])
+                message_obj.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard))
+            else: # /allfofa without args
+                 message_obj.reply_text(f"用法: `{command} <fofa_query>`")
+            return ConversationHandler.END
+
+        key_index, query_text = None, " ".join(context.args)
+        if context.args[0].isdigit() and is_admin(user_id):
+            try:
+                num = int(context.args[0])
+                if 1 <= num <= len(CONFIG['apis']):
+                    key_index = num
+                    query_text = " ".join(context.args[1:])
+            except ValueError:
+                pass
+        
+        context.user_data['original_query'] = query_text
+        context.user_data['key_index'] = key_index
+        context.user_data['command'] = command
+
+        keyboard = [[InlineKeyboardButton("🌍 是的, 限定大洲", callback_data="continent_select"), InlineKeyboardButton("⏩ 不, 直接搜索", callback_data="continent_skip")]]
+        message_obj.reply_text(f"查询: `{escape_markdown_v2(query_text)}`\n\n是否要将此查询限定在特定大洲范围内？", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
+        return STATE_ASK_CONTINENT
     
-    context.user_data['original_query'] = query_text
-    context.user_data['key_index'] = key_index
-    context.user_data['command'] = command
-
-    keyboard = [[InlineKeyboardButton("🌍 是的, 限定大洲", callback_data="continent_select"), InlineKeyboardButton("⏩ 不, 直接搜索", callback_data="continent_skip")]]
-    message_obj.reply_text(f"查询: `{escape_markdown_v2(query_text)}`\n\n是否要将此查询限定在特定大洲范围内？", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_ASK_CONTINENT
+    else:
+        logger.error("query_entry_point called with an unsupported update type.")
+        return ConversationHandler.END
 
 def get_guest_key(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
@@ -1428,7 +1441,6 @@ def shutdown_command(update: Update, context: CallbackContext, restart=False):
         logger.info("Updater stopped. Exiting process.")
         sys.exit(0)
 
-    # Run the shutdown in a separate thread to allow the message to be sent
     context.job_queue.run_once(lambda _: stop_and_exit(), 1)
 
 @admin_only
@@ -1863,7 +1875,7 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(query_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
     
-    logger.info(f"🚀 Fofa Bot v10.5 (稳定版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v10.6 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
 
