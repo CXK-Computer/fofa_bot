@@ -1,9 +1,9 @@
-# fofa_bot_v10.8.py (修复/allfofa的Key回退机制 & 修复MarkdownV2崩溃)
+# fofa_bot_v10.9.py (终极修复关机死锁 & 修复MarkdownV2 '#' 崩溃)
 #
-# v10.8 更新日志:
-# 1. 重大修复 (/allfofa): 彻底重构了 /allfofa 的下载引擎，增加了在F点耗尽时自动无缝切换到下一个可用API Key的智能回退机制，极大提升了海量数据下载的成功率和健壮性。
-# 2. 重大修复 (UI崩溃): 修复了在点击“全新搜索”时，因静态文本中的 `.` 未转义导致的 BadRequest 界面崩溃问题。
-# 3. 保留了v10.7所有修复 (关机死锁, 按钮点击崩溃, systemd重启, 扫描持久化)。
+# v10.9 更新日志:
+# 1. 重大修复 (关机/更新死锁): 采用操作系统信号 (SIGINT) 的方式重写了关机逻辑，彻底解决了 RuntimeError: cannot join current thread 死锁问题，确保关机和更新流程的绝对稳定。
+# 2. 重大修复 (UI崩溃): 修复了在显示查询结果时，因Key编号的 `#` 字符未转义导致的 BadRequest 界面崩溃问题。
+# 3. 保留了v10.8所有修复 (`/allfofa` 智能Key切换, 按钮点击崩溃, systemd重启, 扫描持久化)。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -628,10 +628,10 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.8！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.9！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v10\\.8*\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v10\\.9*\n\n"
                   "*🔍 资产搜索 \\(常规\\)*\n`/kkfofa [key] <query>`\n_FOFA搜索, 适用于1万条以内数据_\n\n"
                   "*🚚 资产搜索 \\(海量\\)*\n`/allfofa <query>`\n_使用next接口稳定获取海量数据 \\(管理员\\)_\n\n"
                   "*📦 主机详查 \\(智能\\)*\n`/host <ip|domain>`\n_自适应获取最全主机信息 \\(管理员\\)_\n\n"
@@ -826,7 +826,6 @@ def cache_choice_callback(update: Update, context: CallbackContext):
 
 def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to_edit=None):
     query_text = context.user_data['query']; key_index = context.user_data.get('key_index'); add_or_update_query(query_text)
-    # v10.8 FIX: Manually escape static text with special characters
     msg_text = f"🔄 正在对 `{escape_markdown_v2(query_text)}` 执行全新查询\\.\\.\\."
     msg = message_to_edit if message_to_edit else update.effective_message.reply_text(msg_text, parse_mode=ParseMode.MARKDOWN_V2)
     if message_to_edit: msg.edit_text(msg_text, parse_mode=ParseMode.MARKDOWN_V2)
@@ -837,7 +836,8 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
         used_key_info = "您的Key"
     else:
         data, _, used_key_index, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page_size=1, fields="host"), key_index)
-        used_key_info = f"Key \\[#{used_key_index}\\]"
+        # v10.9 FIX: Escape the '#' character for MarkdownV2
+        used_key_info = f"Key \\[\\#{used_key_index}\\]"
     if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
     total_size = data.get('size', 0)
     if total_size == 0: msg.edit_text("🤷‍♀️ 未找到结果。"); return ConversationHandler.END
@@ -1248,7 +1248,7 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
             msg.edit_text(f"⚠️ 警告: 您选择的字段 `{', '.join(unauthorized_fields)}` 超出当前可用最高级Key (等级{key_level}) 的权限。请重新选择或升级Key。")
             return ConversationHandler.END
         context.user_data.update({'chat_id': update.effective_chat.id, 'fields': fields_str, 'total_size': total_size, 'is_batch_mode': True })
-        success_message = f"✅ 使用 Key \\[#{used_key_index}\\] (等级{key_level}) 找到 {total_size} 条结果。"
+        success_message = f"✅ 使用 Key \\[\\#{used_key_index}\\] (等级{key_level}) 找到 {total_size} 条结果。"
         if total_size <= 10000:
             msg.edit_text(f"{success_message}\n开始自定义字段批量导出...", parse_mode=ParseMode.MARKDOWN_V2); start_download_job(context, run_batch_download_query, context.user_data)
             return ConversationHandler.END
@@ -1425,27 +1425,17 @@ def get_log_command(update: Update, context: CallbackContext):
         update.message.reply_document(document=open(LOG_FILE, 'rb'))
         upload_and_send_links(context, update.effective_chat.id, LOG_FILE)
     else: update.message.reply_text("❌ 未找到日志文件。")
+
 @admin_only
 def shutdown_command(update: Update, context: CallbackContext, restart=False):
     message = "🤖 机器人正在重启..." if restart else "🤖 机器人正在关闭..."
     update.message.reply_text(message)
     logger.info(f"Shutdown/Restart initiated by user {update.effective_user.id}")
     
-    updater = context.bot_data.get('updater')
-    if not updater:
-        logger.error("Could not find updater object in bot_data for shutdown!")
-        update.message.reply_text("❌ 内部错误: 无法找到核心组件，无法关闭。")
-        return
-
-    def _shutdown_thread_target():
-        time.sleep(1)
-        updater.stop()
-        logger.info("Updater stopped. Exiting process.")
-        sys.exit(0)
-
-    shutdown_thread = threading.Thread(target=_shutdown_thread_target)
-    shutdown_thread.daemon = True
-    shutdown_thread.start()
+    # v10.9 FIX: Use OS signals for a truly robust and deadlock-free shutdown.
+    # This sends a SIGINT signal (like Ctrl+C) to the bot's own process,
+    # which updater.idle() is designed to catch gracefully.
+    threading.Thread(target=lambda: (time.sleep(1), os.kill(os.getpid(), signal.SIGINT))).start()
 
 @admin_only
 def update_script_command(update: Update, context: CallbackContext):
@@ -1716,16 +1706,19 @@ def run_allfofa_download_job(context: CallbackContext):
         return
     
     try:
-        current_key_index = keys_to_try.index(start_key)
+        start_index = keys_to_try.index(start_key)
+        # Reorder keys to start with the one that passed the pre-check
+        keys_to_try = keys_to_try[start_index:] + keys_to_try[:start_index]
     except ValueError:
-        current_key_index = 0
+        pass # If start_key is not in the list for some reason, just use the default order
 
+    current_key_index = 0
     output_filename = generate_filename_from_query(query_text, prefix="allfofa")
     unique_results, stop_flag = set(), f'stop_job_{chat_id}'
     msg = bot.send_message(chat_id, "⏳ 开始使用 `next` 接口进行海量下载...")
     
     next_id, termination_reason, last_update_time = None, "", 0
-    keys_tried_count = 0
+    keys_exhausted_count = 0
 
     while True:
         if context.bot_data.get(stop_flag):
@@ -1738,8 +1731,8 @@ def run_allfofa_download_job(context: CallbackContext):
         if error:
             if "[820031]" in str(error): # F点不足
                 logger.warning(f"Key ...{current_key[-4:]} F点不足，尝试切换...")
-                keys_tried_count += 1
-                if keys_tried_count >= len(keys_to_try):
+                keys_exhausted_count += 1
+                if keys_exhausted_count >= len(keys_to_try):
                     termination_reason = "\n\n❌ 所有可用Key的F点均已耗尽。"
                     break
                 current_key_index = (current_key_index + 1) % len(keys_to_try)
@@ -1748,13 +1741,12 @@ def run_allfofa_download_job(context: CallbackContext):
                 termination_reason = f"\n\n❌ 下载过程中出错: {escape_markdown_v2(error)}"
                 break
         
-        keys_tried_count = 0 # 成功后重置计数器
+        keys_exhausted_count = 0 # 成功后重置计数器
         results = data.get('results', [])
         if not results:
             termination_reason = "\n\nℹ️ 已获取所有查询结果."
             break
         
-        # 默认返回 host, ip, port
         unique_results.update(res[0] for res in results if res and res[0] and ':' in res[0])
 
         if limit and len(unique_results) >= limit:
@@ -1896,9 +1888,10 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(query_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
     
-    logger.info(f"🚀 Fofa Bot v10.8 (稳定版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v10.9 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
+    logger.info("Bot has been shut down gracefully.")
 
 if __name__ == "__main__":
     main()
