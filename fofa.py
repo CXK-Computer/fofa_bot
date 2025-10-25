@@ -1,9 +1,9 @@
-# fofa_bot_v10.6.py (修复CallbackQuery导致的AttributeError崩溃)
+# fofa_bot_v10.7.py (修复关机/更新时的线程死锁BUG)
 #
-# v10.6 更新日志:
-# 1. 重大修复 (崩溃): 彻底解决了因点击预设查询按钮（CallbackQuery）而导致 AttributeError: 'NoneType' object has no attribute 'text' 崩溃的BUG。
-# 2. 代码健壮性: 优化了查询入口函数的逻辑，使其能更稳定地处理不同类型的用户交互。
-# 3. 保留了v10.5所有修复 (systemd重启, MarkdownV2渲染, 扫描持久化)。
+# v10.7 更新日志:
+# 1. 重大修复 (关机/更新死锁): 彻底解决了因在 apscheduler 线程中执行关机操作导致的 RuntimeError: cannot join current thread 死锁问题。现在使用独立的守护线程来执行关机，确保流程稳定可靠。
+# 2. 健壮性: 关机流程现在更加健壮，能够确保在退出前完成所有必要的清理工作。
+# 3. 保留了v10.6所有修复 (按钮点击崩溃, systemd重启, MarkdownV2渲染, 扫描持久化)。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -23,6 +23,7 @@ import random
 import csv
 import asyncio
 import pandas as pd
+import threading
 from functools import wraps
 from datetime import datetime, timedelta
 from dateutil import tz
@@ -627,10 +628,10 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.6！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.7！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v10\\.6*\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v10\\.7*\n\n"
                   "*🔍 资产搜索 \\(常规\\)*\n`/kkfofa [key] <query>`\n_FOFA搜索, 适用于1万条以内数据_\n\n"
                   "*🚚 资产搜索 \\(海量\\)*\n`/allfofa <query>`\n_使用next接口稳定获取海量数据 \\(管理员\\)_\n\n"
                   "*📦 主机详查 \\(智能\\)*\n`/host <ip|domain>`\n_自适应获取最全主机信息 \\(管理员\\)_\n\n"
@@ -653,23 +654,21 @@ def cancel(update: Update, context: CallbackContext) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
-# --- /kkfofa, /allfofa & 访客逻辑 (v10.6 Refactored) ---
+# --- /kkfofa, /allfofa & 访客逻辑 ---
 def query_entry_point(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     query_obj = update.callback_query
     message_obj = update.message
 
-    # v10.6 FIX: Handle CallbackQuery (button press) first to avoid AttributeError
     if query_obj:
         query_obj.answer()
-        # This path is for preset buttons, which implies /kkfofa
         context.user_data['command'] = '/kkfofa'
         
         if not is_admin(user_id):
             guest_key = ANONYMOUS_KEYS.get(str(user_id))
             if not guest_key:
                 query_obj.message.edit_text("👋 欢迎！作为首次使用的访客，请先发送您的FOFA API Key。")
-                return ConversationHandler.END # Can't proceed without key
+                return ConversationHandler.END
             context.user_data['guest_key'] = guest_key
 
         try:
@@ -684,7 +683,6 @@ def query_entry_point(update: Update, context: CallbackContext):
             query_obj.message.edit_text("❌ 预设查询失败。")
             return ConversationHandler.END
 
-    # Handle text messages (commands)
     elif message_obj:
         command = message_obj.text.split()[0].lower()
 
@@ -712,7 +710,7 @@ def query_entry_point(update: Update, context: CallbackContext):
                     query_preview = p['query'][:25] + '...' if len(p['query']) > 25 else p['query']
                     keyboard.append([InlineKeyboardButton(f"{p['name']} (`{query_preview}`)", callback_data=f"run_preset_{i}")])
                 message_obj.reply_text("👇 请选择一个预设查询:", reply_markup=InlineKeyboardMarkup(keyboard))
-            else: # /allfofa without args
+            else:
                  message_obj.reply_text(f"用法: `{command} <fofa_query>`")
             return ConversationHandler.END
 
@@ -1436,12 +1434,17 @@ def shutdown_command(update: Update, context: CallbackContext, restart=False):
         update.message.reply_text("❌ 内部错误: 无法找到核心组件，无法关闭。")
         return
 
-    def stop_and_exit():
+    def _shutdown_thread_target():
+        # Wait a moment to ensure the message is sent
+        time.sleep(1)
         updater.stop()
         logger.info("Updater stopped. Exiting process.")
         sys.exit(0)
 
-    context.job_queue.run_once(lambda _: stop_and_exit(), 1)
+    # Run the shutdown in a separate, non-apscheduler thread to avoid deadlock
+    shutdown_thread = threading.Thread(target=_shutdown_thread_target)
+    shutdown_thread.daemon = True
+    shutdown_thread.start()
 
 @admin_only
 def update_script_command(update: Update, context: CallbackContext):
@@ -1875,7 +1878,7 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(query_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
     
-    logger.info(f"🚀 Fofa Bot v10.6 (稳定版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v10.7 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
 
