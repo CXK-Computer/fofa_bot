@@ -1,10 +1,10 @@
-# fofa_bot_v10.2.py (/host去重 & /lowhost修复 & /batchcheckapi修复)
+# fofa_bot_v10.3.py (新增/allfofa & 修复TCP扫描持久化BUG)
 #
-# v10.2 更新日志:
-# 1. 重大修复 (/host): 增加了核心的服务去重逻辑，确保 /host 命令的报告中每个端口服务只出现一次，彻底解决内容重复问题。
-# 2. Bug修复 (/lowhost): 修正了对 /api/v1/host/ 接口返回的端口列表的解析逻辑，确保端口号能被正确、美观地显示。
-# 3. Bug修复 (/batchcheckapi): 解决了在处理大量API Key时因报告超长而导致的程序崩溃问题。现在超长报告会自动转为文件发送。
-# 4. 保留了v10.1所有功能和修复。
+# v10.3 更新日志:
+# 1. 新功能 (/allfofa): 新增 /allfofa 命令，集成FOFA官方推荐的 search/next 接口，专用于大规模数据的稳定、全量获取，并支持交互式选择下载数量。
+# 2. 重大修复 (TCP扫描): 彻底修复了TCP扫描功能因机器人重启而失效的问题。通过将扫描任务状态持久化到 scan_tasks.json 文件，确保了扫描功能在任何时候都可用。
+# 3. 代码优化: 新增了相关的API调用函数和后台任务逻辑，以支持新功能。
+# 4. 保留了v10.2所有功能和修复。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -47,10 +47,13 @@ HISTORY_FILE = 'history.json'
 LOG_FILE = 'fofa_bot.log'
 FOFA_CACHE_DIR = 'fofa_file'
 ANONYMOUS_KEYS_FILE = 'fofa_anonymous.json'
+SCAN_TASKS_FILE = 'scan_tasks.json' # v10.3: For persistent scan tasks
 MAX_HISTORY_SIZE = 50
+MAX_SCAN_TASKS = 50
 CACHE_EXPIRATION_SECONDS = 24 * 60 * 60
 MAX_BATCH_TARGETS = 10000
 FOFA_SEARCH_URL = "https://fofa.info/api/v1/search/all"
+FOFA_NEXT_URL = "https://fofa.info/api/v1/search/next" # v10.3: New endpoint for /allfofa
 FOFA_INFO_URL = "https://fofa.info/api/v1/info/my"
 FOFA_STATS_URL = "https://fofa.info/api/v1/search/stats"
 FOFA_HOST_BASE_URL = "https://fofa.info/api/v1/host/"
@@ -91,8 +94,8 @@ logger = logging.getLogger(__name__)
     STATE_GET_TRACEBACK_LIMIT, STATE_GET_SCAN_CONCURRENCY, STATE_GET_SCAN_TIMEOUT,
     STATE_UPLOAD_API_MENU, STATE_GET_UPLOAD_URL, STATE_GET_UPLOAD_TOKEN,
     STATE_GET_GUEST_KEY, STATE_BATCH_GET_QUERY, STATE_BATCH_SELECT_FIELDS,
-    STATE_GET_API_FILE,
-) = range(31)
+    STATE_GET_API_FILE, STATE_ALLFOFA_GET_LIMIT,
+) = range(32)
 
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
@@ -101,7 +104,8 @@ def load_json_file(filename, default_content):
     try:
         with open(filename, 'r', encoding='utf-8') as f:
             config = json.load(f)
-            for key, value in default_content.items(): config.setdefault(key, value)
+            if isinstance(default_content, dict):
+                for key, value in default_content.items(): config.setdefault(key, value)
             return config
     except (json.JSONDecodeError, IOError):
         logger.error(f"{filename} 损坏，将使用默认配置重建。");
@@ -112,8 +116,10 @@ DEFAULT_CONFIG = { "bot_token": "YOUR_BOT_TOKEN_HERE", "apis": [], "admins": [],
 CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
 HISTORY = load_json_file(HISTORY_FILE, {"queries": []})
 ANONYMOUS_KEYS = load_json_file(ANONYMOUS_KEYS_FILE, {})
+SCAN_TASKS = load_json_file(SCAN_TASKS_FILE, {}) # v10.3: Load persistent scan tasks
 def save_config(): save_json_file(CONFIG_FILE, CONFIG)
 def save_anonymous_keys(): save_json_file(ANONYMOUS_KEYS_FILE, ANONYMOUS_KEYS)
+def save_scan_tasks(): save_json_file(SCAN_TASKS_FILE, SCAN_TASKS) # v10.3: Save scan tasks
 def add_or_update_query(query_text, cache_data=None):
     existing_query = next((q for q in HISTORY['queries'] if q['query_text'] == query_text), None)
     if existing_query:
@@ -241,6 +247,12 @@ def fetch_fofa_host_info(key, host, detail=False):
     url = FOFA_HOST_BASE_URL + host
     params = {'key': key, 'detail': str(detail).lower()}
     return _make_api_request(url, params, use_b64=False)
+# v10.3: New function for /allfofa
+def fetch_fofa_next_data(key, query, next_id=None, page_size=10000, fields="host"):
+    params = {'key': key, 'q': query, 'size': page_size, 'fields': fields, 'full': CONFIG.get("full_mode", False)}
+    if next_id:
+        params['next'] = next_id
+    return _make_api_request(FOFA_NEXT_URL, params)
 
 def check_and_classify_keys():
     logger.info("--- 开始检查并分类API Keys ---")
@@ -296,7 +308,7 @@ def execute_query_with_fallback(query_func, preferred_key_index=None):
         return None, key_num, key_level, error
     return None, None, None, "所有Key均尝试失败 (可能F点均不足)。"
 
-# --- 异步扫描逻辑 (无变动) ---
+# --- 异步扫描逻辑 ---
 async def async_check_port(host, port, timeout):
     try:
         fut = asyncio.open_connection(host, port)
@@ -346,8 +358,13 @@ def run_async_scan_job(context: CallbackContext):
     job_context = context.job.context
     chat_id, msg, query_hash, mode = job_context['chat_id'], job_context['msg'], job_context['query_hash'], job_context['mode']
     concurrency, timeout = job_context['concurrency'], job_context['timeout']
-    original_query = context.bot_data.get(query_hash)
-    if not original_query: msg.edit_text("❌ 扫描任务已过期或机器人刚刚重启。请重新发起查询以启用扫描。"); return
+    
+    # v10.3: Read from persistent scan tasks file
+    original_query = SCAN_TASKS.get(query_hash)
+    if not original_query:
+        msg.edit_text("❌ 扫描任务已过期或机器人已重启。请重新发起查询以启用扫描。")
+        return
+
     cached_item = find_cached_query(original_query)
     if not cached_item: msg.edit_text("❌ 找不到结果文件的本地缓存记录。"); return
     msg.edit_text("1/3: 正在读取本地缓存文件...")
@@ -368,10 +385,16 @@ def run_async_scan_job(context: CallbackContext):
     upload_and_send_links(context, chat_id, output_filename)
     os.remove(output_filename); msg.delete()
 
-# --- 扫描流程入口 (无变动) ---
+# --- 扫描流程入口 ---
 def offer_post_download_actions(context: CallbackContext, chat_id, query_text):
+    # v10.3: Save scan task to persistent file
     query_hash = hashlib.md5(query_text.encode()).hexdigest()
-    context.bot_data[query_hash] = query_text
+    SCAN_TASKS[query_hash] = query_text
+    # Keep the task list clean
+    while len(SCAN_TASKS) > MAX_SCAN_TASKS:
+        SCAN_TASKS.pop(next(iter(SCAN_TASKS)))
+    save_scan_tasks()
+
     keyboard = [[
         InlineKeyboardButton("⚡️ 异步TCP存活扫描", callback_data=f'start_scan_tcping_{query_hash}'),
         InlineKeyboardButton("🌐 异步子网扫描(/24)", callback_data=f'start_scan_subnet_{query_hash}')
@@ -413,7 +436,7 @@ def get_timeout_callback(update: Update, context: CallbackContext) -> int:
         update.message.reply_text("无效输入，请输入 0.1-10 之间的数字。")
         return STATE_GET_SCAN_TIMEOUT
 
-# --- 后台下载任务 (无变动) ---
+# --- 后台下载任务 ---
 def start_download_job(context: CallbackContext, callback_func, job_data):
     chat_id = job_data['chat_id']; job_name = f"download_job_{chat_id}"
     for job in context.job_queue.get_jobs_by_name(job_name): job.schedule_removal()
@@ -606,11 +629,12 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.2！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.3！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v10.2*\n\n"
-                  "*🔍 资产搜索*\n`/kkfofa [key] <query>`\n_FOFA搜索, 非管理员首次使用需提供Key_\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v10.3*\n\n"
+                  "*🔍 资产搜索 (常规)*\n`/kkfofa [key] <query>`\n_FOFA搜索, 适用于1万条以内数据_\n\n"
+                  "*🚚 资产搜索 (海量)*\n`/allfofa <query>`\n_使用next接口稳定获取海量数据 (管理员)_\n\n"
                   "*📦 主机详查 (智能)*\n`/host <ip|domain>`\n_自适应获取最全主机信息 (管理员)_\n\n"
                   "*🔬 主机速查 (聚合)*\n`/lowhost <ip|domain> [detail]`\n_快速获取主机聚合信息 (所有用户)_\n\n"
                   "*📊 聚合统计*\n`/stats <query>`\n_获取全局聚合统计 (管理员)_\n\n"
@@ -887,7 +911,6 @@ def host_command_logic(update: Update, context: CallbackContext):
         processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown(host_arg)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN)
         return
     
-    # v10.2: Deduplication logic to prevent massive reports
     unique_services = {}
     ip_idx = final_fields_list.index('ip') if 'ip' in final_fields_list else -1
     port_idx = final_fields_list.index('port') if 'port' in final_fields_list else -1
@@ -926,13 +949,12 @@ def format_host_summary(data):
     if location: parts.append(f"*位置:* `{location}`")
     if data.get('asn'): parts.append(f"*ASN:* `{data.get('asn')} ({data.get('org', 'N/A')})`")
     
-    # v10.2: Fix for parsing port list
     if data.get('ports'):
         port_list = data.get('ports', [])
         if port_list and isinstance(port_list[0], dict):
             port_numbers = sorted([p.get('port') for p in port_list if p.get('port')])
             parts.append(f"*开放端口:* `{', '.join(map(str, port_numbers))}`")
-        else: # Fallback for simple list
+        else:
             parts.append(f"*开放端口:* `{', '.join(map(str, port_list))}`")
 
     if data.get('protocols'): parts.append(f"*协议:* `{', '.join(data.get('protocols', []))}`")
@@ -1224,7 +1246,6 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
             except (BadRequest, RetryAfter):
                 time.sleep(2)
     
-    # v10.2: Handle long reports by sending a file
     report = [f"📋 *批量API Key验证报告*"]
     report.append(f"\n总计: {total} | 有效: {len(valid_keys)} | 无效: {len(invalid_keys)}\n")
     if valid_keys:
@@ -1561,6 +1582,140 @@ def get_upload_token(update: Update, context: CallbackContext):
     update.message.reply_text("✅ 上传 Token 已更新。")
     return settings_command(update, context)
 
+# --- /allfofa Command (v10.3) ---
+@admin_only
+def allfofa_command(update: Update, context: CallbackContext):
+    if not context.args:
+        update.message.reply_text("用法: `/allfofa <fofa_query>`\n此命令专用于获取海量数据。")
+        return ConversationHandler.END
+    
+    query_text = " ".join(context.args)
+    msg = update.message.reply_text(f"🚚 正在为查询 `{escape_markdown(query_text)}` 准备海量数据获取任务...")
+    
+    data, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_next_data(key, query_text, page_size=1))
+    if error:
+        msg.edit_text(f"❌ 查询预检失败: {error}")
+        return ConversationHandler.END
+        
+    total_size = data.get('size', 0)
+    if total_size == 0:
+        msg.edit_text("🤷‍♀️ 未找到任何结果。")
+        return ConversationHandler.END
+
+    context.user_data['query'] = query_text
+    context.user_data['total_size'] = total_size
+    context.user_data['chat_id'] = update.effective_chat.id
+
+    keyboard = [
+        [InlineKeyboardButton(f"♾️ 全部获取 ({total_size}条)", callback_data='allfofa_limit_none')],
+        [InlineKeyboardButton("❌ 取消", callback_data='allfofa_limit_cancel')]
+    ]
+    msg.edit_text(
+        f"✅ 查询预检成功，共发现 {total_size} 条结果。\n\n"
+        "请输入您希望获取的数量上限 (例如: 50000)，或选择全部获取。",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return STATE_ALLFOFA_GET_LIMIT
+
+def allfofa_get_limit(update: Update, context: CallbackContext):
+    limit = None
+    query = update.callback_query
+    
+    if query:
+        query.answer()
+        if query.data == 'allfofa_limit_cancel':
+            query.message.edit_text("操作已取消.")
+            return ConversationHandler.END
+        msg_target = query.message
+    else:
+        try:
+            limit = int(update.message.text.strip())
+            assert limit > 0
+        except (ValueError, AssertionError):
+            update.message.reply_text("❌ 无效的数字，请输入一个正整数。")
+            return STATE_ALLFOFA_GET_LIMIT
+        msg_target = update.message
+
+    context.user_data['limit'] = limit
+    msg_target.reply_text(f"✅ 任务已提交！\n将使用 `next` 接口获取数据 (上限: {limit or '无'})...")
+    start_download_job(context, run_allfofa_download_job, context.user_data)
+    if query:
+        msg_target.delete()
+    return ConversationHandler.END
+
+def run_allfofa_download_job(context: CallbackContext):
+    job_data = context.job.context
+    bot, chat_id, query_text = context.bot, job_data['chat_id'], job_data['query']
+    limit, total_size = job_data.get('limit'), job_data.get('total_size')
+
+    output_filename = generate_filename_from_query(query_text, prefix="allfofa")
+    unique_results, stop_flag = set(), f'stop_job_{chat_id}'
+    msg = bot.send_message(chat_id, "⏳ 开始使用 `next` 接口进行海量下载...")
+    
+    next_id = None
+    termination_reason = ""
+    last_update_time = 0
+
+    while True:
+        if context.bot_data.get(stop_flag):
+            termination_reason = "\n\n🌀 任务已手动停止."
+            break
+
+        data, _, _, error = execute_query_with_fallback(
+            lambda key: fetch_fofa_next_data(key, query_text, next_id=next_id)
+        )
+
+        if error:
+            termination_reason = f"\n\n❌ 下载过程中出错: {error}"
+            break
+        
+        results = data.get('results', [])
+        if not results:
+            termination_reason = "\n\nℹ️ 已获取所有查询结果."
+            break
+        
+        # FOFA next API returns list of lists, we need the first element of each sublist
+        unique_results.update(res[0] for res in results if res and res[0] and ':' in res[0])
+
+        if limit and len(unique_results) >= limit:
+            unique_results = set(list(unique_results)[:limit])
+            termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限。"
+            break
+
+        current_time = time.time()
+        if current_time - last_update_time > 2:
+            try:
+                progress_bar = create_progress_bar(len(unique_results) / (limit or total_size) * 100)
+                msg.edit_text(f"下载进度: {progress_bar} ({len(unique_results)} / {limit or total_size})")
+            except (BadRequest, RetryAfter):
+                pass
+            last_update_time = current_time
+
+        next_id = data.get('next')
+        if not next_id:
+            termination_reason = "\n\nℹ️ 已获取所有查询结果 (API未返回next_id)."
+            break
+
+    if unique_results:
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            f.write("\n".join(sorted(list(unique_results))))
+        
+        msg.edit_text(f"✅ 海量下载完成！共 {len(unique_results)} 条。{termination_reason}\n正在发送文件...")
+        cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
+        shutil.move(output_filename, cache_path)
+        
+        with open(cache_path, 'rb') as doc:
+            bot.send_document(chat_id, document=doc, filename=output_filename)
+        
+        upload_and_send_links(context, chat_id, cache_path)
+        cache_data = {'file_path': cache_path, 'result_count': len(unique_results)}
+        add_or_update_query(query_text, cache_data)
+        offer_post_download_actions(context, chat_id, query_text)
+    else:
+        msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
+    
+    context.bot_data.pop(stop_flag, None)
+
 # --- 主函数与调度器 ---
 def main() -> None:
     global CONFIG
@@ -1587,10 +1742,10 @@ def main() -> None:
     dispatcher.bot_data['updater'] = updater
     commands = [
         BotCommand("start", "🚀 启动机器人"), BotCommand("help", "❓ 命令手册"),
-        BotCommand("kkfofa", "🔍 资产搜索/预设"), BotCommand("host", "📦 主机详查 (智能)"),
-        BotCommand("lowhost", "🔬 主机速查 (聚合)"), BotCommand("stats", "📊 全局聚合统计"),
-        BotCommand("batchfind", "📂 批量智能分析 (Excel)"), BotCommand("batch", "📤 批量自定义导出 (交互式)"),
-        BotCommand("batchcheckapi", "🔑 批量验证API Key"),
+        BotCommand("kkfofa", "🔍 资产搜索 (常规)"), BotCommand("allfofa", "🚚 资产搜索 (海量)"),
+        BotCommand("host", "📦 主机详查 (智能)"), BotCommand("lowhost", "🔬 主机速查 (聚合)"),
+        BotCommand("stats", "📊 全局聚合统计"), BotCommand("batchfind", "📂 批量智能分析 (Excel)"),
+        BotCommand("batch", "📤 批量自定义导出 (交互式)"), BotCommand("batchcheckapi", "🔑 批量验证API Key"),
         BotCommand("check", "🩺 系统自检"), BotCommand("settings", "⚙️ 设置菜单"),
         BotCommand("history", "🕰️ 查询历史"), BotCommand("import", "🖇️ 导入旧缓存"),
         BotCommand("backup", "📤 备份配置"), BotCommand("restore", "📥 恢复配置"),
@@ -1641,6 +1796,13 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300,
     )
+    allfofa_conv = ConversationHandler(
+        entry_points=[CommandHandler("allfofa", allfofa_command)],
+        states={
+            STATE_ALLFOFA_GET_LIMIT: [MessageHandler(Filters.text & ~Filters.command, allfofa_get_limit), CallbackQueryHandler(allfofa_get_limit, pattern=r"^allfofa_limit_")]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300,
+    )
     batch_conv = ConversationHandler(
         entry_points=[CommandHandler("batch", batch_command)], 
         states={
@@ -1658,9 +1820,9 @@ def main() -> None:
     batch_check_api_conv = ConversationHandler(entry_points=[CommandHandler("batchcheckapi", batch_check_api_command)], states={STATE_GET_API_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), receive_api_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
-    dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
+    dispatcher.add_handler(settings_conv); dispatcher.add_handler(kkfofa_conv); dispatcher.add_handler(allfofa_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
     
-    logger.info(f"🚀 Fofa Bot v10.2 (稳定版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v10.3 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
 
