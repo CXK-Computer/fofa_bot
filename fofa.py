@@ -1,9 +1,9 @@
-# fofa_bot_v10.7.py (修复关机/更新时的线程死锁BUG)
+# fofa_bot_v10.8.py (修复/allfofa的Key回退机制 & 修复MarkdownV2崩溃)
 #
-# v10.7 更新日志:
-# 1. 重大修复 (关机/更新死锁): 彻底解决了因在 apscheduler 线程中执行关机操作导致的 RuntimeError: cannot join current thread 死锁问题。现在使用独立的守护线程来执行关机，确保流程稳定可靠。
-# 2. 健壮性: 关机流程现在更加健壮，能够确保在退出前完成所有必要的清理工作。
-# 3. 保留了v10.6所有修复 (按钮点击崩溃, systemd重启, MarkdownV2渲染, 扫描持久化)。
+# v10.8 更新日志:
+# 1. 重大修复 (/allfofa): 彻底重构了 /allfofa 的下载引擎，增加了在F点耗尽时自动无缝切换到下一个可用API Key的智能回退机制，极大提升了海量数据下载的成功率和健壮性。
+# 2. 重大修复 (UI崩溃): 修复了在点击“全新搜索”时，因静态文本中的 `.` 未转义导致的 BadRequest 界面崩溃问题。
+# 3. 保留了v10.7所有修复 (关机死锁, 按钮点击崩溃, systemd重启, 扫描持久化)。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -628,10 +628,10 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.7！请使用 /help 查看命令手册。')
+    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.8！请使用 /help 查看命令手册。')
     if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
 def help_command(update: Update, context: CallbackContext):
-    help_text = ( "📖 *Fofa 机器人指令手册 v10\\.7*\n\n"
+    help_text = ( "📖 *Fofa 机器人指令手册 v10\\.8*\n\n"
                   "*🔍 资产搜索 \\(常规\\)*\n`/kkfofa [key] <query>`\n_FOFA搜索, 适用于1万条以内数据_\n\n"
                   "*🚚 资产搜索 \\(海量\\)*\n`/allfofa <query>`\n_使用next接口稳定获取海量数据 \\(管理员\\)_\n\n"
                   "*📦 主机详查 \\(智能\\)*\n`/host <ip|domain>`\n_自适应获取最全主机信息 \\(管理员\\)_\n\n"
@@ -826,8 +826,11 @@ def cache_choice_callback(update: Update, context: CallbackContext):
 
 def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to_edit=None):
     query_text = context.user_data['query']; key_index = context.user_data.get('key_index'); add_or_update_query(query_text)
-    msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🔄 正在对 `{escape_markdown_v2(query_text)}` 执行全新查询...", parse_mode=ParseMode.MARKDOWN_V2)
-    if message_to_edit: msg.edit_text(f"🔄 正在对 `{escape_markdown_v2(query_text)}` 执行全新查询...", parse_mode=ParseMode.MARKDOWN_V2)
+    # v10.8 FIX: Manually escape static text with special characters
+    msg_text = f"🔄 正在对 `{escape_markdown_v2(query_text)}` 执行全新查询\\.\\.\\."
+    msg = message_to_edit if message_to_edit else update.effective_message.reply_text(msg_text, parse_mode=ParseMode.MARKDOWN_V2)
+    if message_to_edit: msg.edit_text(msg_text, parse_mode=ParseMode.MARKDOWN_V2)
+    
     guest_key = context.user_data.get('guest_key')
     if guest_key:
         data, error = fetch_fofa_data(guest_key, query_text, page_size=1, fields="host")
@@ -1435,13 +1438,11 @@ def shutdown_command(update: Update, context: CallbackContext, restart=False):
         return
 
     def _shutdown_thread_target():
-        # Wait a moment to ensure the message is sent
         time.sleep(1)
         updater.stop()
         logger.info("Updater stopped. Exiting process.")
         sys.exit(0)
 
-    # Run the shutdown in a separate, non-apscheduler thread to avoid deadlock
     shutdown_thread = threading.Thread(target=_shutdown_thread_target)
     shutdown_thread.daemon = True
     shutdown_thread.start()
@@ -1665,7 +1666,7 @@ def start_allfofa_search(update: Update, context: CallbackContext, message_to_ed
     context.user_data['query'] = query_text
     context.user_data['total_size'] = total_size
     context.user_data['chat_id'] = update.effective_chat.id
-    context.user_data['pinned_key'] = used_key
+    context.user_data['start_key'] = used_key
 
     keyboard = [
         [InlineKeyboardButton(f"♾️ 全部获取 ({total_size}条)", callback_data='allfofa_limit_none')],
@@ -1707,36 +1708,53 @@ def allfofa_get_limit(update: Update, context: CallbackContext):
 def run_allfofa_download_job(context: CallbackContext):
     job_data = context.job.context
     bot, chat_id, query_text = context.bot, job_data['chat_id'], job_data['query']
-    limit, total_size, pinned_key = job_data.get('limit'), job_data.get('total_size'), job_data.get('pinned_key')
+    limit, total_size, start_key = job_data.get('limit'), job_data.get('total_size'), job_data.get('start_key')
 
-    if not pinned_key:
-        bot.send_message(chat_id, "❌ 内部错误：下载任务未收到锁定的API Key。")
+    keys_to_try = [k for k in CONFIG['apis'] if KEY_LEVELS.get(k, -1) != -1]
+    if not keys_to_try:
+        bot.send_message(chat_id, "❌ 任务失败：没有可用的有效API Key。")
         return
+    
+    try:
+        current_key_index = keys_to_try.index(start_key)
+    except ValueError:
+        current_key_index = 0
 
     output_filename = generate_filename_from_query(query_text, prefix="allfofa")
     unique_results, stop_flag = set(), f'stop_job_{chat_id}'
     msg = bot.send_message(chat_id, "⏳ 开始使用 `next` 接口进行海量下载...")
     
-    next_id = None
-    termination_reason = ""
-    last_update_time = 0
+    next_id, termination_reason, last_update_time = None, "", 0
+    keys_tried_count = 0
 
     while True:
         if context.bot_data.get(stop_flag):
             termination_reason = "\n\n🌀 任务已手动停止."
             break
 
-        data, error = fetch_fofa_next_data(pinned_key, query_text, next_id=next_id)
+        current_key = keys_to_try[current_key_index]
+        data, error = fetch_fofa_next_data(current_key, query_text, next_id=next_id)
 
         if error:
-            termination_reason = f"\n\n❌ 下载过程中出错: {escape_markdown_v2(error)}"
-            break
+            if "[820031]" in str(error): # F点不足
+                logger.warning(f"Key ...{current_key[-4:]} F点不足，尝试切换...")
+                keys_tried_count += 1
+                if keys_tried_count >= len(keys_to_try):
+                    termination_reason = "\n\n❌ 所有可用Key的F点均已耗尽。"
+                    break
+                current_key_index = (current_key_index + 1) % len(keys_to_try)
+                continue # 使用新Key重试当前页
+            else: # 其他错误
+                termination_reason = f"\n\n❌ 下载过程中出错: {escape_markdown_v2(error)}"
+                break
         
+        keys_tried_count = 0 # 成功后重置计数器
         results = data.get('results', [])
         if not results:
             termination_reason = "\n\nℹ️ 已获取所有查询结果."
             break
         
+        # 默认返回 host, ip, port
         unique_results.update(res[0] for res in results if res and res[0] and ':' in res[0])
 
         if limit and len(unique_results) >= limit:
@@ -1878,7 +1896,7 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(query_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
     
-    logger.info(f"🚀 Fofa Bot v10.7 (稳定版) 已启动...")
+    logger.info(f"🚀 Fofa Bot v10.8 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
 
