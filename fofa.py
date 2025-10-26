@@ -39,7 +39,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     Filters,
 )
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
 
 # --- 全局变量和常量 ---
 CONFIG_FILE = 'config.json'
@@ -57,6 +57,16 @@ FOFA_NEXT_URL = "https://fofa.info/api/v1/search/next"
 FOFA_INFO_URL = "https://fofa.info/api/v1/info/my"
 FOFA_STATS_URL = "https://fofa.info/api/v1/search/stats"
 FOFA_HOST_BASE_URL = "https://fofa.info/api/v1/host/"
+
+# --- 大洲国家代码 ---
+CONTINENT_COUNTRIES = {
+    'Asia': ['AF', 'AM', 'AZ', 'BH', 'BD', 'BT', 'BN', 'KH', 'CN', 'CY', 'GE', 'IN', 'ID', 'IR', 'IQ', 'IL', 'JP', 'JO', 'KZ', 'KW', 'KG', 'LA', 'LB', 'MY', 'MV', 'MN', 'MM', 'NP', 'KP', 'OM', 'PK', 'PS', 'PH', 'QA', 'SA', 'SG', 'KR', 'LK', 'SY', 'TW', 'TJ', 'TH', 'TL', 'TR', 'TM', 'AE', 'UZ', 'VN', 'YE'],
+    'Europe': ['AL', 'AD', 'AM', 'AT', 'BY', 'BE', 'BA', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FO', 'FI', 'FR', 'GE', 'DE', 'GI', 'GR', 'HU', 'IS', 'IE', 'IT', 'KZ', 'LV', 'LI', 'LT', 'LU', 'MK', 'MT', 'MD', 'MC', 'ME', 'NL', 'NO', 'PL', 'PT', 'RO', 'RU', 'SM', 'RS', 'SK', 'SI', 'ES', 'SE', 'CH', 'TR', 'UA', 'GB', 'VA'],
+    'NorthAmerica': ['AG', 'BS', 'BB', 'BZ', 'CA', 'CR', 'CU', 'DM', 'DO', 'SV', 'GD', 'GT', 'HT', 'HN', 'JM', 'MX', 'NI', 'PA', 'KN', 'LC', 'VC', 'TT', 'US'],
+    'SouthAmerica': ['AR', 'BO', 'BR', 'CL', 'CO', 'EC', 'GY', 'PY', 'PE', 'SR', 'UY', 'VE'],
+    'Africa': ['DZ', 'AO', 'BJ', 'BW', 'BF', 'BI', 'CV', 'CM', 'CF', 'TD', 'KM', 'CD', 'CG', 'CI', 'DJ', 'EG', 'GQ', 'ER', 'SZ', 'ET', 'GA', 'GM', 'GH', 'GN', 'GW', 'KE', 'LS', 'LR', 'LY', 'MG', 'MW', 'ML', 'MR', 'MU', 'YT', 'MA', 'MZ', 'NA', 'NE', 'NG', 'RW', 'ST', 'SN', 'SC', 'SL', 'SO', 'ZA', 'SS', 'SD', 'TZ', 'TG', 'TN', 'UG', 'EH', 'ZM', 'ZW'],
+    'Oceania': ['AS', 'AU', 'CK', 'FJ', 'PF', 'GU', 'KI', 'MH', 'FM', 'NR', 'NC', 'NZ', 'NU', 'NF', 'MP', 'PW', 'PG', 'PN', 'WS', 'SB', 'TK', 'TO', 'TV', 'VU', 'WF']
+}
 
 # --- FOFA 字段定义 ---
 FOFA_STATS_FIELDS = "protocol,domain,port,title,os,server,country,asn,org,asset_type,fid,icp"
@@ -177,6 +187,39 @@ def create_progress_bar(percentage: float, length: int = 10) -> str:
     return f"[{bar}] {percentage:.1f}%"
 
 # --- 文件上传辅助函数 ---
+def send_file_safely(context: CallbackContext, chat_id: int, file_path: str, caption: str = "", parse_mode: str = None, filename: str = None):
+    """安全地发送文件，处理Telegram API的大小限制。"""
+    try:
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        TELEGRAM_MAX_FILE_SIZE_MB = 48
+
+        if file_size_mb < TELEGRAM_MAX_FILE_SIZE_MB:
+            with open(file_path, 'rb') as doc:
+                context.bot.send_document(
+                    chat_id, 
+                    document=doc, 
+                    filename=filename or os.path.basename(file_path), 
+                    caption=caption, 
+                    parse_mode=parse_mode, 
+                    timeout=120 
+                )
+        else:
+            message = (
+                f"⚠️ *文件过大*\n\n"
+                f"文件 `{escape_markdown_v2(filename or os.path.basename(file_path))}` \\({file_size_mb:.2f} MB\\) "
+                f"超过了Telegram的发送限制 \\({TELEGRAM_MAX_FILE_SIZE_MB} MB\\)\\."
+            )
+            context.bot.send_message(chat_id, message, parse_mode=ParseMode.MARKDOWN_V2)
+    except FileNotFoundError:
+        logger.error(f"尝试发送文件失败: 文件未找到 at path {file_path}")
+        context.bot.send_message(chat_id, f"❌ 内部错误: 尝试发送结果文件时找不到它。")
+    except (TimedOut, NetworkError) as e:
+        logger.error(f"发送文件 '{file_path}' 时出现网络错误或超时: {e}")
+        context.bot.send_message(chat_id, f"⚠️ 发送文件时网络超时或出错。如果配置了外部上传，请检查那里的链接。")
+    except Exception as e:
+        logger.error(f"发送文件 '{file_path}' 时出现未知错误: {e}")
+        context.bot.send_message(chat_id, f"⚠️ 发送文件时出现未知错误: `{escape_markdown_v2(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
+
 def upload_and_send_links(context: CallbackContext, chat_id: int, file_path: str):
     api_url = CONFIG.get("upload_api_url")
     api_token = CONFIG.get("upload_api_token")
@@ -360,8 +403,7 @@ def run_async_scan_job(context: CallbackContext):
     chat_id, msg, query_hash, mode = job_context['chat_id'], job_context['msg'], job_context['query_hash'], job_context['mode']
     concurrency, timeout = job_context['concurrency'], job_context['timeout']
     
-    current_scan_tasks = load_json_file(SCAN_TASKS_FILE, {})
-    original_query = current_scan_tasks.get(query_hash)
+    original_query = SCAN_TASKS.get(query_hash)
     if not original_query:
         msg.edit_text("❌ 扫描任务已过期或机器人刚刚重启。请重新发起查询以启用扫描。")
         return
@@ -381,8 +423,7 @@ def run_async_scan_job(context: CallbackContext):
     output_filename = generate_filename_from_query(original_query, prefix=f"{mode}_scan")
     with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(sorted(list(live_results))))
     final_caption = f"✅ *异步{escape_markdown_v2(scan_type_text)}完成\!**\n\n共发现 *{len(live_results)}* 个存活目标\\."
-    with open(output_filename, 'rb') as doc:
-        context.bot.send_document(chat_id, document=doc, caption=final_caption, parse_mode=ParseMode.MARKDOWN_V2)
+    send_file_safely(context, chat_id, output_filename, caption=final_caption, parse_mode=ParseMode.MARKDOWN_V2)
     upload_and_send_links(context, chat_id, output_filename)
     os.remove(output_filename); msg.delete()
 
@@ -448,7 +489,7 @@ def run_full_download_query(context: CallbackContext):
     for page in range(1, pages_to_fetch + 1):
         if context.bot_data.get(stop_flag): msg.edit_text("🌀 下载任务已手动停止."); break
         try: msg.edit_text(f"下载进度: {len(unique_results)}/{total_size} (Page {page}/{pages_to_fetch})...")
-        except (BadRequest, RetryAfter): pass
+        except (BadRequest, RetryAfter, TimedOut): pass
         guest_key = job_data.get('guest_key')
         if guest_key:
             data, error = fetch_fofa_data(guest_key, query_text, page, 10000, "host")
@@ -463,7 +504,7 @@ def run_full_download_query(context: CallbackContext):
         msg.edit_text(f"✅ 下载完成！共 {len(unique_results)} 条。正在发送...")
         cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
         shutil.move(output_filename, cache_path)
-        with open(cache_path, 'rb') as doc: bot.send_document(chat_id, document=doc, filename=output_filename)
+        send_file_safely(context, chat_id, cache_path, filename=output_filename)
         upload_and_send_links(context, chat_id, cache_path)
         cache_data = {'file_path': cache_path, 'result_count': len(unique_results)}
         add_or_update_query(query_text, cache_data); offer_post_download_actions(context, chat_id, query_text)
@@ -490,7 +531,7 @@ def run_traceback_download_query(context: CallbackContext):
         current_time = time.time()
         if current_time - last_update_time > 2:
             try: msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
-            except (BadRequest, RetryAfter): pass
+            except (BadRequest, RetryAfter, TimedOut): pass
             last_update_time = current_time
         valid_anchor_found = False
         for i in range(len(results) - 1, -1, -1):
@@ -509,7 +550,7 @@ def run_traceback_download_query(context: CallbackContext):
         msg.edit_text(f"✅ 深度追溯完成！共 {len(unique_results)} 条。{termination_reason}\n正在发送文件...")
         cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
         shutil.move(output_filename, cache_path)
-        with open(cache_path, 'rb') as doc: bot.send_document(chat_id, document=doc, filename=output_filename)
+        send_file_safely(context, chat_id, cache_path, filename=output_filename)
         upload_and_send_links(context, chat_id, cache_path)
         cache_data = {'file_path': cache_path, 'result_count': len(unique_results)}
         add_or_update_query(base_query, cache_data); offer_post_download_actions(context, chat_id, base_query)
@@ -541,7 +582,7 @@ def run_incremental_update_query(context: CallbackContext):
     msg.edit_text(f"4/5: 正在合并数据... (发现 {len(new_results)} 条新数据)"); combined_results = sorted(list(new_results.union(old_results)))
     with open(old_file_path, 'w', encoding='utf-8') as f: f.write("\n".join(combined_results))
     msg.edit_text(f"5/5: 发送更新后的文件... (共 {len(combined_results)} 条)")
-    with open(old_file_path, 'rb') as doc: bot.send_document(chat_id, document=doc, filename=os.path.basename(old_file_path))
+    send_file_safely(context, chat_id, old_file_path)
     upload_and_send_links(context, chat_id, old_file_path)
     cache_data = {'file_path': old_file_path, 'result_count': len(combined_results)}
     add_or_update_query(base_query, cache_data)
@@ -553,7 +594,7 @@ def run_batch_download_query(context: CallbackContext):
     for page in range(1, pages_to_fetch + 1):
         if context.bot_data.get(stop_flag): msg.edit_text("🌀 下载任务已手动停止."); break
         try: msg.edit_text(f"下载进度: {len(results_list)}/{total_size} (Page {page}/{pages_to_fetch})...")
-        except (BadRequest, RetryAfter): pass
+        except (BadRequest, RetryAfter, TimedOut): pass
         data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page, 10000, fields))
         if error: msg.edit_text(f"❌ 第 {page} 页下载出错: {error}"); break
         page_results = data.get('results', [])
@@ -564,8 +605,7 @@ def run_batch_download_query(context: CallbackContext):
         try:
             with open(output_filename, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f); writer.writerow(fields.split(',')); writer.writerows(results_list)
-            with open(output_filename, 'rb') as doc:
-                bot.send_document(chat_id, document=doc, filename=output_filename, caption=f"✅ 自定义导出完成\n查询: `{escape_markdown_v2(query_text)}`", parse_mode=ParseMode.MARKDOWN_V2)
+            send_file_safely(context, chat_id, output_filename, caption=f"✅ 自定义导出完成\n查询: `{escape_markdown_v2(query_text)}`", parse_mode=ParseMode.MARKDOWN_V2)
             upload_and_send_links(context, chat_id, output_filename)
         except Exception as e:
             msg.edit_text(f"❌ 生成或发送CSV文件失败: {e}"); logger.error(f"Failed to generate/send CSV for batch command: {e}")
@@ -596,7 +636,7 @@ def run_batch_traceback_query(context: CallbackContext):
         current_time = time.time()
         if current_time - last_update_time > 2:
             try: msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
-            except (BadRequest, RetryAfter): pass
+            except (BadRequest, RetryAfter, TimedOut): pass
             last_update_time = current_time
         valid_anchor_found = False
         for i in range(len(results) - 1, -1, -1):
@@ -615,8 +655,7 @@ def run_batch_traceback_query(context: CallbackContext):
         try:
             with open(output_filename, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f); writer.writerow(fields.split(',')); writer.writerows(unique_results)
-            with open(output_filename, 'rb') as doc:
-                bot.send_document(chat_id, document=doc, filename=output_filename)
+            send_file_safely(context, chat_id, output_filename)
             upload_and_send_links(context, chat_id, output_filename)
         except Exception as e:
             msg.edit_text(f"❌ 生成或发送CSV文件失败: {e}"); logger.error(f"Failed to generate/send CSV for batch traceback: {e}")
@@ -813,11 +852,9 @@ def cache_choice_callback(update: Update, context: CallbackContext):
         cached_item = find_cached_query(context.user_data['query'])
         if cached_item:
             query.message.edit_text("⬇️ 正在从本地缓存发送文件..."); file_path = cached_item['cache']['file_path']
-            try:
-                with open(file_path, 'rb') as doc: context.bot.send_document(chat_id=update.effective_chat.id, document=doc, filename=os.path.basename(file_path))
-                upload_and_send_links(context, update.effective_chat.id, file_path)
-                query.message.delete()
-            except Exception as e: query.message.edit_text(f"❌ 发送缓存失败: {e}")
+            send_file_safely(context, update.effective_chat.id, file_path, filename=os.path.basename(file_path))
+            upload_and_send_links(context, update.effective_chat.id, file_path)
+            query.message.delete()
         else: query.message.edit_text("❌ 找不到本地缓存记录。")
         return ConversationHandler.END
     elif choice == 'newsearch': return start_new_kkfofa_search(update, context, message_to_edit=query.message)
@@ -949,7 +986,7 @@ def host_command_logic(update: Update, context: CallbackContext):
         fields_str = ",".join(fields_to_try)
         try:
             processing_message.edit_text(f"⏳ 正在尝试以 *等级 {level}* 字段查询\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
-        except (BadRequest, RetryAfter):
+        except (BadRequest, RetryAfter, TimedOut):
             time.sleep(1)
         temp_data, _, _, _, temp_error = execute_query_with_fallback(
             lambda key: fetch_fofa_data(key, query, page_size=100, fields=fields_str)
@@ -995,7 +1032,7 @@ def host_command_logic(update: Update, context: CallbackContext):
         try:
             plain_text_report = re.sub(r'([*_`\[\]\\])', '', full_report)
             with open(report_filename, 'w', encoding='utf-8') as f: f.write(plain_text_report)
-            with open(report_filename, 'rb') as doc: context.bot.send_document(chat_id=update.effective_chat.id, document=doc, caption="📄 完整的详细报告已附上。")
+            send_file_safely(context, update.effective_chat.id, report_filename, caption="📄 完整的详细报告已附上。")
             upload_and_send_links(context, update.effective_chat.id, report_filename)
         finally:
             if os.path.exists(report_filename): os.remove(report_filename)
@@ -1061,7 +1098,7 @@ def lowhost_command(update: Update, context: CallbackContext) -> None:
         try:
             plain_text_report = re.sub(r'([*_`\[\]\\])', '', formatted_text)
             with open(report_filename, 'w', encoding='utf-8') as f: f.write(plain_text_report)
-            with open(report_filename, 'rb') as doc: context.bot.send_document(chat_id=update.effective_chat.id, document=doc, caption="📄 完整的聚合报告已附上。")
+            send_file_safely(context, update.effective_chat.id, report_filename, caption="📄 完整的聚合报告已附上。")
             upload_and_send_links(context, update.effective_chat.id, report_filename)
         finally:
             if os.path.exists(report_filename): os.remove(report_filename)
@@ -1151,7 +1188,7 @@ def run_batch_find_job(context: CallbackContext):
         processed_count += 1
         if processed_count % 10 == 0:
             try: msg.edit_text(f"分析进度: {create_progress_bar(processed_count/total_targets*100)} ({processed_count}/{total_targets})")
-            except (BadRequest, RetryAfter): pass
+            except (BadRequest, RetryAfter, TimedOut): pass
         query = f'ip="{target}"' if ':' not in target else f'host="{target}"'
         data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=1, fields=",".join(features)))
         if not error and data.get('results'):
@@ -1165,8 +1202,7 @@ def run_batch_find_job(context: CallbackContext):
             excel_filename = generate_filename_from_query(os.path.basename(file_path), prefix="analysis", ext=".xlsx")
             df.to_excel(excel_filename, index=False, engine='openpyxl')
             msg.edit_text("✅ 分析完成！正在发送Excel报告...")
-            with open(excel_filename, 'rb') as doc:
-                bot.send_document(chat_id=chat_id, document=doc, caption="📄 详细特征分析Excel报告")
+            send_file_safely(context, chat_id, excel_filename, caption="📄 详细特征分析Excel报告")
             upload_and_send_links(context, chat_id, excel_filename)
             os.remove(excel_filename)
         except Exception as e: msg.edit_text(f"❌ 生成Excel失败: {e}")
@@ -1305,7 +1341,7 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
             try:
                 progress_text = f"⏳ 验证进度: {create_progress_bar((i+1)/total*100)} ({i+1}/{total})"
                 msg.edit_text(progress_text)
-            except (BadRequest, RetryAfter):
+            except (BadRequest, RetryAfter, TimedOut):
                 time.sleep(2)
     
     report = [f"📋 *批量API Key验证报告*"]
@@ -1325,7 +1361,7 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
         try:
             plain_text_report = re.sub(r'([*_`\[\]\\])', '', report_text)
             with open(report_filename, 'w', encoding='utf-8') as f: f.write(plain_text_report)
-            with open(report_filename, 'rb') as doc: context.bot.send_document(chat_id=update.effective_chat.id, document=doc)
+            send_file_safely(context, update.effective_chat.id, report_filename)
         finally:
             if os.path.exists(report_filename): os.remove(report_filename)
     else:
@@ -1371,7 +1407,7 @@ def stop_all_tasks(update: Update, context: CallbackContext):
 @admin_only
 def backup_config_command(update: Update, context: CallbackContext):
     if os.path.exists(CONFIG_FILE):
-        update.effective_chat.send_document(document=open(CONFIG_FILE, 'rb'))
+        send_file_safely(context, update.effective_chat.id, CONFIG_FILE)
         upload_and_send_links(context, update.effective_chat.id, CONFIG_FILE)
     else: update.effective_chat.send_message("❌ 找不到配置文件。")
 @admin_only
@@ -1422,7 +1458,7 @@ def get_import_query(update: Update, context: CallbackContext):
 @admin_only
 def get_log_command(update: Update, context: CallbackContext):
     if os.path.exists(LOG_FILE):
-        update.message.reply_document(document=open(LOG_FILE, 'rb'))
+        send_file_safely(context, update.effective_chat.id, LOG_FILE)
         upload_and_send_links(context, update.effective_chat.id, LOG_FILE)
     else: update.message.reply_text("❌ 未找到日志文件。")
 
@@ -1759,7 +1795,7 @@ def run_allfofa_download_job(context: CallbackContext):
             try:
                 progress_bar = create_progress_bar(len(unique_results) / (limit or total_size) * 100)
                 msg.edit_text(f"下载进度: {progress_bar} ({len(unique_results)} / {limit or total_size})")
-            except (BadRequest, RetryAfter):
+            except (BadRequest, RetryAfter, TimedOut):
                 pass
             last_update_time = current_time
 
@@ -1776,8 +1812,7 @@ def run_allfofa_download_job(context: CallbackContext):
         cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
         shutil.move(output_filename, cache_path)
         
-        with open(cache_path, 'rb') as doc:
-            bot.send_document(chat_id, document=doc, filename=output_filename)
+        send_file_safely(context, chat_id, cache_path, filename=output_filename)
         
         upload_and_send_links(context, chat_id, cache_path)
         cache_data = {'file_path': cache_path, 'result_count': len(unique_results)}
@@ -1809,7 +1844,7 @@ def main() -> None:
     bot_token = CONFIG.get("bot_token")
     if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE": logger.critical("错误: 'bot_token' 未在 config.json 中设置!"); return
     check_and_classify_keys()
-    updater = Updater(token=bot_token, use_context=True)
+    updater = Updater(token=bot_token, use_context=True, request_kwargs={'read_timeout': 20, 'connect_timeout': 20})
     dispatcher = updater.dispatcher
     dispatcher.bot_data['updater'] = updater
     commands = [
