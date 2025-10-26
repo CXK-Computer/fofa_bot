@@ -380,7 +380,7 @@ def run_async_scan_job(context: CallbackContext):
     msg.edit_text("3/3: 正在打包并发送新结果...")
     output_filename = generate_filename_from_query(original_query, prefix=f"{mode}_scan")
     with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(sorted(list(live_results))))
-    final_caption = f"✅ *异步{escape_markdown_v2(scan_type_text)}完成\!**\n\n共发现 *{len(live_results)}* 个存活目标。"
+    final_caption = f"✅ *异步{escape_markdown_v2(scan_type_text)}完成\!**\n\n共发现 *{len(live_results)}* 个存活目标\\."
     with open(output_filename, 'rb') as doc:
         context.bot.send_document(chat_id, document=doc, caption=final_caption, parse_mode=ParseMode.MARKDOWN_V2)
     upload_and_send_links(context, chat_id, output_filename)
@@ -783,7 +783,7 @@ def continent_choice_callback(update: Update, context: CallbackContext):
         if not country_list: query.message.edit_text("❌ 错误：无效的大洲选项。"); return ConversationHandler.END
         country_fofa_string = " || ".join([f'country="{code}"' for code in country_list]); final_query = f"({original_query}) && ({country_fofa_string})"
         context.user_data['query'] = final_query
-        query.message.edit_text(f"查询已构建:\n`{escape_markdown_v2(final_query)}`\n\n正在处理...", parse_mode=ParseMode.MARKDOWN_V2)
+        query.message.edit_text(f"查询已构建:\n`{escape_markdown_v2(final_query)}`\n\n正在处理\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
 
     if command == '/kkfofa':
         return proceed_with_kkfofa_query(update, context, message_to_edit=query.message)
@@ -798,7 +798,7 @@ def proceed_with_kkfofa_query(update: Update, context: CallbackContext, message_
         message_text = (f"✅ *发现缓存*\n\n查询: `{escape_markdown_v2(query_text)}`\n缓存于: *{escape_markdown_v2(time_str)}*\n\n")
         keyboard = []; is_expired = (datetime.now(tz.tzutc()) - dt_utc).total_seconds() > CACHE_EXPIRATION_SECONDS
         if is_expired or not is_admin(update.effective_user.id):
-             message_text += "⚠️ *此缓存已过期或您是访客，无法增量更新。*" if is_expired else ""
+             message_text += "⚠️ *此缓存已过期或您是访客，无法增量更新\\.*" if is_expired else ""
              keyboard.append([InlineKeyboardButton("⬇️ 下载旧缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
         else: 
             message_text += "请选择操作："; keyboard.append([InlineKeyboardButton("🔄 增量更新", callback_data='cache_incremental')]); keyboard.append([InlineKeyboardButton("⬇️ 下载缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
@@ -842,9 +842,9 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
     total_size = data.get('size', 0)
     if total_size == 0: msg.edit_text("🤷‍♀️ 未找到结果。"); return ConversationHandler.END
     context.user_data.update({'total_size': total_size, 'chat_id': update.effective_chat.id, 'is_batch_mode': False})
-    success_message = f"✅ 使用 {used_key_info} 找到 {total_size} 条结果。"
+    success_message = f"✅ 使用 {used_key_info} 找到 {total_size} 条结果\\."
     if total_size <= 10000:
-        msg.edit_text(f"{success_message}\n开始下载...", parse_mode=ParseMode.MARKDOWN_V2); start_download_job(context, run_full_download_query, context.user_data)
+        msg.edit_text(f"{success_message}\n开始下载\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2); start_download_job(context, run_full_download_query, context.user_data)
         return ConversationHandler.END
     else:
         keyboard = [[InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
@@ -906,7 +906,7 @@ def create_host_summary(host_arg, results, fields_list):
                 summary.append(f"*{escape_markdown_v2(key)}:* `{escape_markdown_v2(', '.join(map(str, value)))}`")
             else:
                 summary.append(f"*{escape_markdown_v2(key)}:* `{escape_markdown_v2(value)}`")
-    summary.append("\n📄 *详细报告已作为文件发送。*")
+    summary.append("\n📄 *详细报告已作为文件发送\\.*")
     return "\n".join(summary)
 def format_full_host_report(host_arg, results, fields_list):
     info = get_common_host_info(results, fields_list)
@@ -941,14 +941,14 @@ def host_command_logic(update: Update, context: CallbackContext):
         update.message.reply_text(f"用法: `/host <ip_or_domain>`\n\n示例:\n`/host 1\\.1\\.1\\.1`", parse_mode=ParseMode.MARKDOWN_V2)
         return
     host_arg = context.args[0]
-    processing_message = update.message.reply_text(f"⏳ 正在查询主机 `{escape_markdown_v2(host_arg)}`...", parse_mode=ParseMode.MARKDOWN_V2)
+    processing_message = update.message.reply_text(f"⏳ 正在查询主机 `{escape_markdown_v2(host_arg)}`\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
     query = f'ip="{host_arg}"' if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host_arg) else f'domain="{host_arg}"'
     data, final_fields_list, error = None, [], None
     for level in range(3, -1, -1): 
         fields_to_try = get_fields_by_level(level)
         fields_str = ",".join(fields_to_try)
         try:
-            processing_message.edit_text(f"⏳ 正在尝试以 *等级 {level}* 字段查询...", parse_mode=ParseMode.MARKDOWN_V2)
+            processing_message.edit_text(f"⏳ 正在尝试以 *等级 {level}* 字段查询\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
         except (BadRequest, RetryAfter):
             time.sleep(1)
         temp_data, _, _, _, temp_error = execute_query_with_fallback(
@@ -970,7 +970,7 @@ def host_command_logic(update: Update, context: CallbackContext):
         return
     raw_results = data.get('results', [])
     if not raw_results:
-        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown_v2(host_arg)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN_V2)
+        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown_v2(host_arg)}` 的任何信息\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
     
     unique_services = {}
@@ -1043,13 +1043,13 @@ def lowhost_command(update: Update, context: CallbackContext) -> None:
         return
     host = context.args[0]
     detail = len(context.args) > 1 and context.args[1].lower() == 'detail'
-    processing_message = update.message.reply_text(f"正在查询主机 `{escape_markdown_v2(host)}` 的聚合信息...", parse_mode=ParseMode.MARKDOWN_V2)
+    processing_message = update.message.reply_text(f"正在查询主机 `{escape_markdown_v2(host)}` 的聚合信息\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
     data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_host_info(key, host, detail))
     if error:
         processing_message.edit_text(f"查询失败 😞\n*原因:* `{escape_markdown_v2(error)}`", parse_mode=ParseMode.MARKDOWN_V2)
         return
     if not data:
-        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown_v2(host)}` 的任何信息。", parse_mode=ParseMode.MARKDOWN_V2)
+        processing_message.edit_text(f"🤷‍♀️ 未找到关于 `{escape_markdown_v2(host)}` 的任何信息\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
     if detail:
         formatted_text = format_host_details(data)
@@ -1077,7 +1077,7 @@ def stats_command(update: Update, context: CallbackContext):
     return get_fofa_stats_query(update, context)
 def get_fofa_stats_query(update: Update, context: CallbackContext):
     query_text = " ".join(context.args) if context.args else update.message.text
-    msg = update.message.reply_text(f"⏳ 正在对 `{escape_markdown_v2(query_text)}` 进行聚合统计...", parse_mode=ParseMode.MARKDOWN_V2)
+    msg = update.message.reply_text(f"⏳ 正在对 `{escape_markdown_v2(query_text)}` 进行聚合统计\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
     data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_stats(key, query_text))
     if error: msg.edit_text(f"❌ 统计失败: {error}"); return ConversationHandler.END
     report = [f"📊 *聚合统计报告 for `{escape_markdown_v2(query_text)}`*\n"]
@@ -1248,9 +1248,9 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
             msg.edit_text(f"⚠️ 警告: 您选择的字段 `{', '.join(unauthorized_fields)}` 超出当前可用最高级Key (等级{key_level}) 的权限。请重新选择或升级Key。")
             return ConversationHandler.END
         context.user_data.update({'chat_id': update.effective_chat.id, 'fields': fields_str, 'total_size': total_size, 'is_batch_mode': True })
-        success_message = f"✅ 使用 Key \\[\\#{used_key_index}\\] (等级{key_level}) 找到 {total_size} 条结果。"
+        success_message = f"✅ 使用 Key \\[\\#{used_key_index}\\] (等级{key_level}) 找到 {total_size} 条结果\\."
         if total_size <= 10000:
-            msg.edit_text(f"{success_message}\n开始自定义字段批量导出...", parse_mode=ParseMode.MARKDOWN_V2); start_download_job(context, run_batch_download_query, context.user_data)
+            msg.edit_text(f"{success_message}\n开始自定义字段批量导出\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2); start_download_job(context, run_batch_download_query, context.user_data)
             return ConversationHandler.END
         else:
             keyboard = [[InlineKeyboardButton("💎 导出前1万条", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯导出", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
@@ -1309,7 +1309,7 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
                 time.sleep(2)
     
     report = [f"📋 *批量API Key验证报告*"]
-    report.append(f"\n总计: {total} | 有效: {len(valid_keys)} | 无效: {len(invalid_keys)}\n")
+    report.append(f"\n总计: {total} \\| 有效: {len(valid_keys)} \\| 无效: {len(invalid_keys)}\n")
     if valid_keys:
         report.append("\-\-\- *有效 Keys* \-\-\-")
         report.extend(valid_keys)
@@ -1319,7 +1319,7 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
     
     report_text = "\n".join(report)
     if len(report_text) > 3800:
-        summary = f"✅ 验证完成！\n总计: {total} | 有效: {len(valid_keys)} | 无效: {len(invalid_keys)}\n\n报告过长，已作为文件发送。"
+        summary = f"✅ 验证完成！\n总计: {total} \\| 有效: {len(valid_keys)} \\| 无效: {len(invalid_keys)}\n\n报告过长，已作为文件发送\\."
         msg.edit_text(summary)
         report_filename = f"api_check_report_{int(time.time())}.txt"
         try:
@@ -1417,7 +1417,7 @@ def get_import_query(update: Update, context: CallbackContext):
     shutil.move(temp_path, final_path)
     cache_data = {'file_path': final_path, 'result_count': result_count}
     add_or_update_query(query_text, cache_data)
-    update.message.reply_text(f"✅ 成功导入缓存！\n查询: `{escape_markdown_v2(query_text)}`\n共 {result_count} 条记录。", parse_mode=ParseMode.MARKDOWN_V2)
+    update.message.reply_text(f"✅ 成功导入缓存！\n查询: `{escape_markdown_v2(query_text)}`\n共 {result_count} 条记录\\.", parse_mode=ParseMode.MARKDOWN_V2)
     return ConversationHandler.END
 @admin_only
 def get_log_command(update: Update, context: CallbackContext):
@@ -1641,7 +1641,7 @@ def get_upload_token(update: Update, context: CallbackContext):
 # --- /allfofa Command Logic ---
 def start_allfofa_search(update: Update, context: CallbackContext, message_to_edit=None):
     query_text = context.user_data['query']
-    msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🚚 正在为查询 `{escape_markdown_v2(query_text)}` 准备海量数据获取任务...", parse_mode=ParseMode.MARKDOWN_V2)
+    msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🚚 正在为查询 `{escape_markdown_v2(query_text)}` 准备海量数据获取任务\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
     
     data, used_key, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_next_data(key, query_text, page_size=1))
     if error:
@@ -1772,7 +1772,7 @@ def run_allfofa_download_job(context: CallbackContext):
         with open(output_filename, 'w', encoding='utf-8') as f:
             f.write("\n".join(sorted(list(unique_results))))
         
-        msg.edit_text(f"✅ 海量下载完成！共 {len(unique_results)} 条。{termination_reason}\n正在发送文件...", parse_mode=ParseMode.MARKDOWN_V2)
+        msg.edit_text(f"✅ 海量下载完成！共 {len(unique_results)} 条。{termination_reason}\n正在发送文件\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
         cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
         shutil.move(output_filename, cache_path)
         
@@ -1784,7 +1784,7 @@ def run_allfofa_download_job(context: CallbackContext):
         add_or_update_query(query_text, cache_data)
         offer_post_download_actions(context, chat_id, query_text)
     else:
-        msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}", parse_mode=ParseMode.MARKDOWN_V2)
+        msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据\\.{termination_reason}", parse_mode=ParseMode.MARKDOWN_V2)
     
     context.bot_data.pop(stop_flag, None)
 
