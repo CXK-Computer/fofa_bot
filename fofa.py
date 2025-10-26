@@ -920,7 +920,7 @@ def format_full_host_report(host_arg, results, fields_list):
     report.append("\n\-\-\- *服务详情* \-\-\-\n")
     for res_list in results:
         d = _create_dict_from_fofa_result(res_list, fields_list)
-        port_info = [f"🌐 *Port `{d.get('port')}` ({escape_markdown_v2(d.get('protocol', 'N/A'))})*"]
+        port_info = [f"🌐 *Port `{d.get('port')}` \\({escape_markdown_v2(d.get('protocol', 'N/A'))}\\)*"]
         if d.get('title'): port_info.append(f"  - *标题:* `{escape_markdown_v2(d.get('title'))}`")
         if d.get('server'): port_info.append(f"  - *服务:* `{escape_markdown_v2(d.get('server'))}`")
         if d.get('icp'): port_info.append(f"  - *ICP:* `{escape_markdown_v2(d.get('icp'))}`")
@@ -1009,7 +1009,7 @@ def format_host_summary(data):
     if data.get('ip'): parts.append(f"*IP:* `{escape_markdown_v2(data.get('ip'))}`")
     location = f"{data.get('country_name', '')} {data.get('region', '')} {data.get('city', '')}".strip()
     if location: parts.append(f"*位置:* `{escape_markdown_v2(location)}`")
-    if data.get('asn'): parts.append(f"*ASN:* `{data.get('asn')} ({escape_markdown_v2(data.get('org', 'N/A'))})`")
+    if data.get('asn'): parts.append(f"*ASN:* `{data.get('asn')} \\({escape_markdown_v2(data.get('org', 'N/A'))}\\)`")
     
     if data.get('ports'):
         port_list = data.get('ports', [])
@@ -1029,7 +1029,7 @@ def format_host_details(data):
     summary = format_host_summary(data)
     details = ["\n\-\-\- *端口详情* \-\-\-"]
     for port_info in data.get('port_details', []):
-        port_str = f"\n🌐 *Port `{port_info.get('port')}` ({escape_markdown_v2(port_info.get('protocol', 'N/A'))})*"
+        port_str = f"\n🌐 *Port `{port_info.get('port')}` \\({escape_markdown_v2(port_info.get('protocol', 'N/A'))}\\)*"
         if port_info.get('product'): port_str += f"\n  - *产品:* `{escape_markdown_v2(port_info.get('product'))}`"
         if port_info.get('title'): port_str += f"\n  - *标题:* `{escape_markdown_v2(port_info.get('title'))}`"
         if port_info.get('jarm'): port_str += f"\n  - *JARM:* `{escape_markdown_v2(port_info.get('jarm'))}`"
@@ -1248,7 +1248,7 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
             msg.edit_text(f"⚠️ 警告: 您选择的字段 `{', '.join(unauthorized_fields)}` 超出当前可用最高级Key (等级{key_level}) 的权限。请重新选择或升级Key。")
             return ConversationHandler.END
         context.user_data.update({'chat_id': update.effective_chat.id, 'fields': fields_str, 'total_size': total_size, 'is_batch_mode': True })
-        success_message = f"✅ 使用 Key \\[\\#{used_key_index}\\] (等级{key_level}) 找到 {total_size} 条结果\\."
+        success_message = f"✅ 使用 Key \\[\\#{used_key_index}\\] \\(等级{key_level}\\) 找到 {total_size} 条结果\\."
         if total_size <= 10000:
             msg.edit_text(f"{success_message}\n开始自定义字段批量导出\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2); start_download_job(context, run_batch_download_query, context.user_data)
             return ConversationHandler.END
@@ -1298,9 +1298,9 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
                 elif api_level >= 4: level = 3
                 else: level = 1
             level_name = {0: "免费", 1: "个人", 2: "商业", 3: "企业"}.get(level, "未知")
-            valid_keys.append(f"`...{key[-4:]}` \\- ✅ *有效* ({escape_markdown_v2(data.get('username', 'N/A'))}, {level_name}会员)")
+            valid_keys.append(f"`...{key[-4:]}` \\- ✅ *有效* \\({escape_markdown_v2(data.get('username', 'N/A'))}, {level_name}会员\\)")
         else:
-            invalid_keys.append(f"`...{key[-4:]}` \\- ❌ *无效* (原因: {escape_markdown_v2(error)})")
+            invalid_keys.append(f"`...{key[-4:]}` \\- ❌ *无效* \\(原因: {escape_markdown_v2(error)}\\)")
         if (i + 1) % 10 == 0 or (i + 1) == total:
             try:
                 progress_text = f"⏳ 验证进度: {create_progress_bar((i+1)/total*100)} ({i+1}/{total})"
@@ -1495,7 +1495,7 @@ def show_api_menu(update: Update, context: CallbackContext, force_check=False):
         for i, key in enumerate(CONFIG['apis']):
             level = KEY_LEVELS.get(key, -1)
             level_name = {-1: "❌ 无效", 0: "✅ 免费", 1: "✅ 个人", 2: "✅ 商业", 3: "✅ 企业"}.get(level, "未知")
-            api_list_text.append(f"  `#{i+1}` `...{key[-4:]}` \\- {level_name}")
+            api_list_text.append(f"  `\\#{i+1}` `...{key[-4:]}` \\- {level_name}")
     keyboard = [
         [InlineKeyboardButton("➕ 添加", callback_data='action_add_api'), InlineKeyboardButton("➖ 移除", callback_data='action_remove_api')],
         [InlineKeyboardButton("🔄 状态检查", callback_data='action_check_api'), InlineKeyboardButton("🔙 返回", callback_data='action_back')]
