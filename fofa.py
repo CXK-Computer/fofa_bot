@@ -1,22 +1,16 @@
-# fofa_bot_v10.9.3.py (终极修复 /allfofa [820013] 错误)
+# fofa_bot_v10.9.4.py (代理会话修复 & lastupdatetime 权限修复)
+#
+# v10.9.4 更新日志:
+# 1. 根本性修复 (/allfofa): 彻底解决因代理IP变动导致的 "[820013] 请按顺序进行翻页查询" 错误。
+#    - `/allfofa` 任务现在会“锁定”一个代理和API Key用于整个下载会话。
+#    - 从预检到后台翻页的所有请求都将使用相同的代理IP和Key，确保了FOFA API会话的绝对连续性。
+# 2. 根本性修复 (追溯查询): 彻底解决因权限不足导致的 "[820001] 没有权限搜索lastupdatetime字段" 错误。
+#    - 深度追溯功能 (`/kkfofa` > 1万条, `/batch` > 1万条) 现在会根据当前Key的等级动态决定是否请求 `lastupdatetime` 字段。
+#    - 低等级Key将自动回退到不含时间戳的追溯模式，避免任务失败。
+# 3. 内部重构: 调整了内部API调用函数，使其能够感知Key的等级并支持代理会话锁定，为上述修复提供支持。
 #
 # v10.9.3 更新日志:
-# 1. 根本性修复 (/allfofa): 彻底解决了 /allfofa 命令因“预检”和“下载”步骤状态不一致导致的 "[820013] 请按顺序进行翻页查询" 错误。
-#    - 现在，预检查询会一次性获取第一页数据和 `next_id`。
-#    - 这个完整的初始状态（第一页数据, `next_id`, 使用的Key）会被无损地传递给后台下载任务。
-#    - 后台任务从第二页开始无缝衔接，保证了FOFA API会话的连续性，从而根除了翻页错误。
-#
-# v10.9.2 更新日志:
-# 1. 修复 (/allfofa): 废除了在 /allfofa 下载过程中动态切换Key的逻辑，此逻辑与FOFA `next` 接口的有状态会话机制冲突。
-# 2. 修复 (/allfofa): 修正了当只请求 'host' 字段时，对返回结果（字符串列表）的处理逻辑。
-#
-# v10.9.1 更新日志:
-# 1. 修复 (TCP/子网扫描): 修正了回调数据解析逻辑，确保扫描模式和任务哈希能被正确提取，解决了扫描功能无法启动的问题。
-# 2. 修复 (TCP/子网扫描): 修正了结果文件名中因未转义的 `*` 导致的MarkdownV2语法错误，解决了结果文件发送失败的问题。
-#
-# v10.9 更新日志:
-# 1. 重大修复 (关机/更新死锁): 采用操作系统信号 (SIGINT) 的方式重写了关机逻辑，彻底解决了 RuntimeError: cannot join current thread 死锁问题。
-# 2. 重大修复 (UI崩溃): 修复了在显示查询结果时，因Key编号的 `#` 字符未转义导致的 BadRequest 界面崩溃问题。
+# 1. 修复 (/allfofa): 解决了因“预检”和“下载”步骤状态不一致导致的翻页错误。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -169,14 +163,23 @@ def generate_filename_from_query(query_text: str, prefix: str = "fofa", ext: str
     max_len = 100
     if len(sanitized_query) > max_len: sanitized_query = sanitized_query[:max_len].rsplit('_', 1)[0]
     timestamp = int(time.time()); return f"{prefix}_{sanitized_query}_{timestamp}{ext}"
-def get_proxies():
-    proxies_list = CONFIG.get("proxies", [])
-    if not proxies_list:
-        single_proxy = CONFIG.get("proxy")
-        if single_proxy: return {"http": single_proxy, "https": single_proxy}
-        return None
-    chosen_proxy = random.choice(proxies_list)
-    return {"http": chosen_proxy, "https": chosen_proxy}
+def get_proxies(proxy_to_use=None):
+    """
+    返回一个代理配置字典。
+    如果提供了 proxy_to_use，则专门使用它。
+    否则，从代理池中随机选择一个。
+    """
+    proxy_str = proxy_to_use
+    if proxy_str is None:
+        proxies_list = CONFIG.get("proxies", [])
+        if proxies_list:
+            proxy_str = random.choice(proxies_list)
+        else:
+            proxy_str = CONFIG.get("proxy")
+    
+    if proxy_str:
+        return {"http": proxy_str, "https": proxy_str}
+    return None
 def is_admin(user_id: int) -> bool: return user_id in CONFIG.get('admins', [])
 def admin_only(func):
     @wraps(func)
@@ -265,14 +268,18 @@ def upload_and_send_links(context: CallbackContext, chat_id: int, file_path: str
         context.bot.send_message(chat_id, f"⚠️ 文件上传到外部服务器失败: `{escape_markdown_v2(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
 
 # --- FOFA API 核心逻辑 ---
-def _make_api_request(url, params, timeout=60, use_b64=True, retries=10):
+def _make_api_request(url, params, timeout=60, use_b64=True, retries=10, proxy_session=None):
     if use_b64 and 'q' in params:
         params['qbase64'] = base64.b64encode(params.pop('q').encode('utf-8')).decode('utf-8')
+    
     last_error = None
+    # v10.9.4 FIX: 为整个重试循环确定代理。
+    # 如果传递了特定的会话，则使用它。否则，为此尝试获取一个随机的。
+    request_proxies = get_proxies(proxy_to_use=proxy_session)
+
     for attempt in range(retries):
         try:
-            proxies = get_proxies()
-            response = requests.get(url, params=params, timeout=timeout, proxies=proxies, verify=False)
+            response = requests.get(url, params=params, timeout=timeout, proxies=request_proxies, verify=False)
             if response.status_code == 429:
                 wait_time = 5 * (attempt + 1)
                 logger.warning(f"FOFA API rate limit hit (429). Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{retries})")
@@ -294,22 +301,24 @@ def _make_api_request(url, params, timeout=60, use_b64=True, retries=10):
     logger.error(f"API request failed after {retries} retries. Last error: {last_error}")
     return None, last_error if last_error else "API请求未知错误"
 def verify_fofa_api(key): return _make_api_request(FOFA_INFO_URL, {'key': key}, timeout=15, use_b64=False, retries=3)
-def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host"):
+def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host", proxy_session=None):
     query_lower = query.lower()
     if 'body=' in query_lower: page_size = min(page_size, 500)
     elif 'cert=' in query_lower: page_size = min(page_size, 2000)
-    params = {'key': key, 'q': query, 'size': page_size, 'page': page, 'fields': fields, 'full': CONFIG.get("full_mode", False)}; return _make_api_request(FOFA_SEARCH_URL, params)
-def fetch_fofa_stats(key, query):
-    params = {'key': key, 'q': query, 'fields': FOFA_STATS_FIELDS}; return _make_api_request(FOFA_STATS_URL, params)
-def fetch_fofa_host_info(key, host, detail=False):
+    params = {'key': key, 'q': query, 'size': page_size, 'page': page, 'fields': fields, 'full': CONFIG.get("full_mode", False)}
+    return _make_api_request(FOFA_SEARCH_URL, params, proxy_session=proxy_session)
+def fetch_fofa_stats(key, query, proxy_session=None):
+    params = {'key': key, 'q': query, 'fields': FOFA_STATS_FIELDS}
+    return _make_api_request(FOFA_STATS_URL, params, proxy_session=proxy_session)
+def fetch_fofa_host_info(key, host, detail=False, proxy_session=None):
     url = FOFA_HOST_BASE_URL + host
     params = {'key': key, 'detail': str(detail).lower()}
-    return _make_api_request(url, params, use_b64=False)
-def fetch_fofa_next_data(key, query, next_id=None, page_size=10000, fields="host"):
+    return _make_api_request(url, params, use_b64=False, proxy_session=proxy_session)
+def fetch_fofa_next_data(key, query, next_id=None, page_size=10000, fields="host", proxy_session=None):
     params = {'key': key, 'q': query, 'size': page_size, 'fields': fields, 'full': CONFIG.get("full_mode", False)}
     # FIX: Ensure 'next' parameter is always present, and empty on the first call, to comply with API spec.
     params['next'] = next_id if next_id is not None else ""
-    return _make_api_request(FOFA_NEXT_URL, params)
+    return _make_api_request(FOFA_NEXT_URL, params, proxy_session=proxy_session)
 
 def check_and_classify_keys():
     logger.info("--- 开始检查并分类API Keys ---")
@@ -342,28 +351,45 @@ def get_fields_by_level(level):
     if level == 1: return PERSONAL_FIELDS
     return FREE_FIELDS
 
-def execute_query_with_fallback(query_func, preferred_key_index=None):
-    if not CONFIG['apis']: return None, None, None, None, "没有配置任何API Key。"
+def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_session=None):
+    if not CONFIG['apis']: return None, None, None, None, None, "没有配置任何API Key。"
     keys_to_try = [k for k in CONFIG['apis'] if KEY_LEVELS.get(k, -1) != -1]
-    if not keys_to_try: return None, None, None, None, "所有配置的API Key都无效。"
+    if not keys_to_try: return None, None, None, None, None, "所有配置的API Key都无效。"
+    
     start_index = 0
     if preferred_key_index is not None and 1 <= preferred_key_index <= len(CONFIG['apis']):
         preferred_key = CONFIG['apis'][preferred_key_index - 1]
         if preferred_key in keys_to_try:
             start_index = keys_to_try.index(preferred_key)
+
+    # v10.9.4 FIX: 如果未锁定代理会话，则在此回退序列的持续时间内选择一个。
+    current_proxy_session_str = proxy_session
+    if current_proxy_session_str is None:
+        proxies_list = CONFIG.get("proxies", [])
+        if proxies_list:
+            current_proxy_session_str = random.choice(proxies_list)
+        else:
+            current_proxy_session_str = CONFIG.get("proxy")
+
     for i in range(len(keys_to_try)):
         idx = (start_index + i) % len(keys_to_try)
         key = keys_to_try[idx]
         key_num = CONFIG['apis'].index(key) + 1
         key_level = KEY_LEVELS.get(key, 0)
-        data, error = query_func(key)
+        
+        # v10.9.4 FIX: 将key、key_level和一致的proxy_session传递给查询函数。
+        data, error = query_func(key, key_level, current_proxy_session_str)
+        
         if not error:
-            return data, key, key_num, key_level, None
+            # 返回成功使用的代理。
+            return data, key, key_num, key_level, current_proxy_session_str, None
         if "[820031]" in str(error):
             logger.warning(f"Key [#{key_num}] F点余额不足...");
             continue
-        return None, key, key_num, key_level, error
-    return None, None, None, None, "所有Key均尝试失败 (可能F点均不足)。"
+        # 对于其他错误，快速失败并返回问题key的信息
+        return None, key, key_num, key_level, current_proxy_session_str, error
+        
+    return None, None, None, None, None, "所有Key均尝试失败 (可能F点均不足)。"
 
 # --- 异步扫描逻辑 ---
 async def async_check_port(host, port, timeout):
@@ -515,7 +541,9 @@ def run_full_download_query(context: CallbackContext):
         if guest_key:
             data, error = fetch_fofa_data(guest_key, query_text, page, 10000, "host")
         else:
-            data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page, 10000, "host"))
+            data, _, _, _, _, error = execute_query_with_fallback(
+                lambda key, key_level, proxy_session: fetch_fofa_data(key, query_text, page, 10000, "host", proxy_session=proxy_session)
+            )
         if error: msg.edit_text(f"❌ 第 {page} 页下载出错: {error}"); break
         results = data.get('results', []);
         if not results: break
@@ -537,23 +565,59 @@ def run_traceback_download_query(context: CallbackContext):
     msg = bot.send_message(chat_id, "⏳ 开始深度追溯下载...")
     current_query = base_query
     guest_key = job_data.get('guest_key')
+    
+    # v10.9.4 FIX: 为整个追溯过程锁定一个代理会话
+    locked_proxy_session = None
+
     while True:
         page_count += 1
         if context.bot_data.get(stop_flag): termination_reason = "\n\n🌀 任务已手动停止."; break
+
+        fields_were_extended = False
         if guest_key:
-            data, error = fetch_fofa_data(guest_key, current_query, 1, 10000, "host,lastupdatetime")
+            # Guest keys are assumed to be low-level, don't request lastupdatetime
+            data, error = fetch_fofa_data(guest_key, current_query, 1, 10000, fields="host")
         else:
-            data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, current_query, 1, 10000, "host,lastupdatetime"))
+            def query_logic(key, key_level, proxy_session):
+                nonlocal fields_were_extended
+                # Personal members and above can search this field.
+                if key_level >= 1:
+                    fields_were_extended = True
+                    return fetch_fofa_data(key, current_query, 1, 10000, fields="host,lastupdatetime", proxy_session=proxy_session)
+                else:
+                    fields_were_extended = False
+                    return fetch_fofa_data(key, current_query, 1, 10000, fields="host", proxy_session=proxy_session)
+            
+            # 仅在第一次迭代时选择并锁定代理
+            if locked_proxy_session is None:
+                data, _, _, _, locked_proxy_session, error = execute_query_with_fallback(query_logic)
+            else:
+                data, _, _, _, _, error = execute_query_with_fallback(query_logic, proxy_session=locked_proxy_session)
+
         if error: termination_reason = f"\n\n❌ 第 {page_count} 轮出错: {error}"; break
         results = data.get('results', [])
         if not results: termination_reason = "\n\nℹ️ 已获取所有查询结果."; break
-        original_count = len(unique_results); unique_results.update([r[0] for r in results if r and r[0] and ':' in r[0]]); newly_added_count = len(unique_results) - original_count
+
+        if fields_were_extended:
+            newly_added = [r[0] for r in results if r and r[0] and ':' in r[0]]
+        else:
+            newly_added = [r for r in results if r and ':' in r]
+        
+        original_count = len(unique_results)
+        unique_results.update(newly_added)
+        newly_added_count = len(unique_results) - original_count
+
         if limit and len(unique_results) >= limit: unique_results = set(list(unique_results)[:limit]); termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限。"; break
         current_time = time.time()
         if current_time - last_update_time > 2:
             try: msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
             except (BadRequest, RetryAfter, TimedOut): pass
             last_update_time = current_time
+
+        if not fields_were_extended:
+             termination_reason = "\n\n⚠️ 当前Key等级不支持时间追溯，已获取第一页结果。"
+             break
+        
         valid_anchor_found = False
         for i in range(len(results) - 1, -1, -1):
             if not results[i] or len(results[i]) < 2 or not results[i][1]: continue
@@ -585,11 +649,17 @@ def run_incremental_update_query(context: CallbackContext):
     try:
         with open(old_file_path, 'r', encoding='utf-8') as f: old_results = set(line.strip() for line in f if line.strip() and ':' in line)
     except Exception as e: msg.edit_text(f"❌ 读取本地缓存文件失败: {e}"); return
-    msg.edit_text("2/5: 正在确定更新起始点..."); data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, base_query, fields="lastupdatetime"))
+    msg.edit_text("2/5: 正在确定更新起始点..."); 
+    data, _, _, _, _, error = execute_query_with_fallback(
+        lambda key, key_level, proxy_session: fetch_fofa_data(key, base_query, fields="lastupdatetime", proxy_session=proxy_session)
+    )
     if error or not data.get('results'): msg.edit_text(f"❌ 无法获取最新记录时间戳: {error or '无结果'}"); return
     ts_str = data['results'][0][0] if isinstance(data['results'][0], list) else data['results'][0]; cutoff_date = ts_str.split(' ')[0]
     incremental_query = f'({base_query}) && after="{cutoff_date}"'
-    msg.edit_text(f"3/5: 正在侦察自 {cutoff_date} 以来的新数据..."); data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, incremental_query, page_size=1))
+    msg.edit_text(f"3/5: 正在侦察自 {cutoff_date} 以来的新数据..."); 
+    data, _, _, _, _, error = execute_query_with_fallback(
+        lambda key, key_level, proxy_session: fetch_fofa_data(key, incremental_query, page_size=1, proxy_session=proxy_session)
+    )
     if error: msg.edit_text(f"❌ 侦察查询失败: {error}"); return
     total_new_size = data.get('size', 0)
     if total_new_size == 0: msg.edit_text("✅ 未发现新数据。缓存已是最新。"); return
@@ -597,7 +667,9 @@ def run_incremental_update_query(context: CallbackContext):
     for page in range(1, pages_to_fetch + 1):
         if context.bot_data.get(stop_flag): msg.edit_text("🌀 增量更新已手动停止。"); return
         msg.edit_text(f"3/5: 正在下载新数据... ( Page {page}/{pages_to_fetch} )")
-        data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, incremental_query, page=page, page_size=10000))
+        data, _, _, _, _, error = execute_query_with_fallback(
+            lambda key, key_level, proxy_session: fetch_fofa_data(key, incremental_query, page=page, page_size=10000, proxy_session=proxy_session)
+        )
         if error: msg.edit_text(f"❌ 下载新数据失败: {error}"); return
         if data.get('results'): new_results.update(res for res in data.get('results', []) if ':' in res)
     msg.edit_text(f"4/5: 正在合并数据... (发现 {len(new_results)} 条新数据)"); combined_results = sorted(list(new_results.union(old_results)))
@@ -616,7 +688,9 @@ def run_batch_download_query(context: CallbackContext):
         if context.bot_data.get(stop_flag): msg.edit_text("🌀 下载任务已手动停止."); break
         try: msg.edit_text(f"下载进度: {len(results_list)}/{total_size} (Page {page}/{pages_to_fetch})...")
         except (BadRequest, RetryAfter, TimedOut): pass
-        data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page, 10000, fields))
+        data, _, _, _, _, error = execute_query_with_fallback(
+            lambda key, key_level, proxy_session: fetch_fofa_data(key, query_text, page, 10000, fields, proxy_session=proxy_session)
+        )
         if error: msg.edit_text(f"❌ 第 {page} 页下载出错: {error}"); break
         page_results = data.get('results', [])
         if not page_results: break
@@ -641,24 +715,52 @@ def run_batch_traceback_query(context: CallbackContext):
     unique_results, page_count, last_page_date, termination_reason, stop_flag, last_update_time = [], 0, None, "", f'stop_job_{chat_id}', 0
     msg = bot.send_message(chat_id, "⏳ 开始自定义字段深度追溯下载...")
     current_query = base_query; seen_hashes = set()
+    
+    # v10.9.4 FIX: 为整个追溯过程锁定一个代理会话
+    locked_proxy_session = None
+
     while True:
         page_count += 1
         if context.bot_data.get(stop_flag): termination_reason = "\n\n🌀 任务已手动停止."; break
-        data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, current_query, 1, 10000, fields + ",lastupdatetime"))
+        
+        fields_were_extended = False
+        def query_logic(key, key_level, proxy_session):
+            nonlocal fields_were_extended
+            if key_level >= 1:
+                fields_were_extended = True
+                return fetch_fofa_data(key, current_query, 1, 10000, fields=fields + ",lastupdatetime", proxy_session=proxy_session)
+            else:
+                fields_were_extended = False
+                return fetch_fofa_data(key, current_query, 1, 10000, fields=fields, proxy_session=proxy_session)
+
+        # 仅在第一次迭代时选择并锁定代理
+        if locked_proxy_session is None:
+            data, _, _, _, locked_proxy_session, error = execute_query_with_fallback(query_logic)
+        else:
+            data, _, _, _, _, error = execute_query_with_fallback(query_logic, proxy_session=locked_proxy_session)
+
         if error: termination_reason = f"\n\n❌ 第 {page_count} 轮出错: {error}"; break
         results = data.get('results', [])
         if not results: termination_reason = "\n\nℹ️ 已获取所有查询结果."; break
+
         newly_added_count = 0
         for r in results:
             r_hash = hashlib.md5(str(r).encode()).hexdigest()
             if r_hash not in seen_hashes:
-                seen_hashes.add(r_hash); unique_results.append(r[:-1]); newly_added_count += 1
+                seen_hashes.add(r_hash)
+                unique_results.append(r[:-1] if fields_were_extended else r)
+                newly_added_count += 1
         if limit and len(unique_results) >= limit: unique_results = unique_results[:limit]; termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限。"; break
         current_time = time.time()
         if current_time - last_update_time > 2:
             try: msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
             except (BadRequest, RetryAfter, TimedOut): pass
             last_update_time = current_time
+
+        if not fields_were_extended:
+             termination_reason = "\n\n⚠️ 当前Key等级不支持时间追溯，已获取第一页结果。"
+             break
+        
         valid_anchor_found = False
         for i in range(len(results) - 1, -1, -1):
             if not results[i] or len(results[i]) < 2 or not results[i][-1]: continue
@@ -893,7 +995,10 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
         data, error = fetch_fofa_data(guest_key, query_text, page_size=1, fields="host")
         used_key_info = "您的Key"
     else:
-        data, _, used_key_index, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page_size=1, fields="host"), key_index)
+        data, _, used_key_index, _, _, error = execute_query_with_fallback(
+            lambda key, key_level, proxy_session: fetch_fofa_data(key, query_text, page_size=1, fields="host", proxy_session=proxy_session),
+            preferred_key_index=key_index
+        )
         # v10.9 FIX: Escape the '#' character for MarkdownV2
         used_key_info = f"Key \\[\\#{used_key_index}\\]"
     if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
@@ -1009,8 +1114,8 @@ def host_command_logic(update: Update, context: CallbackContext):
             processing_message.edit_text(f"⏳ 正在尝试以 *等级 {level}* 字段查询\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
         except (BadRequest, RetryAfter, TimedOut):
             time.sleep(1)
-        temp_data, _, _, _, temp_error = execute_query_with_fallback(
-            lambda key: fetch_fofa_data(key, query, page_size=100, fields=fields_str)
+        temp_data, _, _, _, _, temp_error = execute_query_with_fallback(
+            lambda key, key_level, proxy_session: fetch_fofa_data(key, query, page_size=100, fields=fields_str, proxy_session=proxy_session)
         )
         if not temp_error:
             data = temp_data
@@ -1102,7 +1207,9 @@ def lowhost_command(update: Update, context: CallbackContext) -> None:
     host = context.args[0]
     detail = len(context.args) > 1 and context.args[1].lower() == 'detail'
     processing_message = update.message.reply_text(f"正在查询主机 `{escape_markdown_v2(host)}` 的聚合信息\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
-    data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_host_info(key, host, detail))
+    data, _, _, _, _, error = execute_query_with_fallback(
+        lambda key, key_level, proxy_session: fetch_fofa_host_info(key, host, detail, proxy_session=proxy_session)
+    )
     if error:
         processing_message.edit_text(f"查询失败 😞\n*原因:* `{escape_markdown_v2(error)}`", parse_mode=ParseMode.MARKDOWN_V2)
         return
@@ -1136,7 +1243,9 @@ def stats_command(update: Update, context: CallbackContext):
 def get_fofa_stats_query(update: Update, context: CallbackContext):
     query_text = " ".join(context.args) if context.args else update.message.text
     msg = update.message.reply_text(f"⏳ 正在对 `{escape_markdown_v2(query_text)}` 进行聚合统计\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
-    data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_stats(key, query_text))
+    data, _, _, _, _, error = execute_query_with_fallback(
+        lambda key, key_level, proxy_session: fetch_fofa_stats(key, query_text, proxy_session=proxy_session)
+    )
     if error: msg.edit_text(f"❌ 统计失败: {error}"); return ConversationHandler.END
     report = [f"📊 *聚合统计报告 for `{escape_markdown_v2(query_text)}`*\n"]
     for field, aggs in data.items():
@@ -1211,7 +1320,9 @@ def run_batch_find_job(context: CallbackContext):
             try: msg.edit_text(f"分析进度: {create_progress_bar(processed_count/total_targets*100)} ({processed_count}/{total_targets})")
             except (BadRequest, RetryAfter, TimedOut): pass
         query = f'ip="{target}"' if ':' not in target else f'host="{target}"'
-        data, _, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query, page_size=1, fields=",".join(features)))
+        data, _, _, _, _, error = execute_query_with_fallback(
+            lambda key, key_level, proxy_session: fetch_fofa_data(key, query, page_size=1, fields=",".join(features), proxy_session=proxy_session)
+        )
         if not error and data.get('results'):
             result = data['results'][0]
             row_data = {'Target': target}
@@ -1295,7 +1406,9 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
         query_text = context.user_data['query']
         fields_str = ",".join(list(selected_fields))
         msg = query.message.edit_text("正在执行查询以预估数据量...")
-        data, _, used_key_index, key_level, error = execute_query_with_fallback(lambda key: fetch_fofa_data(key, query_text, page_size=1, fields="host"))
+        data, _, used_key_index, key_level, _, error = execute_query_with_fallback(
+            lambda key, key_level, proxy_session: fetch_fofa_data(key, query_text, page_size=1, fields="host", proxy_session=proxy_session)
+        )
         if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
         total_size = data.get('size', 0)
         if total_size == 0: msg.edit_text("🤷‍♀️ 未找到结果。"); return ConversationHandler.END
@@ -1700,8 +1813,11 @@ def start_allfofa_search(update: Update, context: CallbackContext, message_to_ed
     query_text = context.user_data['query']
     msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🚚 正在为查询 `{escape_markdown_v2(query_text)}` 准备海量数据获取任务\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
     
-    # v10.9.3 FIX: Perform pre-check and immediately capture initial state (results, next_id).
-    data, used_key, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_next_data(key, query_text, page_size=10000))
+    # v10.9.4 FIX: Perform pre-check and CAPTURE the proxy session used.
+    data, used_key, _, _, used_proxy, error = execute_query_with_fallback(
+        lambda key, level, proxy: fetch_fofa_next_data(key, query_text, page_size=10000, proxy_session=proxy)
+    )
+
     if error:
         msg.edit_text(f"❌ 查询预检失败: {escape_markdown_v2(error)}", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
@@ -1711,7 +1827,6 @@ def start_allfofa_search(update: Update, context: CallbackContext, message_to_ed
         msg.edit_text("🤷‍♀️ 未找到任何结果。")
         return ConversationHandler.END
 
-    # v10.9.3 FIX: Capture the state from the very first API call.
     initial_results = data.get('results', [])
     initial_next_id = data.get('next')
 
@@ -1721,6 +1836,8 @@ def start_allfofa_search(update: Update, context: CallbackContext, message_to_ed
     context.user_data['start_key'] = used_key
     context.user_data['initial_results'] = initial_results
     context.user_data['initial_next_id'] = initial_next_id
+    # v10.9.4 FIX: Lock the proxy session for the background job.
+    context.user_data['proxy_session'] = used_proxy
 
     keyboard = [
         [InlineKeyboardButton(f"♾️ 全部获取 ({total_size}条)", callback_data='allfofa_limit_none')],
@@ -1762,13 +1879,15 @@ def allfofa_get_limit(update: Update, context: CallbackContext):
 def run_allfofa_download_job(context: CallbackContext):
     job_data = context.job.context
     bot, chat_id, query_text = context.bot, job_data['chat_id'], job_data['query']
-    limit, total_size, start_key = job_data.get('limit'), job_data.get('total_size'), job_data.get('start_key')
-    
-    # v10.9.3 FIX: Receive the initial state from the pre-check.
+    limit, total_size = job_data.get('limit'), job_data.get('total_size')
+
+    # v10.9.4 FIX: Receive the locked-in key AND proxy session from the pre-check.
+    start_key = job_data.get('start_key')
+    proxy_session = job_data.get('proxy_session')
+
     initial_results = job_data.get('initial_results', [])
     initial_next_id = job_data.get('initial_next_id')
 
-    # The job will now stick to the initial pre-checked key.
     if not start_key or KEY_LEVELS.get(start_key, -1) == -1:
         bot.send_message(chat_id, "❌ 任务失败：没有可用的有效API Key或起始Key无效。")
         return
@@ -1776,30 +1895,27 @@ def run_allfofa_download_job(context: CallbackContext):
     current_key = start_key
     output_filename = generate_filename_from_query(query_text, prefix="allfofa")
     
-    # v10.9.3 FIX: Initialize the results set with the data from the first page.
     unique_results = set(res for res in initial_results if isinstance(res, str) and ':' in res)
     
     stop_flag = f'stop_job_{chat_id}'
     msg = bot.send_message(chat_id, "⏳ 开始使用 `next` 接口进行海量下载...")
     
-    # v10.9.3 FIX: Start the loop with the next_id from the first page.
     next_id, termination_reason, last_update_time = initial_next_id, "", 0
 
-    # If the first page already contained all results, we can stop early.
     if not next_id:
         termination_reason = "\n\nℹ️ 已获取所有查询结果 (仅有一页数据)."
-    # If the limit is already met by the first page, also stop.
     elif limit and len(unique_results) >= limit:
         unique_results = set(list(unique_results)[:limit])
         termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限 (仅有一页数据)。"
-        next_id = None # Prevent loop from running
+        next_id = None
 
     while next_id:
         if context.bot_data.get(stop_flag):
             termination_reason = "\n\n🌀 任务已手动停止."
             break
 
-        data, error = fetch_fofa_next_data(current_key, query_text, next_id=next_id, fields="host")
+        # v10.9.4 FIX: Use the locked-in proxy for all subsequent `next` calls.
+        data, error = fetch_fofa_next_data(current_key, query_text, next_id=next_id, fields="host", proxy_session=proxy_session)
 
         if error:
             termination_reason = f"\n\n❌ 下载过程中出错: {escape_markdown_v2(error)}"
