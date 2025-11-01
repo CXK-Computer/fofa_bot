@@ -1,4 +1,8 @@
-# fofa_bot_v10.9.4.py (代理会话修复 & lastupdatetime 权限修复)
+# fofa_bot_v10.9.5.py (allfofa Key 等级限制)
+#
+# v10.9.5 更新日志:
+# 1. 优化 (/allfofa): `/allfofa` 海量下载任务现在会优先使用并要求至少为“个人会员”等级的API Key。
+#    - 此举旨在避免因使用F点不足的免费Key而导致下载任务中途失败。
 #
 # v10.9.4 更新日志:
 # 1. 根本性修复 (/allfofa): 彻底解决因代理IP变动导致的 "[820013] 请按顺序进行翻页查询" 错误。
@@ -351,10 +355,15 @@ def get_fields_by_level(level):
     if level == 1: return PERSONAL_FIELDS
     return FREE_FIELDS
 
-def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_session=None):
+def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_session=None, min_level=0):
     if not CONFIG['apis']: return None, None, None, None, None, "没有配置任何API Key。"
-    keys_to_try = [k for k in CONFIG['apis'] if KEY_LEVELS.get(k, -1) != -1]
-    if not keys_to_try: return None, None, None, None, None, "所有配置的API Key都无效。"
+    
+    keys_to_try = [k for k in CONFIG['apis'] if KEY_LEVELS.get(k, -1) >= min_level]
+    
+    if not keys_to_try:
+        if min_level > 0:
+            return None, None, None, None, None, f"没有找到等级不低于“个人会员”的有效API Key以执行此操作。"
+        return None, None, None, None, None, "所有配置的API Key都无效。"
     
     start_index = 0
     if preferred_key_index is not None and 1 <= preferred_key_index <= len(CONFIG['apis']):
@@ -1813,9 +1822,10 @@ def start_allfofa_search(update: Update, context: CallbackContext, message_to_ed
     query_text = context.user_data['query']
     msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🚚 正在为查询 `{escape_markdown_v2(query_text)}` 准备海量数据获取任务\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
     
-    # v10.9.4 FIX: Perform pre-check and CAPTURE the proxy session used.
+    # v10.9.5 FIX: Set min_level=1 for /allfofa pre-check to ensure a VIP key is used.
     data, used_key, _, _, used_proxy, error = execute_query_with_fallback(
-        lambda key, level, proxy: fetch_fofa_next_data(key, query_text, page_size=10000, proxy_session=proxy)
+        lambda key, key_level, proxy_session: fetch_fofa_next_data(key, query_text, page_size=10000, proxy_session=proxy_session),
+        min_level=1
     )
 
     if error:
