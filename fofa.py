@@ -1,9 +1,22 @@
-# fofa_bot_v10.9.py (终极修复关机死锁 & 修复MarkdownV2 '#' 崩溃)
+# fofa_bot_v10.9.3.py (终极修复 /allfofa [820013] 错误)
+#
+# v10.9.3 更新日志:
+# 1. 根本性修复 (/allfofa): 彻底解决了 /allfofa 命令因“预检”和“下载”步骤状态不一致导致的 "[820013] 请按顺序进行翻页查询" 错误。
+#    - 现在，预检查询会一次性获取第一页数据和 `next_id`。
+#    - 这个完整的初始状态（第一页数据, `next_id`, 使用的Key）会被无损地传递给后台下载任务。
+#    - 后台任务从第二页开始无缝衔接，保证了FOFA API会话的连续性，从而根除了翻页错误。
+#
+# v10.9.2 更新日志:
+# 1. 修复 (/allfofa): 废除了在 /allfofa 下载过程中动态切换Key的逻辑，此逻辑与FOFA `next` 接口的有状态会话机制冲突。
+# 2. 修复 (/allfofa): 修正了当只请求 'host' 字段时，对返回结果（字符串列表）的处理逻辑。
+#
+# v10.9.1 更新日志:
+# 1. 修复 (TCP/子网扫描): 修正了回调数据解析逻辑，确保扫描模式和任务哈希能被正确提取，解决了扫描功能无法启动的问题。
+# 2. 修复 (TCP/子网扫描): 修正了结果文件名中因未转义的 `*` 导致的MarkdownV2语法错误，解决了结果文件发送失败的问题。
 #
 # v10.9 更新日志:
-# 1. 重大修复 (关机/更新死锁): 采用操作系统信号 (SIGINT) 的方式重写了关机逻辑，彻底解决了 RuntimeError: cannot join current thread 死锁问题，确保关机和更新流程的绝对稳定。
+# 1. 重大修复 (关机/更新死锁): 采用操作系统信号 (SIGINT) 的方式重写了关机逻辑，彻底解决了 RuntimeError: cannot join current thread 死锁问题。
 # 2. 重大修复 (UI崩溃): 修复了在显示查询结果时，因Key编号的 `#` 字符未转义导致的 BadRequest 界面崩溃问题。
-# 3. 保留了v10.8所有修复 (`/allfofa` 智能Key切换, 按钮点击崩溃, systemd重启, 扫描持久化)。
 #
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
@@ -1687,7 +1700,8 @@ def start_allfofa_search(update: Update, context: CallbackContext, message_to_ed
     query_text = context.user_data['query']
     msg = message_to_edit if message_to_edit else update.effective_message.reply_text(f"🚚 正在为查询 `{escape_markdown_v2(query_text)}` 准备海量数据获取任务\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
     
-    data, used_key, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_next_data(key, query_text, page_size=1))
+    # v10.9.3 FIX: Perform pre-check and immediately capture initial state (results, next_id).
+    data, used_key, _, _, error = execute_query_with_fallback(lambda key: fetch_fofa_next_data(key, query_text, page_size=10000))
     if error:
         msg.edit_text(f"❌ 查询预检失败: {escape_markdown_v2(error)}", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
@@ -1697,10 +1711,16 @@ def start_allfofa_search(update: Update, context: CallbackContext, message_to_ed
         msg.edit_text("🤷‍♀️ 未找到任何结果。")
         return ConversationHandler.END
 
+    # v10.9.3 FIX: Capture the state from the very first API call.
+    initial_results = data.get('results', [])
+    initial_next_id = data.get('next')
+
     context.user_data['query'] = query_text
     context.user_data['total_size'] = total_size
     context.user_data['chat_id'] = update.effective_chat.id
     context.user_data['start_key'] = used_key
+    context.user_data['initial_results'] = initial_results
+    context.user_data['initial_next_id'] = initial_next_id
 
     keyboard = [
         [InlineKeyboardButton(f"♾️ 全部获取 ({total_size}条)", callback_data='allfofa_limit_none')],
@@ -1743,55 +1763,54 @@ def run_allfofa_download_job(context: CallbackContext):
     job_data = context.job.context
     bot, chat_id, query_text = context.bot, job_data['chat_id'], job_data['query']
     limit, total_size, start_key = job_data.get('limit'), job_data.get('total_size'), job_data.get('start_key')
+    
+    # v10.9.3 FIX: Receive the initial state from the pre-check.
+    initial_results = job_data.get('initial_results', [])
+    initial_next_id = job_data.get('initial_next_id')
 
-    keys_to_try = [k for k in CONFIG['apis'] if KEY_LEVELS.get(k, -1) != -1]
-    if not keys_to_try:
-        bot.send_message(chat_id, "❌ 任务失败：没有可用的有效API Key。")
+    # The job will now stick to the initial pre-checked key.
+    if not start_key or KEY_LEVELS.get(start_key, -1) == -1:
+        bot.send_message(chat_id, "❌ 任务失败：没有可用的有效API Key或起始Key无效。")
         return
     
-    try:
-        start_index = keys_to_try.index(start_key)
-        # Reorder keys to start with the one that passed the pre-check
-        keys_to_try = keys_to_try[start_index:] + keys_to_try[:start_index]
-    except ValueError:
-        pass # If start_key is not in the list for some reason, just use the default order
-
-    current_key_index = 0
+    current_key = start_key
     output_filename = generate_filename_from_query(query_text, prefix="allfofa")
-    unique_results, stop_flag = set(), f'stop_job_{chat_id}'
+    
+    # v10.9.3 FIX: Initialize the results set with the data from the first page.
+    unique_results = set(res for res in initial_results if isinstance(res, str) and ':' in res)
+    
+    stop_flag = f'stop_job_{chat_id}'
     msg = bot.send_message(chat_id, "⏳ 开始使用 `next` 接口进行海量下载...")
     
-    next_id, termination_reason, last_update_time = None, "", 0
-    keys_exhausted_count = 0
+    # v10.9.3 FIX: Start the loop with the next_id from the first page.
+    next_id, termination_reason, last_update_time = initial_next_id, "", 0
 
-    while True:
+    # If the first page already contained all results, we can stop early.
+    if not next_id:
+        termination_reason = "\n\nℹ️ 已获取所有查询结果 (仅有一页数据)."
+    # If the limit is already met by the first page, also stop.
+    elif limit and len(unique_results) >= limit:
+        unique_results = set(list(unique_results)[:limit])
+        termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限 (仅有一页数据)。"
+        next_id = None # Prevent loop from running
+
+    while next_id:
         if context.bot_data.get(stop_flag):
             termination_reason = "\n\n🌀 任务已手动停止."
             break
 
-        current_key = keys_to_try[current_key_index]
-        data, error = fetch_fofa_next_data(current_key, query_text, next_id=next_id)
+        data, error = fetch_fofa_next_data(current_key, query_text, next_id=next_id, fields="host")
 
         if error:
-            if "[820031]" in str(error): # F点不足
-                logger.warning(f"Key ...{current_key[-4:]} F点不足，尝试切换...")
-                keys_exhausted_count += 1
-                if keys_exhausted_count >= len(keys_to_try):
-                    termination_reason = "\n\n❌ 所有可用Key的F点均已耗尽。"
-                    break
-                current_key_index = (current_key_index + 1) % len(keys_to_try)
-                continue # 使用新Key重试当前页
-            else: # 其他错误
-                termination_reason = f"\n\n❌ 下载过程中出错: {escape_markdown_v2(error)}"
-                break
+            termination_reason = f"\n\n❌ 下载过程中出错: {escape_markdown_v2(error)}"
+            break
         
-        keys_exhausted_count = 0 # 成功后重置计数器
         results = data.get('results', [])
         if not results:
             termination_reason = "\n\nℹ️ 已获取所有查询结果."
             break
         
-        unique_results.update(res[0] for res in results if res and res[0] and ':' in res[0])
+        unique_results.update(res for res in results if isinstance(res, str) and ':' in res)
 
         if limit and len(unique_results) >= limit:
             unique_results = set(list(unique_results)[:limit])
