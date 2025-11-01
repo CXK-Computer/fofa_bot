@@ -1,10 +1,3 @@
-# fofa_bot_v10.9.py (终极修复关机死锁 & 修复MarkdownV2 '#' 崩溃)
-#
-# v10.9 更新日志:
-# 1. 重大修复 (关机/更新死锁): 采用操作系统信号 (SIGINT) 的方式重写了关机逻辑，彻底解决了 RuntimeError: cannot join current thread 死锁问题，确保关机和更新流程的绝对稳定。
-# 2. 重大修复 (UI崩溃): 修复了在显示查询结果时，因Key编号的 `#` 字符未转义导致的 BadRequest 界面崩溃问题。
-# 3. 保留了v10.8所有修复 (`/allfofa` 智能Key切换, 按钮点击崩溃, systemd重启, 扫描持久化)。
-#
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
 import os
@@ -400,14 +393,9 @@ async def async_scanner_orchestrator(targets, concurrency, timeout, mode='tcping
     return [res for res in results if res is not None]
 def run_async_scan_job(context: CallbackContext):
     job_context = context.job.context
-    chat_id, msg, query_hash, mode = job_context['chat_id'], job_context['msg'], job_context['query_hash'], job_context['mode']
+    chat_id, msg, original_query, mode = job_context['chat_id'], job_context['msg'], job_context['original_query'], job_context['mode']
     concurrency, timeout = job_context['concurrency'], job_context['timeout']
     
-    original_query = SCAN_TASKS.get(query_hash)
-    if not original_query:
-        msg.edit_text("❌ 扫描任务已过期或机器人刚刚重启。请重新发起查询以启用扫描。")
-        return
-
     cached_item = find_cached_query(original_query)
     if not cached_item: msg.edit_text("❌ 找不到结果文件的本地缓存记录。"); return
     msg.edit_text("1/3: 正在读取本地缓存文件...")
@@ -442,8 +430,20 @@ def offer_post_download_actions(context: CallbackContext, chat_id, query_text):
     context.bot.send_message(chat_id, "下载完成，需要对结果进行二次扫描吗？", reply_markup=InlineKeyboardMarkup(keyboard))
 def start_scan_callback(update: Update, context: CallbackContext) -> int:
     query = update.callback_query; query.answer()
-    _, mode, query_hash = query.data.split('_', 2)
-    context.user_data['scan_query_hash'] = query_hash
+    # v10.9.1 FIX: Correctly parse callback data to get mode and query_hash
+    try:
+        _, _, mode, query_hash = query.data.split('_', 3)
+    except ValueError:
+        logger.error(f"无法从回调数据解析扫描任务: {query.data}")
+        query.message.edit_text("❌ 内部错误：无法解析扫描任务。")
+        return ConversationHandler.END
+
+    original_query = SCAN_TASKS.get(query_hash)
+    if not original_query:
+        query.message.edit_text("❌ 扫描任务已过期或机器人刚刚重启。请重新发起查询以启用扫描。")
+        return ConversationHandler.END
+
+    context.user_data['scan_original_query'] = original_query
     context.user_data['scan_mode'] = mode
     query.message.edit_text("请输入扫描并发数 (建议 100-1000):")
     return STATE_GET_SCAN_CONCURRENCY
@@ -464,7 +464,7 @@ def get_timeout_callback(update: Update, context: CallbackContext) -> int:
         msg = update.message.reply_text("✅ 参数设置完毕，任务已提交到后台。")
         job_context = {
             'chat_id': update.effective_chat.id, 'msg': msg,
-            'query_hash': context.user_data['scan_query_hash'],
+            'original_query': context.user_data['scan_original_query'],
             'mode': context.user_data['scan_mode'],
             'concurrency': context.user_data['scan_concurrency'],
             'timeout': timeout
