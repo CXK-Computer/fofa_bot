@@ -1,3 +1,10 @@
+# fofa_bot_v10.9.py (终极修复关机死锁 & 修复MarkdownV2 '#' 崩溃)
+#
+# v10.9 更新日志:
+# 1. 重大修复 (关机/更新死锁): 采用操作系统信号 (SIGINT) 的方式重写了关机逻辑，彻底解决了 RuntimeError: cannot join current thread 死锁问题，确保关机和更新流程的绝对稳定。
+# 2. 重大修复 (UI崩溃): 修复了在显示查询结果时，因Key编号的 `#` 字符未转义导致的 BadRequest 界面崩溃问题。
+# 3. 保留了v10.8所有修复 (`/allfofa` 智能Key切换, 按钮点击崩溃, systemd重启, 扫描持久化)。
+#
 # 运行前请确保已安装依赖:
 # pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
 import os
@@ -287,8 +294,8 @@ def fetch_fofa_host_info(key, host, detail=False):
     return _make_api_request(url, params, use_b64=False)
 def fetch_fofa_next_data(key, query, next_id=None, page_size=10000, fields="host"):
     params = {'key': key, 'q': query, 'size': page_size, 'fields': fields, 'full': CONFIG.get("full_mode", False)}
-    if next_id:
-        params['next'] = next_id
+    # FIX: Ensure 'next' parameter is always present, and empty on the first call, to comply with API spec.
+    params['next'] = next_id if next_id is not None else ""
     return _make_api_request(FOFA_NEXT_URL, params)
 
 def check_and_classify_keys():
@@ -410,7 +417,8 @@ def run_async_scan_job(context: CallbackContext):
     msg.edit_text("3/3: 正在打包并发送新结果...")
     output_filename = generate_filename_from_query(original_query, prefix=f"{mode}_scan")
     with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(sorted(list(live_results))))
-    final_caption = f"✅ *异步{escape_markdown_v2(scan_type_text)}完成\!**\n\n共发现 *{len(live_results)}* 个存活目标\\."
+    # FIX: Corrected MarkdownV2 syntax error (removed extra asterisk).
+    final_caption = f"✅ *异步{escape_markdown_v2(scan_type_text)}完成\!*\n\n共发现 *{len(live_results)}* 个存活目标\\."
     send_file_safely(context, chat_id, output_filename, caption=final_caption, parse_mode=ParseMode.MARKDOWN_V2)
     upload_and_send_links(context, chat_id, output_filename)
     os.remove(output_filename); msg.delete()
