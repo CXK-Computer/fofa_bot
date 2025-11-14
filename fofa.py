@@ -117,7 +117,8 @@ logger = logging.getLogger(__name__)
     STATE_GET_GUEST_KEY, STATE_BATCH_GET_QUERY, STATE_BATCH_SELECT_FIELDS,
     STATE_GET_API_FILE, STATE_ALLFOFA_GET_LIMIT,
     STATE_ADMIN_MENU, STATE_GET_ADMIN_ID_TO_ADD, STATE_GET_ADMIN_ID_TO_REMOVE,
-) = range(35)
+    STATE_AWAITING_QUERY, STATE_AWAITING_HOST,
+) = range(37)
 
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
@@ -872,9 +873,11 @@ def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
     welcome_text = f'👋 欢迎, {user.first_name}！\n请选择一个操作:'
     
+    # v10.9.6 FIX: 扩展主菜单并重做工作流程
     keyboard = [
-        [KeyboardButton("🔍 资产搜索"), KeyboardButton("⚙️ 设置")],
-        [KeyboardButton("📦 主机详查"), KeyboardButton("📖 帮助手册")]
+        [KeyboardButton("常规搜索"), KeyboardButton("海量搜索")],
+        [KeyboardButton("主机详查"), KeyboardButton("批量导出")],
+        [KeyboardButton("设置"), KeyboardButton("帮助手册")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -1829,7 +1832,8 @@ def remove_api(update: Update, context: CallbackContext):
     removed_keys_display = []
     for index in sorted_indices:
         removed_key = CONFIG['apis'].pop(index)
-        removed_keys_display.append(f"`...{removed_key[-4:]}` (原编号 #{index + 1})")
+        # v10.9.6 FIX: 手动转义Markdown字符以用于确认消息。
+        removed_keys_display.append(f"`...{removed_key[-4:]}` \\(原编号 \\#{index + 1}\\)")
 
     save_config()
     check_and_classify_keys()
@@ -2188,6 +2192,46 @@ def run_allfofa_download_job(context: CallbackContext):
     
     context.bot_data.pop(stop_flag, None)
 
+# --- 菜单查询处理器 (v10.9.6) ---
+def prompt_for_query(update: Update, context: CallbackContext) -> int:
+    """要求用户为菜单命令输入查询字符串。"""
+    button_text = update.message.text
+    command_map = { "常规搜索": "/kkfofa", "海量搜索": "/allfofa", "批量导出": "/batch" }
+    command = command_map.get(button_text)
+    if not command: return ConversationHandler.END
+    context.user_data['menu_command'] = command
+    update.message.reply_text(f"请输入 `{command}` 的查询语句:")
+    return STATE_AWAITING_QUERY
+
+def prompt_for_host(update: Update, context: CallbackContext) -> int:
+    """要求用户为主机命令输入主机字符串。"""
+    context.user_data['menu_command'] = '/host'
+    update.message.reply_text("请输入要查询的主机 (IP或域名):")
+    return STATE_AWAITING_HOST
+
+def run_query_from_menu(update: Update, context: CallbackContext):
+    """使用用户提供的文本运行查询命令。"""
+    command = context.user_data.pop('menu_command', None)
+    query_text = update.message.text
+    context.args = query_text.split()
+
+    if command == '/batch':
+        return batch_command(update, context)
+    elif command in ['/kkfofa', '/allfofa']:
+        return query_entry_point(update, context)
+    return ConversationHandler.END
+
+def run_host_from_menu(update: Update, context: CallbackContext):
+    """使用用户提供的文本运行主机命令。"""
+    context.user_data.pop('menu_command', None)
+    host_text = update.message.text
+    context.args = host_text.split()
+    
+    # host_command 带有 admin_only 装饰器
+    host_command(update, context)
+    return ConversationHandler.END
+
+
 # --- 主函数与调度器 ---
 def interactive_setup():
     """Handles the initial interactive setup for the bot."""
@@ -2332,11 +2376,24 @@ def main() -> None:
     
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     
-    # --- 主菜单按钮处理器 ---
-    dispatcher.add_handler(MessageHandler(Filters.regex(r'^🔍 资产搜索$'), query_entry_point))
-    dispatcher.add_handler(MessageHandler(Filters.regex(r'^⚙️ 设置$'), settings_command))
-    dispatcher.add_handler(MessageHandler(Filters.regex(r'^📦 主机详查$'), host_command))
-    dispatcher.add_handler(MessageHandler(Filters.regex(r'^📖 帮助手册$'), help_command))
+    # --- 主菜单按钮处理器 (v10.9.6) ---
+    menu_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(Filters.regex('^常规搜索$'), prompt_for_query),
+            MessageHandler(Filters.regex('^海量搜索$'), prompt_for_query),
+            MessageHandler(Filters.regex('^批量导出$'), prompt_for_query),
+            MessageHandler(Filters.regex('^主机详查$'), prompt_for_host),
+        ],
+        states={
+            STATE_AWAITING_QUERY: [MessageHandler(Filters.text & ~Filters.command, run_query_from_menu)],
+            STATE_AWAITING_HOST: [MessageHandler(Filters.text & ~Filters.command, run_host_from_menu)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        conversation_timeout=300
+    )
+    dispatcher.add_handler(menu_conv)
+    dispatcher.add_handler(MessageHandler(Filters.regex(r'^设置$'), settings_command))
+    dispatcher.add_handler(MessageHandler(Filters.regex(r'^帮助手册$'), help_command))
 
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(query_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
     
