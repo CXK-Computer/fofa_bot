@@ -40,7 +40,7 @@ from datetime import datetime, timedelta
 from dateutil import tz
 from urllib.parse import urlparse
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -50,7 +50,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     Filters,
 )
-from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
+from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, InvalidToken
 
 # --- 全局变量和常量 ---
 CONFIG_FILE = 'config.json'
@@ -116,7 +116,8 @@ logger = logging.getLogger(__name__)
     STATE_UPLOAD_API_MENU, STATE_GET_UPLOAD_URL, STATE_GET_UPLOAD_TOKEN,
     STATE_GET_GUEST_KEY, STATE_BATCH_GET_QUERY, STATE_BATCH_SELECT_FIELDS,
     STATE_GET_API_FILE, STATE_ALLFOFA_GET_LIMIT,
-) = range(32)
+    STATE_ADMIN_MENU, STATE_GET_ADMIN_ID_TO_ADD, STATE_GET_ADMIN_ID_TO_REMOVE,
+) = range(35)
 
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
@@ -185,6 +186,10 @@ def get_proxies(proxy_to_use=None):
         return {"http": proxy_str, "https": proxy_str}
     return None
 def is_admin(user_id: int) -> bool: return user_id in CONFIG.get('admins', [])
+def is_super_admin(user_id: int) -> bool:
+    admins = CONFIG.get('admins', [])
+    return admins and user_id == admins[0]
+
 def admin_only(func):
     @wraps(func)
     def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
@@ -289,6 +294,12 @@ def _make_api_request(url, params, timeout=60, use_b64=True, retries=10, proxy_s
                 logger.warning(f"FOFA API rate limit hit (429). Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{retries})")
                 time.sleep(wait_time)
                 last_error = f"API请求因速率限制(429)失败"
+                continue
+            if response.status_code == 502: # Bad Gateway
+                wait_time = 5 * (attempt + 1)
+                logger.warning(f"FOFA API returned 502 Bad Gateway. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{retries})")
+                time.sleep(wait_time)
+                last_error = "API请求失败 (502 Bad Gateway)"
                 continue
             response.raise_for_status()
             data = response.json()
@@ -409,16 +420,8 @@ async def async_check_port(host, port, timeout):
         return f"{host}:{port}"
     except (asyncio.TimeoutError, ConnectionRefusedError, OSError, socket.gaierror): return None
     except Exception: return None
-async def async_scanner_orchestrator(targets, concurrency, timeout, mode='tcping'):
-    try:
-        from tqdm.asyncio import tqdm as asyncio_tqdm
-    except ImportError:
-        logger.warning("tqdm 未安装，控制台将不显示进度条。请运行: pip install tqdm")
-        async def dummy_gather(*args, **kwargs):
-            return await asyncio.gather(*args)
-        asyncio_tqdm_gather = dummy_gather
-    else:
-        asyncio_tqdm_gather = asyncio_tqdm.gather
+
+async def async_scanner_orchestrator(targets, concurrency, timeout, mode='tcping', progress_callback=None):
     semaphore = asyncio.Semaphore(concurrency)
     scan_targets = []
     if mode == 'tcping':
@@ -440,36 +443,92 @@ async def async_scanner_orchestrator(targets, concurrency, timeout, mode='tcping
             for i in range(1, 255):
                 for port in ports:
                     scan_targets.append((f"{subnet}.{i}", port))
+
+    total_tasks = len(scan_targets)
+    completed_tasks = 0
+    
     async def worker(host, port):
+        nonlocal completed_tasks
         async with semaphore:
-            return await async_check_port(host, port, timeout)
+            result = await async_check_port(host, port, timeout)
+            completed_tasks += 1
+            if progress_callback:
+                await progress_callback(completed_tasks, total_tasks)
+            return result
+
     tasks = [worker(host, port) for host, port in scan_targets]
-    results = await asyncio_tqdm_gather(*tasks, desc=f"Scanning ({mode})", total=len(tasks), unit="host")
+    results = await asyncio.gather(*tasks)
     return [res for res in results if res is not None]
+
 def run_async_scan_job(context: CallbackContext):
     job_context = context.job.context
     chat_id, msg, original_query, mode = job_context['chat_id'], job_context['msg'], job_context['original_query'], job_context['mode']
     concurrency, timeout = job_context['concurrency'], job_context['timeout']
     
     cached_item = find_cached_query(original_query)
-    if not cached_item: msg.edit_text("❌ 找不到结果文件的本地缓存记录。"); return
-    msg.edit_text("1/3: 正在读取本地缓存文件...")
+    if not cached_item:
+        try: msg.edit_text("❌ 找不到结果文件的本地缓存记录。")
+        except (BadRequest, RetryAfter, TimedOut): pass
+        return
+
+    try: msg.edit_text("1/3: 正在读取本地缓存文件...")
+    except (BadRequest, RetryAfter, TimedOut): pass
+    
     try:
         with open(cached_item['cache']['file_path'], 'r', encoding='utf-8') as f:
             targets = [line.strip() for line in f if ':' in line.strip()]
-    except Exception as e: msg.edit_text(f"❌ 读取缓存文件失败: {e}"); return
+    except Exception as e:
+        try: msg.edit_text(f"❌ 读取缓存文件失败: {e}")
+        except (BadRequest, RetryAfter, TimedOut): pass
+        return
+
     scan_type_text = "TCP存活扫描" if mode == 'tcping' else "子网扫描"
-    msg.edit_text(f"2/3: 已加载 {len(targets)} 个目标，开始异步{scan_type_text} (并发: {concurrency}, 超时: {timeout}s)...")
-    live_results = asyncio.run(async_scanner_orchestrator(targets, concurrency, timeout, mode))
-    if not live_results: msg.edit_text("🤷‍♀️ 扫描完成，但未发现任何存活的目标。"); return
-    msg.edit_text("3/3: 正在打包并发送新结果...")
+    
+    async def main_scan_logic():
+        last_update_time = 0
+        
+        async def progress_callback(completed, total):
+            nonlocal last_update_time
+            current_time = time.time()
+            if total > 0 and current_time - last_update_time > 2:
+                percentage = (completed / total) * 100
+                progress_bar = create_progress_bar(percentage)
+                try:
+                    await msg.edit_text(
+                        f"2/3: 正在进行异步{scan_type_text}...\n"
+                        f"{progress_bar} ({completed}/{total})"
+                    )
+                    last_update_time = current_time
+                except (BadRequest, RetryAfter, TimedOut):
+                    pass # Ignore if editing fails, continue scanning
+
+        initial_message = f"2/3: 已加载 {len(targets)} 个目标，开始异步{scan_type_text} (并发: {concurrency}, 超时: {timeout}s)..."
+        try:
+            await msg.edit_text(initial_message)
+        except (BadRequest, RetryAfter, TimedOut):
+            pass
+
+        return await async_scanner_orchestrator(targets, concurrency, timeout, mode, progress_callback)
+
+    live_results = asyncio.run(main_scan_logic())
+    
+    if not live_results:
+        try: msg.edit_text("🤷‍♀️ 扫描完成，但未发现任何存活的目标。")
+        except (BadRequest, RetryAfter, TimedOut): pass
+        return
+
+    try: msg.edit_text("3/3: 正在打包并发送新结果...")
+    except (BadRequest, RetryAfter, TimedOut): pass
+    
     output_filename = generate_filename_from_query(original_query, prefix=f"{mode}_scan")
     with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(sorted(list(live_results))))
-    # FIX: Corrected MarkdownV2 syntax error (removed extra asterisk).
+    
     final_caption = f"✅ *异步{escape_markdown_v2(scan_type_text)}完成\!*\n\n共发现 *{len(live_results)}* 个存活目标\\."
     send_file_safely(context, chat_id, output_filename, caption=final_caption, parse_mode=ParseMode.MARKDOWN_V2)
     upload_and_send_links(context, chat_id, output_filename)
-    os.remove(output_filename); msg.delete()
+    os.remove(output_filename)
+    try: msg.delete()
+    except (BadRequest, RetryAfter, TimedOut): pass
 
 # --- 扫描流程入口 ---
 def offer_post_download_actions(context: CallbackContext, chat_id, query_text):
@@ -652,20 +711,24 @@ def run_traceback_download_query(context: CallbackContext):
     context.bot_data.pop(stop_flag, None)
 def run_incremental_update_query(context: CallbackContext):
     job_data = context.job.context; bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']; msg = bot.send_message(chat_id, "--- 增量更新启动 ---")
-    msg.edit_text("1/5: 正在获取旧缓存..."); cached_item = find_cached_query(base_query)
+    try: msg.edit_text("1/5: 正在获取旧缓存...")
+    except (BadRequest, RetryAfter, TimedOut): pass
+    cached_item = find_cached_query(base_query)
     if not cached_item: msg.edit_text("❌ 错误：找不到本地缓存项。"); return
     old_file_path = cached_item['cache']['file_path']; old_results = set()
     try:
         with open(old_file_path, 'r', encoding='utf-8') as f: old_results = set(line.strip() for line in f if line.strip() and ':' in line)
     except Exception as e: msg.edit_text(f"❌ 读取本地缓存文件失败: {e}"); return
-    msg.edit_text("2/5: 正在确定更新起始点..."); 
+    try: msg.edit_text("2/5: 正在确定更新起始点...")
+    except (BadRequest, RetryAfter, TimedOut): pass
     data, _, _, _, _, error = execute_query_with_fallback(
         lambda key, key_level, proxy_session: fetch_fofa_data(key, base_query, fields="lastupdatetime", proxy_session=proxy_session)
     )
     if error or not data.get('results'): msg.edit_text(f"❌ 无法获取最新记录时间戳: {error or '无结果'}"); return
     ts_str = data['results'][0][0] if isinstance(data['results'][0], list) else data['results'][0]; cutoff_date = ts_str.split(' ')[0]
     incremental_query = f'({base_query}) && after="{cutoff_date}"'
-    msg.edit_text(f"3/5: 正在侦察自 {cutoff_date} 以来的新数据..."); 
+    try: msg.edit_text(f"3/5: 正在侦察自 {cutoff_date} 以来的新数据...")
+    except (BadRequest, RetryAfter, TimedOut): pass
     data, _, _, _, _, error = execute_query_with_fallback(
         lambda key, key_level, proxy_session: fetch_fofa_data(key, incremental_query, page_size=1, proxy_session=proxy_session)
     )
@@ -674,16 +737,23 @@ def run_incremental_update_query(context: CallbackContext):
     if total_new_size == 0: msg.edit_text("✅ 未发现新数据。缓存已是最新。"); return
     new_results, stop_flag = set(), f'stop_job_{chat_id}'; pages_to_fetch = (total_new_size + 9999) // 10000
     for page in range(1, pages_to_fetch + 1):
-        if context.bot_data.get(stop_flag): msg.edit_text("🌀 增量更新已手动停止。"); return
-        msg.edit_text(f"3/5: 正在下载新数据... ( Page {page}/{pages_to_fetch} )")
+        if context.bot_data.get(stop_flag):
+            try: msg.edit_text("🌀 增量更新已手动停止。")
+            except (BadRequest, RetryAfter, TimedOut): pass
+            return
+        try: msg.edit_text(f"3/5: 正在下载新数据... ( Page {page}/{pages_to_fetch} )")
+        except (BadRequest, RetryAfter, TimedOut): pass
         data, _, _, _, _, error = execute_query_with_fallback(
             lambda key, key_level, proxy_session: fetch_fofa_data(key, incremental_query, page=page, page_size=10000, proxy_session=proxy_session)
         )
         if error: msg.edit_text(f"❌ 下载新数据失败: {error}"); return
         if data.get('results'): new_results.update(res for res in data.get('results', []) if ':' in res)
-    msg.edit_text(f"4/5: 正在合并数据... (发现 {len(new_results)} 条新数据)"); combined_results = sorted(list(new_results.union(old_results)))
+    try: msg.edit_text(f"4/5: 正在合并数据... (发现 {len(new_results)} 条新数据)")
+    except (BadRequest, RetryAfter, TimedOut): pass
+    combined_results = sorted(list(new_results.union(old_results)))
     with open(old_file_path, 'w', encoding='utf-8') as f: f.write("\n".join(combined_results))
-    msg.edit_text(f"5/5: 发送更新后的文件... (共 {len(combined_results)} 条)")
+    try: msg.edit_text(f"5/5: 发送更新后的文件... (共 {len(combined_results)} 条)")
+    except (BadRequest, RetryAfter, TimedOut): pass
     send_file_safely(context, chat_id, old_file_path)
     upload_and_send_links(context, chat_id, old_file_path)
     cache_data = {'file_path': old_file_path, 'result_count': len(combined_results)}
@@ -799,8 +869,23 @@ def run_batch_traceback_query(context: CallbackContext):
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text('👋 欢迎使用 Fofa 查询机器人 v10.9！请使用 /help 查看命令手册。')
-    if not CONFIG['admins']: first_admin_id = update.effective_user.id; CONFIG.setdefault('admins', []).append(first_admin_id); save_config(); update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
+    user = update.effective_user
+    welcome_text = f'👋 欢迎, {user.first_name}！\n请选择一个操作:'
+    
+    keyboard = [
+        [KeyboardButton("🔍 资产搜索"), KeyboardButton("⚙️ 设置")],
+        [KeyboardButton("📦 主机详查"), KeyboardButton("📖 帮助手册")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    update.message.reply_text(welcome_text, reply_markup=reply_markup)
+
+    if not CONFIG['admins']:
+        first_admin_id = update.effective_user.id
+        CONFIG.setdefault('admins', []).append(first_admin_id)
+        save_config()
+        update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
+
 def help_command(update: Update, context: CallbackContext):
     help_text = ( "📖 *Fofa 机器人指令手册 v10\\.9*\n\n"
                   "*🔍 资产搜索 \\(常规\\)*\n`/kkfofa [key] <query>`\n_FOFA搜索, 适用于1万条以内数据_\n\n"
@@ -1549,10 +1634,16 @@ def stop_all_tasks(update: Update, context: CallbackContext):
     update.message.reply_text("🛑 已发送停止信号，当前下载任务将在完成本页后停止。")
 @admin_only
 def backup_config_command(update: Update, context: CallbackContext):
+    if update.callback_query:
+        update.callback_query.answer()
+    
+    chat_id = update.effective_chat.id
     if os.path.exists(CONFIG_FILE):
-        send_file_safely(context, update.effective_chat.id, CONFIG_FILE)
-        upload_and_send_links(context, update.effective_chat.id, CONFIG_FILE)
-    else: update.effective_chat.send_message("❌ 找不到配置文件。")
+        context.bot.send_message(chat_id, "📤 正在发送配置文件备份...")
+        send_file_safely(context, chat_id, CONFIG_FILE)
+        upload_and_send_links(context, chat_id, CONFIG_FILE)
+    else:
+        context.bot.send_message(chat_id, "❌ 找不到配置文件。")
 @admin_only
 def restore_config_command(update: Update, context: CallbackContext):
     update.message.reply_text("请发送您的 `config.json` 备份文件。")
@@ -1640,6 +1731,7 @@ def settings_command(update: Update, context: CallbackContext):
     keyboard = [
         [InlineKeyboardButton("🔑 API 管理", callback_data='settings_api'), InlineKeyboardButton("✨ 预设管理", callback_data='settings_preset')],
         [InlineKeyboardButton("🌐 代理池管理", callback_data='settings_proxypool'), InlineKeyboardButton("📤 上传接口设置", callback_data='settings_upload')],
+        [InlineKeyboardButton("👨‍💼 管理员设置", callback_data='settings_admin')],
         [InlineKeyboardButton("💾 备份与恢复", callback_data='settings_backup'), InlineKeyboardButton("🔄 脚本更新", callback_data='settings_update')],
         [InlineKeyboardButton("❌ 关闭菜单", callback_data='settings_close')]
     ]
@@ -1655,6 +1747,7 @@ def settings_callback_handler(update: Update, context: CallbackContext):
     if menu == 'preset': return show_preset_menu(update, context)
     if menu == 'update': return show_update_menu(update, context)
     if menu == 'upload': return show_upload_api_menu(update, context)
+    if menu == 'admin': return show_admin_menu(update, context)
     if menu == 'close': query.message.edit_text("菜单已关闭."); return ConversationHandler.END
     return STATE_SETTINGS_ACTION
 def settings_action_handler(update: Update, context: CallbackContext):
@@ -1683,22 +1776,68 @@ def show_api_menu(update: Update, context: CallbackContext, force_check=False):
     return STATE_SETTINGS_ACTION
 def get_key(update: Update, context: CallbackContext):
     new_key = update.message.text.strip()
-    if new_key not in CONFIG['apis']: 
-        CONFIG['apis'].append(new_key); save_config()
-        check_and_classify_keys()
-        update.message.reply_text("✅ API Key 已添加。")
-    else: update.message.reply_text("⚠️ 此 Key 已存在。")
-    return settings_command(update, context)
+    if new_key in CONFIG['apis']:
+        update.message.reply_text("⚠️ 此 Key 已存在。")
+        return settings_command(update, context)
+
+    msg = update.message.reply_text("⏳ 正在验证新的 API Key...")
+    data, error = verify_fofa_api(new_key)
+    if error:
+        msg.edit_text(f"❌ Key 验证失败: {error}\n请重新输入一个有效的Key，或使用 /cancel 取消。")
+        return STATE_GET_KEY 
+    
+    CONFIG['apis'].append(new_key)
+    save_config()
+    check_and_classify_keys() 
+    msg.edit_text(f"✅ API Key ({data.get('username', 'N/A')}) 已成功添加。")
+    
+    # 使用一个新的 update 对象来调用 settings_command，因为它需要一个有效的 update 对象
+    # 来发送新消息，而我们编辑了旧消息。
+    fake_update = type('FakeUpdate', (), {'message': update.message, 'callback_query': None})
+    return settings_command(fake_update, context)
+
 def remove_api(update: Update, context: CallbackContext):
-    try:
-        index = int(update.message.text.strip()) - 1
-        if 0 <= index < len(CONFIG['apis']):
-            removed_key = CONFIG['apis'].pop(index); save_config()
-            check_and_classify_keys()
-            update.message.reply_text(f"✅ 已移除 Key `...{removed_key[-4:]}`。")
-        else: update.message.reply_text("❌ 无效的编号。")
-    except ValueError: update.message.reply_text("❌ 请输入一个有效的数字编号。")
-    return settings_command(update, context)
+    input_text = update.message.text.strip()
+    # 使用正则表达式查找所有数字，支持逗号、空格等分隔符
+    indices_to_remove_str = re.findall(r'\d+', input_text)
+    
+    if not indices_to_remove_str:
+        update.message.reply_text("❌ 请输入一个或多个有效的数字编号。")
+        return settings_command(update, context)
+
+    indices_to_remove = set()
+    invalid_indices = []
+    for index_str in indices_to_remove_str:
+        try:
+            index = int(index_str) - 1
+            if 0 <= index < len(CONFIG['apis']):
+                indices_to_remove.add(index)
+            else:
+                invalid_indices.append(index_str)
+        except ValueError:
+            invalid_indices.append(index_str)
+
+    if invalid_indices:
+        update.message.reply_text(f"⚠️ 无效的编号: {', '.join(invalid_indices)}。")
+
+    if not indices_to_remove:
+        return settings_command(update, context)
+
+    # 对索引进行降序排序，以防止在删除时出现索引错误
+    sorted_indices = sorted(list(indices_to_remove), reverse=True)
+    
+    removed_keys_display = []
+    for index in sorted_indices:
+        removed_key = CONFIG['apis'].pop(index)
+        removed_keys_display.append(f"`...{removed_key[-4:]}` (原编号 #{index + 1})")
+
+    save_config()
+    check_and_classify_keys()
+    
+    update.message.reply_text(f"✅ 已成功移除以下 Key:\n{', '.join(reversed(removed_keys_display))}", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    fake_update = type('FakeUpdate', (), {'message': update.message, 'callback_query': None})
+    return settings_command(fake_update, context)
 def show_preset_menu(update: Update, context: CallbackContext):
     query = update.callback_query; presets = CONFIG.get("presets", [])
     text = ["*✨ 预设查询管理*"]
@@ -1815,6 +1954,79 @@ def get_upload_token(update: Update, context: CallbackContext):
     token = update.message.text.strip()
     CONFIG['upload_api_token'] = token; save_config()
     update.message.reply_text("✅ 上传 Token 已更新。")
+    return settings_command(update, context)
+
+# --- Admin Management ---
+def show_admin_menu(update: Update, context: CallbackContext):
+    query = update.callback_query
+    admins = CONFIG.get('admins', [])
+    text = ["*👨‍💼 管理员列表*"]
+    if not admins:
+        text.append("  \\- _空_")
+    else:
+        for i, admin_id in enumerate(admins):
+            user_label = "⭐ 超级管理员" if i == 0 else f"  `\\#{i+1}`"
+            text.append(f"{user_label} \\- `{admin_id}`")
+    
+    keyboard = []
+    if is_super_admin(query.from_user.id):
+        keyboard.append([
+            InlineKeyboardButton("➕ 添加管理员", callback_data='admin_add'),
+            InlineKeyboardButton("➖ 移除管理员", callback_data='admin_remove')
+        ])
+    keyboard.append([InlineKeyboardButton("🔙 返回", callback_data='admin_back')])
+    
+    query.message.edit_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
+    return STATE_ADMIN_MENU
+
+def admin_menu_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    action = query.data.split('_')[1]
+
+    if not is_super_admin(query.from_user.id):
+        query.answer("⛔️ 只有超级管理员才能执行此操作。", show_alert=True)
+        return STATE_ADMIN_MENU
+
+    if action == 'add':
+        query.message.edit_text("请输入新管理员的 Telegram User ID:")
+        return STATE_GET_ADMIN_ID_TO_ADD
+    if action == 'remove':
+        query.message.edit_text("请输入要移除的管理员的编号 (例如: 2):")
+        return STATE_GET_ADMIN_ID_TO_REMOVE
+    if action == 'back':
+        return settings_command(update, context)
+
+def get_admin_id_to_add(update: Update, context: CallbackContext):
+    try:
+        new_id = int(update.message.text.strip())
+        admins = CONFIG.get('admins', [])
+        if new_id in admins:
+            update.message.reply_text("⚠️ 此用户已经是管理员。")
+        else:
+            CONFIG['admins'].append(new_id)
+            save_config()
+            update.message.reply_text("✅ 管理员已添加。")
+    except ValueError:
+        update.message.reply_text("❌ 无效的 User ID，请输入纯数字。")
+    
+    return settings_command(update, context)
+
+def get_admin_id_to_remove(update: Update, context: CallbackContext):
+    try:
+        index = int(update.message.text.strip())
+        admins = CONFIG.get('admins', [])
+        if index == 1:
+            update.message.reply_text("❌ 不能移除超级管理员。")
+        elif 1 < index <= len(admins):
+            removed_admin = CONFIG['admins'].pop(index - 1)
+            save_config()
+            update.message.reply_text(f"✅ 已移除管理员 `{removed_admin}`。")
+        else:
+            update.message.reply_text("❌ 无效的编号。")
+    except ValueError:
+        update.message.reply_text("❌ 请输入一个有效的数字编号。")
+    
     return settings_command(update, context)
 
 # --- /allfofa Command Logic ---
@@ -1977,27 +2189,69 @@ def run_allfofa_download_job(context: CallbackContext):
     context.bot_data.pop(stop_flag, None)
 
 # --- 主函数与调度器 ---
-def main() -> None:
+def interactive_setup():
+    """Handles the initial interactive setup for the bot."""
     global CONFIG
-    os.makedirs(FOFA_CACHE_DIR, exist_ok=True)
-    if not os.path.exists(CONFIG_FILE) or CONFIG.get("bot_token") == "YOUR_BOT_TOKEN_HERE":
-        print("--- 首次运行或配置不完整，进入交互式设置 ---")
-        bot_token = input("请输入您的 Telegram Bot Token: ").strip()
-        admin_id = input("请输入您的 Telegram User ID (作为第一个管理员): ").strip()
-        if not bot_token or not admin_id.isdigit(): print("错误：Bot Token 和 Admin ID 不能为空且ID必须是数字。请重新运行脚本。"); sys.exit(1)
-        CONFIG["bot_token"] = bot_token; CONFIG["admins"] = [int(admin_id)]
-        fofa_keys = []; print("请输入您的 FOFA API Key (输入空行结束):")
+    print("--- 首次运行或配置不完整，进入交互式设置 ---")
+    bot_token = input("请输入您的 Telegram Bot Token (留空则退出): ").strip()
+    if not bot_token:
+        return False
+    
+    admin_id_str = ""
+    while not admin_id_str.isdigit():
+        admin_id_str = input("请输入您的 Telegram User ID (作为第一个管理员): ").strip()
+        if not admin_id_str.isdigit():
+            print("错误: User ID 必须是纯数字。")
+
+    admin_id = int(admin_id_str)
+    
+    CONFIG["bot_token"] = bot_token
+    if not CONFIG.get("admins"): # Only set admins if list is empty
+        CONFIG["admins"] = [admin_id]
+
+    fofa_keys = []
+    if not CONFIG.get("apis"): # Only ask for keys if none are present
+        print("请输入您的 FOFA API Key (输入空行结束):")
         while True:
             key = input(f"  - Key #{len(fofa_keys) + 1}: ").strip()
             if not key: break
             fofa_keys.append(key)
         CONFIG["apis"] = fofa_keys
-        save_config(); print("✅ 配置已保存到 config.json。正在启动机器人...")
-        CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
-    bot_token = CONFIG.get("bot_token")
-    if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE": logger.critical("错误: 'bot_token' 未在 config.json 中设置!"); return
-    check_and_classify_keys()
-    updater = Updater(token=bot_token, use_context=True, request_kwargs={'read_timeout': 20, 'connect_timeout': 20})
+
+    save_config()
+    print("✅ 配置已保存到 config.json。")
+    CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
+    return True
+
+def main() -> None:
+    global CONFIG
+    os.makedirs(FOFA_CACHE_DIR, exist_ok=True)
+
+    if not os.path.exists(CONFIG_FILE) or CONFIG.get("bot_token") == "YOUR_BOT_TOKEN_HERE":
+        if not interactive_setup():
+            sys.exit(0)
+
+    while True:
+        try:
+            bot_token = CONFIG.get("bot_token")
+            if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE":
+                logger.critical("错误: 'bot_token' 未在 config.json 中设置!")
+                if not interactive_setup():
+                    break
+                continue
+
+            check_and_classify_keys()
+            updater = Updater(token=bot_token, use_context=True, request_kwargs={'read_timeout': 20, 'connect_timeout': 20})
+            break  # Break loop if updater is created successfully
+        except InvalidToken:
+            logger.error("!!!!!! 无效的 Bot Token !!!!!!")
+            print("当前配置的 Telegram Bot Token 无效。")
+            if not interactive_setup():
+                sys.exit(0)
+        except Exception as e:
+            logger.critical(f"启动时发生无法恢复的错误: {e}")
+            sys.exit(1)
+
     dispatcher = updater.dispatcher
     dispatcher.bot_data['updater'] = updater
     commands = [
@@ -2023,11 +2277,14 @@ def main() -> None:
                 CallbackQueryHandler(settings_action_handler, pattern=r"^action_"),
                 CallbackQueryHandler(show_update_menu, pattern=r"^settings_update"),
                 CallbackQueryHandler(show_backup_restore_menu, pattern=r"^settings_backup"),
-                CallbackQueryHandler(lambda u,c: backup_config_command(u.callback_query, c), pattern=r"^backup_now"),
+                CallbackQueryHandler(backup_config_command, pattern=r"^backup_now"),
                 CallbackQueryHandler(lambda u,c: restore_config_command(u.callback_query.message, c), pattern=r"^restore_now"),
                 CallbackQueryHandler(get_update_url, pattern=r"^update_set_url"),
                 CallbackQueryHandler(settings_command, pattern=r"^(update_back|backup_back)"),
             ],
+            STATE_ADMIN_MENU: [CallbackQueryHandler(admin_menu_callback, pattern=r"^admin_")],
+            STATE_GET_ADMIN_ID_TO_ADD: [MessageHandler(Filters.text & ~Filters.command, get_admin_id_to_add)],
+            STATE_GET_ADMIN_ID_TO_REMOVE: [MessageHandler(Filters.text & ~Filters.command, get_admin_id_to_remove)],
             STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)],
             STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
             STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")],
@@ -2074,6 +2331,13 @@ def main() -> None:
     batch_check_api_conv = ConversationHandler(entry_points=[CommandHandler("batchcheckapi", batch_check_api_command)], states={STATE_GET_API_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), receive_api_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
+    
+    # --- 主菜单按钮处理器 ---
+    dispatcher.add_handler(MessageHandler(Filters.regex(r'^🔍 资产搜索$'), query_entry_point))
+    dispatcher.add_handler(MessageHandler(Filters.regex(r'^⚙️ 设置$'), settings_command))
+    dispatcher.add_handler(MessageHandler(Filters.regex(r'^📦 主机详查$'), host_command))
+    dispatcher.add_handler(MessageHandler(Filters.regex(r'^📖 帮助手册$'), help_command))
+
     dispatcher.add_handler(settings_conv); dispatcher.add_handler(query_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
     
     logger.info(f"🚀 Fofa Bot v10.9 (稳定版) 已启动...")
