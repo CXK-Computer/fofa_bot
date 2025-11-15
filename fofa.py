@@ -1147,7 +1147,7 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
         return ConversationHandler.END
     else:
         keyboard = [[InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
-        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return STATE_KKFOFA_MODE
+        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return QUERY_STATE_KKFOFA_MODE
 
 def query_mode_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); mode = query.data.split('_')[1]
@@ -1569,7 +1569,7 @@ def batch_command(update: Update, context: CallbackContext):
     context.user_data['page'] = 0
     keyboard = build_batch_fields_keyboard(context.user_data)
     update.message.reply_text(f"查询: `{escape_markdown_v2(query_text)}`\n请选择要导出的字段:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_BATCH_SELECT_FIELDS
+    return BATCH_STATE_SELECT_FIELDS
 def batch_select_fields_callback(update: Update, context: CallbackContext):
     query = update.callback_query
     query.answer()
@@ -1588,7 +1588,7 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
         selected_fields = context.user_data.get('selected_fields')
         if not selected_fields:
             query.answer("请至少选择一个字段！", show_alert=True)
-            return STATE_BATCH_SELECT_FIELDS
+            return BATCH_STATE_SELECT_FIELDS
         query_text = context.user_data['query']
         fields_str = ",".join(list(selected_fields))
         msg = query.message.edit_text("正在执行查询以预估数据量...")
@@ -1613,7 +1613,7 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
             msg.edit_text(f"{success_message}\n请选择导出模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return BATCH_STATE_MODE_CHOICE
     keyboard = build_batch_fields_keyboard(context.user_data)
     query.message.edit_reply_markup(reply_markup=keyboard)
-    return STATE_BATCH_SELECT_FIELDS
+    return BATCH_STATE_SELECT_FIELDS
 
 # --- /batchcheckapi 命令 ---
 @admin_only
