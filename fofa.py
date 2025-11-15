@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from dateutil import tz
 from urllib.parse import urlparse
 import uuid # 确保文件顶部有这行
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode, ReplyKeyboardMarkup, KeyboardButton, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -1892,7 +1892,7 @@ def settings_callback_handler(update: Update, context: CallbackContext):
     if menu == 'upload': return show_upload_api_menu(update, context)
     if menu == 'admin': return show_admin_menu(update, context)
     if menu == 'close': query.message.edit_text("菜单已关闭."); return ConversationHandler.END
-    return STATE_SETTINGS_ACTION
+    return SETTINGS_STATE_ACTION
 def settings_action_handler(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_', 1)[1]
     if action == 'add_api': query.message.edit_text("请输入新的FOFA API Key:"); return SETTINGS_STATE_GET_KEY
