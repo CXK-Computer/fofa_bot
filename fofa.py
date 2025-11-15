@@ -1065,7 +1065,8 @@ def ask_continent_callback(update: Update, context: CallbackContext):
             [InlineKeyboardButton("🌎 北美洲", callback_data="continent_NorthAmerica"), InlineKeyboardButton("🌎 南美洲", callback_data="continent_SouthAmerica")],
             [InlineKeyboardButton("🌍 非洲", callback_data="continent_Africa"), InlineKeyboardButton("🌏 大洋洲", callback_data="continent_Oceania")],
             [InlineKeyboardButton("↩️ 跳过", callback_data="continent_skip")]]
-        query.message.edit_text("请选择一个大洲:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_CONTINENT_CHOICE
+        query.message.edit_text("请选择一个大洲:", reply_markup=InlineKeyboardMarkup(keyboard)); return QUERY_STATE_CONTINENT_CHOICE
+
 
 def continent_choice_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); continent = query.data.split('_', 1)[1]; original_query = context.user_data['original_query']
@@ -1100,7 +1101,7 @@ def proceed_with_kkfofa_query(update: Update, context: CallbackContext, message_
             message_text += "请选择操作："; keyboard.append([InlineKeyboardButton("🔄 增量更新", callback_data='cache_incremental')]); keyboard.append([InlineKeyboardButton("⬇️ 下载缓存", callback_data='cache_download'), InlineKeyboardButton("🔍 全新搜索", callback_data='cache_newsearch')])
         keyboard.append([InlineKeyboardButton("❌ 取消", callback_data='cache_cancel')])
         message_to_edit.edit_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-        return STATE_CACHE_CHOICE
+        return QUERY_STATE_CACHE_CHOICE
     return start_new_kkfofa_search(update, context, message_to_edit=message_to_edit)
 
 def cache_choice_callback(update: Update, context: CallbackContext):
@@ -1141,7 +1142,8 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
     context.user_data.update({'total_size': total_size, 'chat_id': update.effective_chat.id, 'is_batch_mode': False})
     success_message = f"✅ 使用 {used_key_info} 找到 {total_size} 条结果\\."
     if total_size <= 10000:
-        msg.edit_text(f"{success_message}\n开始下载\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2); start_download_job(context, run_full_download_query, context.user_data)
+        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return QUERY_STATE_KKFA_MODE
+
         return ConversationHandler.END
     else:
         keyboard = [[InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
@@ -1373,7 +1375,7 @@ def lowhost_command(update: Update, context: CallbackContext) -> None:
 def stats_command(update: Update, context: CallbackContext):
     if not context.args:
         update.message.reply_text("请输入要进行聚合统计的FOFA查询语法:")
-        return STATE_GET_STATS_QUERY
+        return STATS_STATE_GET_QUERY
     return get_fofa_stats_query(update, context)
 def get_fofa_stats_query(update: Update, context: CallbackContext):
     query_text = " ".join(context.args) if context.args else update.message.text
@@ -1397,7 +1399,7 @@ BATCH_FEATURES = { "protocol": "协议", "domain": "域名", "os": "操作系统
 @admin_only
 def batchfind_command(update: Update, context: CallbackContext):
     update.message.reply_text("请上传一个包含 IP:Port 列表的 .txt 文件。")
-    return STATE_GET_BATCH_FILE
+    return BATCHFIND_STATE_GET_FILE
 def get_batch_file_handler(update: Update, context: CallbackContext):
     doc = update.message.document
     file = doc.get_file()
@@ -1414,12 +1416,12 @@ def get_batch_file_handler(update: Update, context: CallbackContext):
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("✅ 全部选择", callback_data="batchfeature_all"), InlineKeyboardButton("➡️ 开始分析", callback_data="batchfeature_done")])
     update.message.reply_text("请选择您需要分析的特征:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return STATE_SELECT_BATCH_FEATURES
+    return BATCHFIND_STATE_SELECT_FEATURES
 def select_batch_features_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); feature = query.data.split('_', 1)[1]
     selected = context.user_data['selected_features']
     if feature == 'done':
-        if not selected: query.answer("请至少选择一个特征！", show_alert=True); return STATE_SELECT_BATCH_FEATURES
+        if not selected: query.answer("请至少选择一个特征！", show_alert=True); return BATCHFIND_STATE_SELECT_FEATURES
         query.message.edit_text("✅ 特征选择完毕，任务已提交到后台分析。")
         job_context = {'chat_id': query.message.chat_id, 'file_path': context.user_data['batch_file_path'], 'features': list(selected)}
         context.job_queue.run_once(run_batch_find_job, 1, context=job_context, name=f"batchfind_{query.message.chat_id}")
@@ -1440,7 +1442,7 @@ def select_batch_features_callback(update: Update, context: CallbackContext):
     all_text = "✅ 取消全选" if len(selected) == len(BATCH_FEATURES) else "✅ 全部选择"
     keyboard.append([InlineKeyboardButton(all_text, callback_data="batchfeature_all"), InlineKeyboardButton("➡️ 开始分析", callback_data="batchfeature_done")])
     query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-    return STATE_SELECT_BATCH_FEATURES
+    return BATCHFIND_STATE_SELECT_FEATURES
 def run_batch_find_job(context: CallbackContext):
     job_data = context.job.context; chat_id, file_path, features = job_data['chat_id'], job_data['file_path'], job_data['features']
     bot = context.bot; msg = bot.send_message(chat_id, "⏳ 开始批量分析任务...")
@@ -1568,7 +1570,7 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
 @admin_only
 def batch_check_api_command(update: Update, context: CallbackContext) -> int:
     update.message.reply_text("请上传一个包含 API Keys 的 .txt 文件 (每行一个 Key)。")
-    return STATE_GET_API_FILE
+    return BATCHCHECKAPI_STATE_GET_FILE
 def receive_api_file(update: Update, context: CallbackContext) -> int:
     doc = update.message.document
     if not doc.file_name.endswith('.txt'):
@@ -1688,7 +1690,7 @@ def backup_config_command(update: Update, context: CallbackContext):
 @admin_only
 def restore_config_command(update: Update, context: CallbackContext):
     update.message.reply_text("请发送您的 `config.json` 备份文件。")
-    return STATE_GET_RESTORE_FILE
+    return RESTORE_STATE_GET_FILE
 def receive_config_file(update: Update, context: CallbackContext):
     doc = update.message.document
     if doc.file_name != 'config.json':
