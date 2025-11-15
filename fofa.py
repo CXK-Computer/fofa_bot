@@ -1,23 +1,3 @@
-# fofa_bot_v10.9.5.py (allfofa Key 等级限制)
-#
-# v10.9.5 更新日志:
-# 1. 优化 (/allfofa): `/allfofa` 海量下载任务现在会优先使用并要求至少为“个人会员”等级的API Key。
-#    - 此举旨在避免因使用F点不足的免费Key而导致下载任务中途失败。
-#
-# v10.9.4 更新日志:
-# 1. 根本性修复 (/allfofa): 彻底解决因代理IP变动导致的 "[820013] 请按顺序进行翻页查询" 错误。
-#    - `/allfofa` 任务现在会“锁定”一个代理和API Key用于整个下载会话。
-#    - 从预检到后台翻页的所有请求都将使用相同的代理IP和Key，确保了FOFA API会话的绝对连续性。
-# 2. 根本性修复 (追溯查询): 彻底解决因权限不足导致的 "[820001] 没有权限搜索lastupdatetime字段" 错误。
-#    - 深度追溯功能 (`/kkfofa` > 1万条, `/batch` > 1万条) 现在会根据当前Key的等级动态决定是否请求 `lastupdatetime` 字段。
-#    - 低等级Key将自动回退到不含时间戳的追溯模式，避免任务失败。
-# 3. 内部重构: 调整了内部API调用函数，使其能够感知Key的等级并支持代理会话锁定，为上述修复提供支持。
-#
-# v10.9.3 更新日志:
-# 1. 修复 (/allfofa): 解决了因“预检”和“下载”步骤状态不一致导致的翻页错误。
-#
-# 运行前请确保已安装依赖:
-# pip install pandas openpyxl pysocks "requests[socks]" tqdm "python-telegram-bot"
 import os
 import sys
 import json
@@ -39,7 +19,7 @@ from functools import wraps
 from datetime import datetime, timedelta
 from dateutil import tz
 from urllib.parse import urlparse
-
+import uuid # 确保文件顶部有这行
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Updater,
@@ -48,8 +28,10 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     CallbackQueryHandler,
+    InlineQueryHandler, # <--- 确保有这个
     Filters,
 )
+
 from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, InvalidToken
 
 # --- 全局变量和常量 ---
@@ -1442,6 +1424,75 @@ def get_fofa_stats_query(update: Update, context: CallbackContext):
 
     return ConversationHandler.END
 
+def inline_fofa_handler(update: Update, context: CallbackContext) -> None:
+    """处理内联查询请求"""
+    query_text = update.inline_query.query
+    results = []
+
+    # 如果用户只输入了@botname，没有附带查询语句
+    if not query_text:
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title="开始输入FOFA查询语法...",
+                description='例如: domain="example.com"',
+                input_message_content=InputTextMessageContent(
+                    "💡 **FOFA 内联查询用法** 💡\n\n"
+                    "在任何聊天框中输入 `@你的机器人用户名` 然后跟上FOFA查询语法，即可快速搜索。\n\n"
+                    "例如：`@你的机器人用户名 domain=\"qq.com\"`"
+                , parse_mode=ParseMode.MARKDOWN)
+            )
+        )
+        update.inline_query.answer(results)
+        return
+
+    # --- 用户输入了查询语句，开始调用FOFA API ---
+    # 内联模式不应返回太多结果，我们只查询前10条
+    # 为了提供更多上下文，我们查询 host 和 title 两个字段
+    def inline_query_logic(key, key_level, proxy_session):
+        return fetch_fofa_data(key, query_text, page_size=10, fields="host,title", proxy_session=proxy_session)
+
+    data, _, _, _, _, error = execute_query_with_fallback(inline_query_logic)
+
+    # 如果查询出错
+    if error:
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title="查询出错",
+                description=str(error),
+                input_message_content=InputTextMessageContent(f"FOFA 查询失败: {error}")
+            )
+        )
+    # 如果没有找到结果
+    elif not data or not data.get('results'):
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title="未找到结果",
+                description=f"查询: {query_text}",
+                input_message_content=InputTextMessageContent(f"对于查询 '{query_text}'，FOFA 未返回任何结果。")
+            )
+        )
+    # 成功找到结果
+    else:
+        for result in data['results']:
+            host = result[0] if result and len(result) > 0 else "N/A"
+            title = result[1] if result and len(result) > 1 else "无标题"
+            
+            results.append(
+                InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title=host, # 结果标题显示 host
+                    description=title, # 结果描述显示 title
+                    input_message_content=InputTextMessageContent(
+                        host # 用户点击后，将 host 发送到聊天框
+                    )
+                )
+            )
+
+    # 将最终结果列表发送给Telegram，cache_time建议设置一个较短的时间
+    update.inline_query.answer(results, cache_time=30)
 
 # --- /batchfind 命令 ---
 BATCH_FEATURES = { "protocol": "协议", "domain": "域名", "os": "操作系统", "server": "服务/组件", "icp": "ICP备案号", "title": "标题", "jarm": "JARM指纹", "cert.issuer.org": "证书颁发组织", "cert.issuer.cn": "证书颁发CN", "cert.subject.org": "证书主体组织", "cert.subject.cn": "证书主体CN" }
@@ -2466,7 +2517,7 @@ def main() -> None:
     scan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(start_scan_callback, pattern=r'^start_scan_')], states={SCAN_STATE_GET_CONCURRENCY: [MessageHandler(Filters.text & ~Filters.command, get_concurrency_callback)], SCAN_STATE_GET_TIMEOUT: [MessageHandler(Filters.text & ~Filters.command, get_timeout_callback)]}, fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=120)
     batch_check_api_conv = ConversationHandler(entry_points=[CommandHandler("batchcheckapi", batch_check_api_command)], states={BATCHCHECKAPI_STATE_GET_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), receive_api_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     
-    dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
+    dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command)); dispatcher.add_handler(InlineQueryHandler(inline_fofa_handler)); 
     
     # --- 主菜单按钮处理器 (v10.9.6) ---
     menu_conv = ConversationHandler(
