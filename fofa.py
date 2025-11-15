@@ -104,21 +104,57 @@ logging.basicConfig(
 logging.getLogger("requests").setLevel(logging.WARNING); logging.getLogger("urllib3").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- 会话状态定义 ---
+# --- 会话状态定义 (v10.9.6 重构) ---
+# 为每个独立的 ConversationHandler 分配唯一的状态范围，防止冲突
+
+# 主菜单交互 (ReplyKeyboardMarkup)
+STATE_AWAITING_QUERY, STATE_AWAITING_HOST = range(1, 3)
+
+# /kkfofa 和 /allfofa 查询流程
 (
-    STATE_SETTINGS_MAIN, STATE_SETTINGS_ACTION, STATE_GET_KEY, STATE_REMOVE_API,
-    STATE_KKFOFA_MODE, STATE_CACHE_CHOICE, STATE_GET_IMPORT_QUERY, STATE_GET_STATS_QUERY,
-    STATE_PRESET_MENU, STATE_GET_PRESET_NAME, STATE_GET_PRESET_QUERY, STATE_REMOVE_PRESET,
-    STATE_GET_UPDATE_URL, STATE_ASK_CONTINENT, STATE_CONTINENT_CHOICE,
-    STATE_GET_BATCH_FILE, STATE_SELECT_BATCH_FEATURES, STATE_GET_RESTORE_FILE,
-    STATE_PROXYPOOL_MENU, STATE_GET_PROXY_ADD, STATE_GET_PROXY_REMOVE,
-    STATE_GET_TRACEBACK_LIMIT, STATE_GET_SCAN_CONCURRENCY, STATE_GET_SCAN_TIMEOUT,
-    STATE_UPLOAD_API_MENU, STATE_GET_UPLOAD_URL, STATE_GET_UPLOAD_TOKEN,
-    STATE_GET_GUEST_KEY, STATE_BATCH_GET_QUERY, STATE_BATCH_SELECT_FIELDS,
-    STATE_GET_API_FILE, STATE_ALLFOFA_GET_LIMIT,
-    STATE_ADMIN_MENU, STATE_GET_ADMIN_ID_TO_ADD, STATE_GET_ADMIN_ID_TO_REMOVE,
-    STATE_AWAITING_QUERY, STATE_AWAITING_HOST,
-) = range(37)
+    QUERY_STATE_GET_GUEST_KEY,
+    QUERY_STATE_ASK_CONTINENT,
+    QUERY_STATE_CONTINENT_CHOICE,
+    QUERY_STATE_CACHE_CHOICE,
+    QUERY_STATE_KKFOFA_MODE,
+    QUERY_STATE_GET_TRACEBACK_LIMIT,
+    QUERY_STATE_ALLFOFA_GET_LIMIT,
+) = range(10, 17)
+
+# /settings 设置流程
+(
+    SETTINGS_STATE_MAIN, SETTINGS_STATE_ACTION,
+    SETTINGS_STATE_GET_KEY, SETTINGS_STATE_REMOVE_API,
+    SETTINGS_STATE_PRESET_MENU, SETTINGS_STATE_GET_PRESET_NAME,
+    SETTINGS_STATE_GET_PRESET_QUERY, SETTINGS_STATE_REMOVE_PRESET,
+    SETTINGS_STATE_GET_UPDATE_URL, SETTINGS_STATE_PROXYPOOL_MENU,
+    SETTINGS_STATE_GET_PROXY_ADD, SETTINGS_STATE_GET_PROXY_REMOVE,
+    SETTINGS_STATE_UPLOAD_API_MENU, SETTINGS_STATE_GET_UPLOAD_URL,
+    SETTINGS_STATE_GET_UPLOAD_TOKEN, SETTINGS_STATE_ADMIN_MENU,
+    SETTINGS_STATE_GET_ADMIN_ID_TO_ADD, SETTINGS_STATE_GET_ADMIN_ID_TO_REMOVE,
+) = range(20, 38)
+
+# /batch 批量导出流程
+(
+    BATCH_STATE_SELECT_FIELDS,
+    BATCH_STATE_MODE_CHOICE,
+    BATCH_STATE_GET_LIMIT,
+) = range(50, 53)
+
+# /stats, /import, /batchfind, /restore, /batchcheckapi 等独立流程
+(
+    STATS_STATE_GET_QUERY,
+    IMPORT_STATE_GET_FILE,
+    BATCHFIND_STATE_GET_FILE, BATCHFIND_STATE_SELECT_FEATURES,
+    RESTORE_STATE_GET_FILE,
+    BATCHCHECKAPI_STATE_GET_FILE,
+) = range(80, 86)
+
+# /scan 扫描流程 (CallbackQueryHandler)
+(
+    SCAN_STATE_GET_CONCURRENCY,
+    SCAN_STATE_GET_TIMEOUT,
+) = range(100, 102)
 
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
@@ -562,17 +598,17 @@ def start_scan_callback(update: Update, context: CallbackContext) -> int:
     context.user_data['scan_original_query'] = original_query
     context.user_data['scan_mode'] = mode
     query.message.edit_text("请输入扫描并发数 (建议 100-1000):")
-    return STATE_GET_SCAN_CONCURRENCY
+    return SCAN_STATE_GET_CONCURRENCY
 def get_concurrency_callback(update: Update, context: CallbackContext) -> int:
     try:
         concurrency = int(update.message.text)
         if not 1 <= concurrency <= 5000: raise ValueError
         context.user_data['scan_concurrency'] = concurrency
         update.message.reply_text("请输入连接超时时间 (秒, 建议 1-3):")
-        return STATE_GET_SCAN_TIMEOUT
+        return SCAN_STATE_GET_TIMEOUT
     except ValueError:
         update.message.reply_text("无效输入，请输入 1-5000 之间的整数。")
-        return STATE_GET_SCAN_CONCURRENCY
+        return SCAN_STATE_GET_CONCURRENCY
 def get_timeout_callback(update: Update, context: CallbackContext) -> int:
     try:
         timeout = float(update.message.text)
@@ -590,7 +626,7 @@ def get_timeout_callback(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
     except ValueError:
         update.message.reply_text("无效输入，请输入 0.1-10 之间的数字。")
-        return STATE_GET_SCAN_TIMEOUT
+        return SCAN_STATE_GET_TIMEOUT
 
 # --- 后台下载任务 ---
 def start_download_job(context: CallbackContext, callback_func, job_data):
@@ -1116,7 +1152,7 @@ def query_mode_callback(update: Update, context: CallbackContext):
     if mode == 'traceback':
         keyboard = [[InlineKeyboardButton("♾️ 全部获取", callback_data='limit_none')], [InlineKeyboardButton("❌ 取消", callback_data='limit_cancel')]]
         query.message.edit_text("请输入深度追溯获取的结果数量上限 (例如: 50000)，或选择全部获取。", reply_markup=InlineKeyboardMarkup(keyboard))
-        return STATE_GET_TRACEBACK_LIMIT
+        return BATCH_STATE_GET_LIMIT if context.user_data.get('is_batch_mode') else QUERY_STATE_GET_TRACEBACK_LIMIT
     job_func = run_batch_download_query if context.user_data.get('is_batch_mode') else run_full_download_query
     if mode == 'full' and job_func:
         query.message.edit_text(f"⏳ 开始下载..."); start_download_job(context, job_func, context.user_data); query.message.delete()
@@ -1131,7 +1167,8 @@ def get_traceback_limit(update: Update, context: CallbackContext):
         try:
             limit = int(update.message.text.strip()); assert limit > 0
         except (ValueError, AssertionError):
-            update.message.reply_text("❌ 无效的数字，请输入一个正整数。"); return STATE_GET_TRACEBACK_LIMIT
+            update.message.reply_text("❌ 无效的数字，请输入一个正整数。")
+            return BATCH_STATE_GET_LIMIT if context.user_data.get('is_batch_mode') else QUERY_STATE_GET_TRACEBACK_LIMIT
     context.user_data['limit'] = limit
     job_func = run_batch_traceback_query if context.user_data.get('is_batch_mode') else run_traceback_download_query
     msg_target = update.callback_query.message if update.callback_query else update.message
@@ -1513,7 +1550,7 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
         unauthorized_fields = [f for f in selected_fields if f not in allowed_fields]
         if unauthorized_fields:
             msg.edit_text(f"⚠️ 警告: 您选择的字段 `{', '.join(unauthorized_fields)}` 超出当前可用最高级Key (等级{key_level}) 的权限。请重新选择或升级Key。")
-            return ConversationHandler.END
+            return BATCH_STATE_SELECT_FIELDS
         context.user_data.update({'chat_id': update.effective_chat.id, 'fields': fields_str, 'total_size': total_size, 'is_batch_mode': True })
         success_message = f"✅ 使用 Key \\[\\#{used_key_index}\\] \\(等级{key_level}\\) 找到 {total_size} 条结果\\."
         if total_size <= 10000:
@@ -1521,7 +1558,7 @@ def batch_select_fields_callback(update: Update, context: CallbackContext):
             return ConversationHandler.END
         else:
             keyboard = [[InlineKeyboardButton("💎 导出前1万条", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯导出", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
-            msg.edit_text(f"{success_message}\n请选择导出模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return STATE_KKFOFA_MODE
+            msg.edit_text(f"{success_message}\n请选择导出模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return BATCH_STATE_MODE_CHOICE
     keyboard = build_batch_fields_keyboard(context.user_data)
     query.message.edit_reply_markup(reply_markup=keyboard)
     return STATE_BATCH_SELECT_FIELDS
@@ -1618,7 +1655,7 @@ def check_command(update: Update, context: CallbackContext):
         for i, key in enumerate(CONFIG['apis']):
             level = KEY_LEVELS.get(key, -1)
             level_name = {-1: "❌ 无效", 0: "✅ 免费", 1: "✅ 个人", 2: "✅ 商业", 3: "✅ 企业"}.get(level, "未知")
-            report.append(f"  `#{i+1}` (`...{key[-4:]}`): {level_name}")
+            report.append(f"  `\\#{i+1}` \\(`...{key[-4:]}`\\): {level_name}")
     report.append("\n*🌐 代理:*")
     proxies_to_check = CONFIG.get("proxies", [])
     if not proxies_to_check and CONFIG.get("proxy"): proxies_to_check.append(CONFIG.get("proxy"))
@@ -2316,8 +2353,8 @@ def main() -> None:
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
         states={
-            STATE_SETTINGS_MAIN: [CallbackQueryHandler(settings_callback_handler, pattern=r"^settings_")],
-            STATE_SETTINGS_ACTION: [
+            SETTINGS_STATE_MAIN: [CallbackQueryHandler(settings_callback_handler, pattern=r"^settings_")],
+            SETTINGS_STATE_ACTION: [
                 CallbackQueryHandler(settings_action_handler, pattern=r"^action_"),
                 CallbackQueryHandler(show_update_menu, pattern=r"^settings_update"),
                 CallbackQueryHandler(show_backup_restore_menu, pattern=r"^settings_backup"),
@@ -2326,53 +2363,53 @@ def main() -> None:
                 CallbackQueryHandler(get_update_url, pattern=r"^update_set_url"),
                 CallbackQueryHandler(settings_command, pattern=r"^(update_back|backup_back)"),
             ],
-            STATE_ADMIN_MENU: [CallbackQueryHandler(admin_menu_callback, pattern=r"^admin_")],
-            STATE_GET_ADMIN_ID_TO_ADD: [MessageHandler(Filters.text & ~Filters.command, get_admin_id_to_add)],
-            STATE_GET_ADMIN_ID_TO_REMOVE: [MessageHandler(Filters.text & ~Filters.command, get_admin_id_to_remove)],
-            STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)],
-            STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
-            STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")],
-            STATE_GET_PRESET_NAME: [MessageHandler(Filters.text & ~Filters.command, get_preset_name)],
-            STATE_GET_PRESET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_preset_query)],
-            STATE_REMOVE_PRESET: [MessageHandler(Filters.text & ~Filters.command, remove_preset)],
-            STATE_GET_UPDATE_URL: [MessageHandler(Filters.text & ~Filters.command, get_update_url)],
-            STATE_PROXYPOOL_MENU: [CallbackQueryHandler(proxypool_menu_callback, pattern=r"^proxypool_")],
-            STATE_GET_PROXY_ADD: [MessageHandler(Filters.text & ~Filters.command, get_proxy_to_add)],
-            STATE_GET_PROXY_REMOVE: [MessageHandler(Filters.text & ~Filters.command, get_proxy_to_remove)],
-            STATE_UPLOAD_API_MENU: [CallbackQueryHandler(upload_api_menu_callback, pattern=r"^upload_")],
-            STATE_GET_UPLOAD_URL: [MessageHandler(Filters.text & ~Filters.command, get_upload_url)],
-            STATE_GET_UPLOAD_TOKEN: [MessageHandler(Filters.text & ~Filters.command, get_upload_token)],
+            SETTINGS_STATE_ADMIN_MENU: [CallbackQueryHandler(admin_menu_callback, pattern=r"^admin_")],
+            SETTINGS_STATE_GET_ADMIN_ID_TO_ADD: [MessageHandler(Filters.text & ~Filters.command, get_admin_id_to_add)],
+            SETTINGS_STATE_GET_ADMIN_ID_TO_REMOVE: [MessageHandler(Filters.text & ~Filters.command, get_admin_id_to_remove)],
+            SETTINGS_STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)],
+            SETTINGS_STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
+            SETTINGS_STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")],
+            SETTINGS_STATE_GET_PRESET_NAME: [MessageHandler(Filters.text & ~Filters.command, get_preset_name)],
+            SETTINGS_STATE_GET_PRESET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_preset_query)],
+            SETTINGS_STATE_REMOVE_PRESET: [MessageHandler(Filters.text & ~Filters.command, remove_preset)],
+            SETTINGS_STATE_GET_UPDATE_URL: [MessageHandler(Filters.text & ~Filters.command, get_update_url)],
+            SETTINGS_STATE_PROXYPOOL_MENU: [CallbackQueryHandler(proxypool_menu_callback, pattern=r"^proxypool_")],
+            SETTINGS_STATE_GET_PROXY_ADD: [MessageHandler(Filters.text & ~Filters.command, get_proxy_to_add)],
+            SETTINGS_STATE_GET_PROXY_REMOVE: [MessageHandler(Filters.text & ~Filters.command, get_proxy_to_remove)],
+            SETTINGS_STATE_UPLOAD_API_MENU: [CallbackQueryHandler(upload_api_menu_callback, pattern=r"^upload_")],
+            SETTINGS_STATE_GET_UPLOAD_URL: [MessageHandler(Filters.text & ~Filters.command, get_upload_url)],
+            SETTINGS_STATE_GET_UPLOAD_TOKEN: [MessageHandler(Filters.text & ~Filters.command, get_upload_token)],
         },
         fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300,
     )
     query_conv = ConversationHandler(
         entry_points=[ CommandHandler("kkfofa", query_entry_point), CommandHandler("allfofa", query_entry_point), CallbackQueryHandler(query_entry_point, pattern=r"^run_preset_") ],
         states={
-            STATE_GET_GUEST_KEY: [MessageHandler(Filters.text & ~Filters.command, get_guest_key)],
-            STATE_ASK_CONTINENT: [CallbackQueryHandler(ask_continent_callback, pattern=r"^continent_")], 
-            STATE_CONTINENT_CHOICE: [CallbackQueryHandler(continent_choice_callback, pattern=r"^continent_")], 
-            STATE_CACHE_CHOICE: [CallbackQueryHandler(cache_choice_callback, pattern=r"^cache_")],
-            STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
-            STATE_GET_TRACEBACK_LIMIT: [MessageHandler(Filters.text & ~Filters.command, get_traceback_limit), CallbackQueryHandler(get_traceback_limit, pattern=r"^limit_")],
-            STATE_ALLFOFA_GET_LIMIT: [MessageHandler(Filters.text & ~Filters.command, allfofa_get_limit), CallbackQueryHandler(allfofa_get_limit, pattern=r"^allfofa_limit_")]
+            QUERY_STATE_GET_GUEST_KEY: [MessageHandler(Filters.text & ~Filters.command, get_guest_key)],
+            QUERY_STATE_ASK_CONTINENT: [CallbackQueryHandler(ask_continent_callback, pattern=r"^continent_")], 
+            QUERY_STATE_CONTINENT_CHOICE: [CallbackQueryHandler(continent_choice_callback, pattern=r"^continent_")], 
+            QUERY_STATE_CACHE_CHOICE: [CallbackQueryHandler(cache_choice_callback, pattern=r"^cache_")],
+            QUERY_STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
+            QUERY_STATE_GET_TRACEBACK_LIMIT: [MessageHandler(Filters.text & ~Filters.command, get_traceback_limit), CallbackQueryHandler(get_traceback_limit, pattern=r"^limit_")],
+            QUERY_STATE_ALLFOFA_GET_LIMIT: [MessageHandler(Filters.text & ~Filters.command, allfofa_get_limit), CallbackQueryHandler(allfofa_get_limit, pattern=r"^allfofa_limit_")]
         },
         fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300,
     )
     batch_conv = ConversationHandler(
         entry_points=[CommandHandler("batch", batch_command)], 
         states={
-            STATE_BATCH_SELECT_FIELDS: [CallbackQueryHandler(batch_select_fields_callback, pattern=r"^batchfield_")],
-            STATE_KKFOFA_MODE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
-            STATE_GET_TRACEBACK_LIMIT: [MessageHandler(Filters.text & ~Filters.command, get_traceback_limit), CallbackQueryHandler(get_traceback_limit, pattern=r"^limit_")]
+            BATCH_STATE_SELECT_FIELDS: [CallbackQueryHandler(batch_select_fields_callback, pattern=r"^batchfield_")],
+            BATCH_STATE_MODE_CHOICE: [CallbackQueryHandler(query_mode_callback, pattern=r"^mode_")],
+            BATCH_STATE_GET_LIMIT: [MessageHandler(Filters.text & ~Filters.command, get_traceback_limit), CallbackQueryHandler(get_traceback_limit, pattern=r"^limit_")]
         },
         fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=600,
     )
     import_conv = ConversationHandler(entry_points=[CommandHandler("import", import_command)], states={STATE_GET_IMPORT_QUERY: [MessageHandler(Filters.document.mime_type("text/plain"), get_import_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
-    stats_conv = ConversationHandler(entry_points=[CommandHandler("stats", stats_command)], states={STATE_GET_STATS_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
-    batchfind_conv = ConversationHandler(entry_points=[CommandHandler("batchfind", batchfind_command)], states={STATE_GET_BATCH_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), get_batch_file_handler)], STATE_SELECT_BATCH_FEATURES: [CallbackQueryHandler(select_batch_features_callback, pattern=r"^batchfeature_")]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
-    restore_conv = ConversationHandler(entry_points=[CommandHandler("restore", restore_config_command)], states={STATE_GET_RESTORE_FILE: [MessageHandler(Filters.document, receive_config_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
-    scan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(start_scan_callback, pattern=r'^start_scan_')], states={STATE_GET_SCAN_CONCURRENCY: [MessageHandler(Filters.text & ~Filters.command, get_concurrency_callback)], STATE_GET_SCAN_TIMEOUT: [MessageHandler(Filters.text & ~Filters.command, get_timeout_callback)]}, fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=120)
-    batch_check_api_conv = ConversationHandler(entry_points=[CommandHandler("batchcheckapi", batch_check_api_command)], states={STATE_GET_API_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), receive_api_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    stats_conv = ConversationHandler(entry_points=[CommandHandler("stats", stats_command)], states={STATS_STATE_GET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    batchfind_conv = ConversationHandler(entry_points=[CommandHandler("batchfind", batchfind_command)], states={BATCHFIND_STATE_GET_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), get_batch_file_handler)], BATCHFIND_STATE_SELECT_FEATURES: [CallbackQueryHandler(select_batch_features_callback, pattern=r"^batchfeature_")]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    restore_conv = ConversationHandler(entry_points=[CommandHandler("restore", restore_config_command)], states={RESTORE_STATE_GET_FILE: [MessageHandler(Filters.document, receive_config_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    scan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(start_scan_callback, pattern=r'^start_scan_')], states={SCAN_STATE_GET_CONCURRENCY: [MessageHandler(Filters.text & ~Filters.command, get_concurrency_callback)], SCAN_STATE_GET_TIMEOUT: [MessageHandler(Filters.text & ~Filters.command, get_timeout_callback)]}, fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=120)
+    batch_check_api_conv = ConversationHandler(entry_points=[CommandHandler("batchcheckapi", batch_check_api_command)], states={BATCHCHECKAPI_STATE_GET_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), receive_api_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command));
     
