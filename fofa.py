@@ -1116,20 +1116,27 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
             lambda key, key_level, proxy_session: fetch_fofa_data(key, query_text, page_size=1, fields="host", proxy_session=proxy_session),
             preferred_key_index=key_index
         )
-        # v10.9 FIX: Escape the '#' character for MarkdownV2
         used_key_info = f"Key \\[\\#{used_key_index}\\]"
     if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
+    
     total_size = data.get('size', 0)
     if total_size == 0: msg.edit_text("🤷‍♀️ 未找到结果。"); return ConversationHandler.END
     context.user_data.update({'total_size': total_size, 'chat_id': update.effective_chat.id, 'is_batch_mode': False})
+    
     success_message = f"✅ 使用 {used_key_info} 找到 {total_size} 条结果\\."
+    
     if total_size <= 10000:
-        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return QUERY_STATE_KKFA_MODE
-
+        msg.edit_text(f"{success_message}\n开始下载\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        start_download_job(context, run_full_download_query, context.user_data)
         return ConversationHandler.END
     else:
-        keyboard = [[InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')], [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]]
-        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2); return QUERY_STATE_KKFOFA_MODE
+        keyboard = [
+            [InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')],
+            [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]
+        ]
+        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
+        # 修复了拼写错误 KKFA -> KKFOFA
+        return QUERY_STATE_KKFOFA_MODE 
 
 def query_mode_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); mode = query.data.split('_')[1]
@@ -1429,70 +1436,81 @@ def inline_fofa_handler(update: Update, context: CallbackContext) -> None:
     query_text = update.inline_query.query
     results = []
 
-    # 如果用户只输入了@botname，没有附带查询语句
-    if not query_text:
-        results.append(
-            InlineQueryResultArticle(
-                id=str(uuid.uuid4()),
-                title="开始输入FOFA查询语法...",
-                description='例如: domain="example.com"',
-                input_message_content=InputTextMessageContent(
-                    "💡 **FOFA 内联查询用法** 💡\n\n"
-                    "在任何聊天框中输入 `@你的机器人用户名` 然后跟上FOFA查询语法，即可快速搜索。\n\n"
-                    "例如：`@你的机器人用户名 domain=\"qq.com\"`"
-                , parse_mode=ParseMode.MARKDOWN)
-            )
-        )
-        update.inline_query.answer(results)
-        return
-
-    # --- 用户输入了查询语句，开始调用FOFA API ---
-    # 内联模式不应返回太多结果，我们只查询前10条
-    # 为了提供更多上下文，我们查询 host 和 title 两个字段
-    def inline_query_logic(key, key_level, proxy_session):
-        return fetch_fofa_data(key, query_text, page_size=10, fields="host,title", proxy_session=proxy_session)
-
-    data, _, _, _, _, error = execute_query_with_fallback(inline_query_logic)
-
-    # 如果查询出错
-    if error:
-        results.append(
-            InlineQueryResultArticle(
-                id=str(uuid.uuid4()),
-                title="查询出错",
-                description=str(error),
-                input_message_content=InputTextMessageContent(f"FOFA 查询失败: {error}")
-            )
-        )
-    # 如果没有找到结果
-    elif not data or not data.get('results'):
-        results.append(
-            InlineQueryResultArticle(
-                id=str(uuid.uuid4()),
-                title="未找到结果",
-                description=f"查询: {query_text}",
-                input_message_content=InputTextMessageContent(f"对于查询 '{query_text}'，FOFA 未返回任何结果。")
-            )
-        )
-    # 成功找到结果
-    else:
-        for result in data['results']:
-            host = result[0] if result and len(result) > 0 else "N/A"
-            title = result[1] if result and len(result) > 1 else "无标题"
-            
+    try:
+        # 如果用户只输入了@botname，没有附带查询语句
+        if not query_text:
             results.append(
                 InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
-                    title=host, # 结果标题显示 host
-                    description=title, # 结果描述显示 title
+                    title="开始输入FOFA查询语法...",
+                    description='例如: domain="example.com"',
                     input_message_content=InputTextMessageContent(
-                        host # 用户点击后，将 host 发送到聊天框
+                        "💡 **FOFA 内联查询用法** 💡\n\n"
+                        "在任何聊天框中输入 `@你的机器人用户名` 然后跟上FOFA查询语法，即可快速搜索。\n\n"
+                        "例如：`@你的机器人用户名 domain=\"qq.com\"`",
+                        parse_mode=ParseMode.MARKDOWN
                     )
                 )
             )
+            update.inline_query.answer(results, cache_time=300) # 初始消息可以缓存久一点
+            return
 
-    # 将最终结果列表发送给Telegram，cache_time建议设置一个较短的时间
-    update.inline_query.answer(results, cache_time=30)
+        # --- 用户输入了查询语句，开始调用FOFA API ---
+        def inline_query_logic(key, key_level, proxy_session):
+            return fetch_fofa_data(key, query_text, page_size=10, fields="host,title", proxy_session=proxy_session)
+
+        data, _, _, _, _, error = execute_query_with_fallback(inline_query_logic)
+
+        # 如果查询出错
+        if error:
+            results.append(
+                InlineQueryResultArticle(
+                    id='error',
+                    title="查询出错",
+                    description=str(error),
+                    input_message_content=InputTextMessageContent(f"FOFA 查询失败: {error}")
+                )
+            )
+        # 如果没有找到结果
+        elif not data or not data.get('results'):
+            results.append(
+                InlineQueryResultArticle(
+                    id='no_results',
+                    title="未找到结果",
+                    description=f"查询: {query_text}",
+                    input_message_content=InputTextMessageContent(f"对于查询 '{query_text}'，FOFA 未返回任何结果。")
+                )
+            )
+        # 成功找到结果
+        else:
+            for result in data['results']:
+                host = result[0] if result and len(result) > 0 else "N/A"
+                title = result[1] if result and len(result) > 1 else "无标题"
+                
+                results.append(
+                    InlineQueryResultArticle(
+                        id=str(uuid.uuid4()),
+                        title=host,
+                        description=title,
+                        input_message_content=InputTextMessageContent(host)
+                    )
+                )
+    
+    except Exception as e:
+        # 捕获任何意外的崩溃，并返回错误信息
+        logger.error(f"内联查询时发生严重错误: {e}", exc_info=True)
+        results = [
+            InlineQueryResultArticle(
+                id='critical_error',
+                title="机器人内部错误",
+                description="处理您的请求时发生意外错误，请检查日志。",
+                input_message_content=InputTextMessageContent("机器人内部错误，请联系管理员。")
+            )
+        ]
+    
+    # 确保总能响应Telegram，避免界面卡住
+    update.inline_query.answer(results, cache_time=10) # 实际查询结果缓存时间短一点
+
 
 # --- /batchfind 命令 ---
 BATCH_FEATURES = { "protocol": "协议", "domain": "域名", "os": "操作系统", "server": "服务/组件", "icp": "ICP备案号", "title": "标题", "jarm": "JARM指纹", "cert.issuer.org": "证书颁发组织", "cert.issuer.cn": "证书颁发CN", "cert.subject.org": "证书主体组织", "cert.subject.cn": "证书主体CN" }
