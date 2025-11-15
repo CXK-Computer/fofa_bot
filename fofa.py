@@ -1380,19 +1380,68 @@ def stats_command(update: Update, context: CallbackContext):
 def get_fofa_stats_query(update: Update, context: CallbackContext):
     query_text = " ".join(context.args) if context.args else update.message.text
     msg = update.message.reply_text(f"⏳ 正在对 `{escape_markdown_v2(query_text)}` 进行聚合统计\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    
     data, _, _, _, _, error = execute_query_with_fallback(
         lambda key, key_level, proxy_session: fetch_fofa_stats(key, query_text, proxy_session=proxy_session)
     )
-    if error: msg.edit_text(f"❌ 统计失败: {error}"); return ConversationHandler.END
+    
+    if error:
+        msg.edit_text(f"❌ 统计失败: {escape_markdown_v2(error)}", parse_mode=ParseMode.MARKDOWN_V2)
+        return ConversationHandler.END
+
+    # 智能适配层：处理嵌套和扁平两种API响应格式
+    stats_source = data.get("aggs", data)
+
     report = [f"📊 *聚合统计报告 for `{escape_markdown_v2(query_text)}`*\n"]
-    for field, aggs in data.items():
-        if aggs and isinstance(aggs, list):
-            report.append(f"\-\-\- *{escape_markdown_v2(field.capitalize())}* \-\-\-")
-            for item in aggs[:10]:
-                report.append(f"`{escape_markdown_v2(item['name'])}`: {item['count']}")
+    
+    # 完整版 display_map，包含全部12个可聚合字段
+    display_map = {
+        "countries": "🌍 Top 5 国家/地区",
+        "org": "🏢 Top 5 组织 (ORG)",
+        "asn": "📛 Top 5 ASN",
+        "server": "🖥️ Top 5 服务/组件",
+        "protocol": "🔌 Top 5 协议",
+        "port": "🚪 Top 5 端口",
+        "icp": "📜 Top 5 ICP备案",
+        "title": "📰 Top 5 网站标题",
+        "fid": "🔑 Top 5 FID 指纹",
+        "domain": "🌐 Top 5 域名",          # <-- 新增
+        "os": "💻 Top 5 操作系统",        # <-- 新增
+        "asset_type": "📦 Top 5 资产类型" # <-- 新增
+    }
+    
+    data_found = False
+    for key, title in display_map.items():
+        items = stats_source.get(key)
+        
+        if items and isinstance(items, list):
+            data_found = True
+            report.append(f"*{escape_markdown_v2(title)}*:")
+            for item in items[:5]:
+                name = escape_markdown_v2(item.get('name', 'N/A'))
+                count = item.get('count', 0)
+                report.append(f"  `{name}`: *{count:,}*")
             report.append("")
-    msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN_V2)
+
+    if not data_found:
+        report.append("_未找到可供聚合的数据。_")
+
+    try:
+        msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN_V2)
+    except BadRequest as e:
+        if "message is too long" in str(e).lower():
+            msg.edit_text("✅ 统计完成！报告过长，将作为文件发送。")
+            report_filename = f"stats_report_{int(time.time())}.txt"
+            plain_text_report = re.sub(r'([*_`\[\]\\])', '', "\n".join(report))
+            with open(report_filename, 'w', encoding='utf-8') as f:
+                f.write(plain_text_report)
+            send_file_safely(context, update.effective_chat.id, report_filename)
+            os.remove(report_filename)
+        else:
+            msg.edit_text(f"❌ 发送报告时出错: {escape_markdown_v2(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+
     return ConversationHandler.END
+
 
 # --- /batchfind 命令 ---
 BATCH_FEATURES = { "protocol": "协议", "domain": "域名", "os": "操作系统", "server": "服务/组件", "icp": "ICP备案号", "title": "标题", "jarm": "JARM指纹", "cert.issuer.org": "证书颁发组织", "cert.issuer.cn": "证书颁发CN", "cert.subject.org": "证书主体组织", "cert.subject.cn": "证书主体CN" }
@@ -1781,7 +1830,7 @@ def settings_command(update: Update, context: CallbackContext):
     message_text = "⚙️ *设置菜单*"; reply_markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query: update.callback_query.message.edit_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
     else: update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_SETTINGS_MAIN
+    return SETTINGS_STATE_MAIN
 def settings_callback_handler(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); menu = query.data.split('_', 1)[1]
     if menu == 'api': return show_api_menu(update, context, force_check=False)
@@ -1795,8 +1844,8 @@ def settings_callback_handler(update: Update, context: CallbackContext):
     return STATE_SETTINGS_ACTION
 def settings_action_handler(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_', 1)[1]
-    if action == 'add_api': query.message.edit_text("请输入新的FOFA API Key:"); return STATE_GET_KEY
-    if action == 'remove_api': query.message.edit_text("请输入要移除的API Key的编号:"); return STATE_REMOVE_API
+    if action == 'add_api': query.message.edit_text("请输入新的FOFA API Key:"); return SETTINGS_STATE_GET_KEY
+    if action == 'remove_api': query.message.edit_text("请输入要移除的API Key的编号:"); return SETTINGS_STATE_REMOVE_API
     if action == 'check_api': return show_api_menu(update, context, force_check=True)
     if action == 'back': return settings_command(update, context)
 def show_api_menu(update: Update, context: CallbackContext, force_check=False):
@@ -1827,7 +1876,7 @@ def get_key(update: Update, context: CallbackContext):
     data, error = verify_fofa_api(new_key)
     if error:
         msg.edit_text(f"❌ Key 验证失败: {error}\n请重新输入一个有效的Key，或使用 /cancel 取消。")
-        return STATE_GET_KEY 
+        return SETTINGS_STATE_GET_KEY  
     
     CONFIG['apis'].append(new_key)
     save_config()
@@ -1893,16 +1942,16 @@ def show_preset_menu(update: Update, context: CallbackContext):
         [InlineKeyboardButton("🔙 返回", callback_data='preset_back')]
     ]
     query.message.edit_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_PRESET_MENU
+    return SETTINGS_STATE_PRESET_MENU
 def preset_menu_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_')[1]
-    if action == 'add': query.message.edit_text("请输入预设的名称:"); return STATE_GET_PRESET_NAME
-    if action == 'remove': query.message.edit_text("请输入要移除的预设的编号:"); return STATE_REMOVE_PRESET
+    if action == 'add': query.message.edit_text("请输入预设的名称:"); return SETTINGS_STATE_GET_PRESET_NAME
+    if action == 'remove': query.message.edit_text("请输入要移除的预设的编号:"); return SETTINGS_STATE_REMOVE_PRESET
     if action == 'back': return settings_command(update, context)
 def get_preset_name(update: Update, context: CallbackContext):
     context.user_data['preset_name'] = update.message.text.strip()
     update.message.reply_text("请输入此预设的FOFA查询语法:")
-    return STATE_GET_PRESET_QUERY
+    return SETTINGS_STATE_GET_PRESET_QUERY
 def get_preset_query(update: Update, context: CallbackContext):
     preset_query = update.message.text.strip(); preset_name = context.user_data['preset_name']
     CONFIG.setdefault("presets", []).append({"name": preset_name, "query": preset_query}); save_config()
@@ -1947,11 +1996,11 @@ def show_proxypool_menu(update: Update, context: CallbackContext):
         [InlineKeyboardButton("🔙 返回", callback_data='proxypool_back')]
     ]
     query.message.edit_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_PROXYPOOL_MENU
+    return SETTINGS_STATE_PROXYPOOL_MENU
 def proxypool_menu_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_')[1]
-    if action == 'add': query.message.edit_text("请输入要添加的代理 (格式: `http://user:pass@host:port`):"); return STATE_GET_PROXY_ADD
-    if action == 'remove': query.message.edit_text("请输入要移除的代理的编号:"); return STATE_GET_PROXY_REMOVE
+    if action == 'add': query.message.edit_text("请输入要添加的代理 (格式: `http://user:pass@host:port`):"); return SETTINGS_STATE_GET_PROXY_ADD
+    if action == 'remove': query.message.edit_text("请输入要移除的代理的编号:"); return SETTINGS_STATE_GET_PROXY_REMOVE
     if action == 'back': return settings_command(update, context)
 def get_proxy_to_add(update: Update, context: CallbackContext):
     proxy = update.message.text.strip()
@@ -1980,13 +2029,13 @@ def show_upload_api_menu(update: Update, context: CallbackContext):
         [InlineKeyboardButton("🔙 返回", callback_data='upload_back')]
     ]
     query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kbd), parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_UPLOAD_API_MENU
+    return SETTINGS_STATE_UPLOAD_API_MENU
 def upload_api_menu_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_', 1)[1]
     if action == 'back': return settings_command(update, context)
     if action == 'set_url': query.message.edit_text("请输入您的上传接口 URL:"); return STATE_GET_UPLOAD_URL
     if action == 'set_token': query.message.edit_text("请输入您的上传接口 Token:"); return STATE_GET_UPLOAD_TOKEN
-    return STATE_UPLOAD_API_MENU
+    return SETTINGS_STATE_UPLOAD_API_MENU
 def get_upload_url(update: Update, context: CallbackContext):
     url = update.message.text.strip()
     if url.lower().startswith('http'):
@@ -2021,7 +2070,7 @@ def show_admin_menu(update: Update, context: CallbackContext):
     keyboard.append([InlineKeyboardButton("🔙 返回", callback_data='admin_back')])
     
     query.message.edit_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_ADMIN_MENU
+    return SETTINGS_STATE_ADMIN_MENU
 
 def admin_menu_callback(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -2030,14 +2079,17 @@ def admin_menu_callback(update: Update, context: CallbackContext):
 
     if not is_super_admin(query.from_user.id):
         query.answer("⛔️ 只有超级管理员才能执行此操作。", show_alert=True)
-        return STATE_ADMIN_MENU
+        return SETTINGS_STATE_ADMIN_MENU
+
 
     if action == 'add':
         query.message.edit_text("请输入新管理员的 Telegram User ID:")
-        return STATE_GET_ADMIN_ID_TO_ADD
+        return SETTINGS_STATE_GET_ADMIN_ID_TO_ADD
+
     if action == 'remove':
         query.message.edit_text("请输入要移除的管理员的编号 (例如: 2):")
-        return STATE_GET_ADMIN_ID_TO_REMOVE
+        return SETTINGS_STATE_GET_ADMIN_ID_TO_REMOVE
+
     if action == 'back':
         return settings_command(update, context)
 
@@ -2114,7 +2166,7 @@ def start_allfofa_search(update: Update, context: CallbackContext, message_to_ed
         "请输入您希望获取的数量上限 (例如: 50000)，或选择全部获取。",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    return STATE_ALLFOFA_GET_LIMIT
+    return QUERY_STATE_ALLFOFA_GET_LIMIT
 
 def allfofa_get_limit(update: Update, context: CallbackContext):
     limit = None
