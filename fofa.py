@@ -1710,7 +1710,7 @@ def history_command(update: Update, context: CallbackContext):
 @admin_only
 def import_command(update: Update, context: CallbackContext):
     update.message.reply_text("请发送您要导入的旧缓存文件 (txt格式)。")
-    return STATE_GET_IMPORT_QUERY
+    return IMPORT_STATE_GET_FILE
 def get_import_query(update: Update, context: CallbackContext):
     doc = update.message.document
     if not doc.file_name.endswith('.txt'): update.message.reply_text("❌ 请上传 .txt 文件。"); return ConversationHandler.END
@@ -1721,7 +1721,7 @@ def get_import_query(update: Update, context: CallbackContext):
         with open(temp_path, 'r', encoding='utf-8') as f: result_count = sum(1 for _ in f)
     except Exception as e: update.message.reply_text(f"❌ 读取文件失败: {e}"); os.remove(temp_path); return ConversationHandler.END
     query_text = update.message.text
-    if not query_text: update.message.reply_text("请输入与此文件关联的原始FOFA查询语法:"); return STATE_GET_IMPORT_QUERY
+    if not query_text: update.message.reply_text("请输入与此文件关联的原始FOFA查询语法:"); return IMPORT_STATE_GET_FILE
     final_filename = generate_filename_from_query(query_text)
     final_path = os.path.join(FOFA_CACHE_DIR, final_filename)
     shutil.move(temp_path, final_path)
@@ -2404,7 +2404,7 @@ def main() -> None:
         },
         fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=600,
     )
-    import_conv = ConversationHandler(entry_points=[CommandHandler("import", import_command)], states={STATE_GET_IMPORT_QUERY: [MessageHandler(Filters.document.mime_type("text/plain"), get_import_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
+    import_conv = ConversationHandler(entry_points=[CommandHandler("import", import_command)], states={IMPORT_STATE_GET_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), get_import_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     stats_conv = ConversationHandler(entry_points=[CommandHandler("stats", stats_command)], states={STATS_STATE_GET_QUERY: [MessageHandler(Filters.text & ~Filters.command, get_fofa_stats_query)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     batchfind_conv = ConversationHandler(entry_points=[CommandHandler("batchfind", batchfind_command)], states={BATCHFIND_STATE_GET_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), get_batch_file_handler)], BATCHFIND_STATE_SELECT_FEATURES: [CallbackQueryHandler(select_batch_features_callback, pattern=r"^batchfeature_")]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     restore_conv = ConversationHandler(entry_points=[CommandHandler("restore", restore_config_command)], states={RESTORE_STATE_GET_FILE: [MessageHandler(Filters.document, receive_config_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
