@@ -973,7 +973,7 @@ def query_entry_point(update: Update, context: CallbackContext):
             context.user_data['key_index'] = None
             keyboard = [[InlineKeyboardButton("🌍 是的, 限定大洲", callback_data="continent_select"), InlineKeyboardButton("⏩ 不, 直接搜索", callback_data="continent_skip")]]
             query_obj.message.edit_text(f"预设查询: `{escape_markdown_v2(preset['query'])}`\n\n是否要将此查询限定在特定大洲范围内？", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-            return STATE_ASK_CONTINENT
+            return QUERY_STATE_ASK_CONTINENT
         except (ValueError, IndexError):
             query_obj.message.edit_text("❌ 预设查询失败。")
             return ConversationHandler.END
@@ -1025,7 +1025,8 @@ def query_entry_point(update: Update, context: CallbackContext):
 
         keyboard = [[InlineKeyboardButton("🌍 是的, 限定大洲", callback_data="continent_select"), InlineKeyboardButton("⏩ 不, 直接搜索", callback_data="continent_skip")]]
         message_obj.reply_text(f"查询: `{escape_markdown_v2(query_text)}`\n\n是否要将此查询限定在特定大洲范围内？", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-        return STATE_ASK_CONTINENT
+        return QUERY_STATE_ASK_CONTINENT
+
     
     else:
         logger.error("query_entry_point called with an unsupported update type.")
